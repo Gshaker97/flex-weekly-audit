@@ -1,12 +1,28 @@
-import Link from "next/link";
 import { prisma } from "@/lib/prisma";
+import { computeDashboardKPIs } from "@/lib/kpis";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { Badge } from "@/components/ui/Badge";
 import { StatCard } from "@/components/ui/StatCard";
-import { formatCurrency, formatDate, formatDateTime } from "@/lib/utils";
-import { AlertCircle, CheckCircle2, FileText, ListTodo } from "lucide-react";
-import RunAuditButton from "./RunAuditButton";
+import RevenueLineChart from "@/components/ui/RevenueLineChart";
+import NewCustomersBarChart from "@/components/ui/NewCustomersBarChart";
+import SyncButton from "./SyncButton";
+import {
+  formatCurrency,
+  formatCurrencyDetailed,
+  formatNumber,
+  formatDateTime,
+} from "@/lib/utils";
+import {
+  DollarSign,
+  Users,
+  AlertCircle,
+  Receipt,
+  Repeat,
+  UserPlus,
+  TrendingUp,
+  PiggyBank,
+} from "lucide-react";
 
 export const dynamic = "force-dynamic";
 
@@ -15,262 +31,274 @@ export default async function DashboardPage() {
     orderBy: { createdAt: "desc" },
   });
 
-  if (!auth) {
-    return <ConnectJobberPrompt />;
-  }
+  if (!auth) return <ConnectJobberPrompt />;
 
-  const latest = await prisma.audit.findFirst({
-    orderBy: { startedAt: "desc" },
-    include: {
-      flaggedJobItems: { orderBy: { totalAmount: "desc" } },
-    },
+  const lastSync = await prisma.syncRun.findFirst({
+    where: { status: "complete" },
+    orderBy: { completedAt: "desc" },
   });
 
-  const recentAudits = await prisma.audit.findMany({
-    orderBy: { startedAt: "desc" },
-    take: 8,
-  });
+  if (!lastSync) return <FirstSyncPrompt />;
 
-  const completionRate =
-    latest && latest.totalJobs > 0
-      ? Math.round((latest.completedJobs / latest.totalJobs) * 100)
-      : null;
-  const invoicedRate =
-    latest && latest.totalJobs > 0
-      ? Math.round((latest.invoicedJobs / latest.totalJobs) * 100)
-      : null;
+  const kpis = await computeDashboardKPIs();
+
+  const last12Months = kpis.monthlySeries.slice(-12);
 
   return (
     <div className="space-y-8">
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
-        <div>
-          <h2 className="text-2xl font-semibold tracking-tight">
-            Operations Audit
-          </h2>
-          <p className="mt-1 text-sm text-muted-foreground">
-            {latest ? (
-              <>
-                Last run {formatDateTime(latest.startedAt)} — covering{" "}
-                {formatDate(latest.weekStart)} through{" "}
-                {formatDate(new Date(latest.weekEnd.getTime() - 1))}
-              </>
-            ) : (
-              "No audits yet. Pick a range and run your first audit."
-            )}
-          </p>
+      <DashboardHeader lastSyncAt={kpis.lastSyncAt} />
+
+      <section className="space-y-3">
+        <SectionTitle title="Revenue" />
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          <StatCard
+            label="Revenue YTD"
+            value={formatCurrency(kpis.revenueYTD)}
+            sublabel={`Invoiced this year`}
+            accent="brand"
+            icon={<DollarSign size={18} />}
+          />
+          <StatCard
+            label="This Month"
+            value={formatCurrency(kpis.revenueThisMonth)}
+            sublabel={
+              kpis.momChangePercent != null
+                ? `vs ${formatCurrency(kpis.revenueLastMonth)} last month`
+                : "First month tracked"
+            }
+            accent="success"
+            icon={<TrendingUp size={18} />}
+            changePercent={kpis.momChangePercent}
+          />
+          <StatCard
+            label="Average Job Value"
+            value={formatCurrency(kpis.averageJobValue)}
+            sublabel="YTD completed jobs"
+            icon={<Receipt size={18} />}
+          />
+          <StatCard
+            label="Outstanding Receivables"
+            value={formatCurrency(kpis.outstandingReceivables)}
+            sublabel="Invoiced but unpaid"
+            accent={kpis.outstandingReceivables > 0 ? "warning" : "default"}
+            icon={<PiggyBank size={18} />}
+          />
         </div>
-        <RunAuditButton />
-      </div>
+      </section>
 
-      {latest ? (
-        <>
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-            <StatCard
-              label="Total Jobs in Range"
-              value={latest.totalJobs}
-              sublabel="Jobs scheduled or completed"
-              icon={<ListTodo size={18} />}
-            />
-            <StatCard
-              label="Marked Complete"
-              value={`${latest.completedJobs}`}
-              sublabel={
-                completionRate != null ? `${completionRate}% completion rate` : undefined
-              }
-              accent="success"
-              icon={<CheckCircle2 size={18} />}
-            />
-            <StatCard
-              label="Invoiced"
-              value={`${latest.invoicedJobs}`}
-              sublabel={
-                invoicedRate != null ? `${invoicedRate}% invoiced rate` : undefined
-              }
-              accent="success"
-              icon={<FileText size={18} />}
-            />
-            <StatCard
-              label="Needs Attention"
-              value={latest.flaggedJobs}
-              sublabel="Missing status or invoice"
-              accent={latest.flaggedJobs > 0 ? "danger" : "success"}
-              icon={<AlertCircle size={18} />}
-            />
-          </div>
+      <section className="space-y-3">
+        <SectionTitle title="Risk &amp; Gaps" />
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          <StatCard
+            label="Revenue at Risk"
+            value={formatCurrency(kpis.revenueAtRisk)}
+            sublabel="Past end date, not completed"
+            accent={kpis.revenueAtRisk > 0 ? "danger" : "success"}
+            icon={<AlertCircle size={18} />}
+          />
+          <StatCard
+            label="Uninvoiced Revenue"
+            value={formatCurrency(kpis.uninvoicedRevenue)}
+            sublabel="Completed but no invoice"
+            accent={kpis.uninvoicedRevenue > 0 ? "warning" : "success"}
+            icon={<Receipt size={18} />}
+          />
+          <StatCard
+            label="Recurring Churn (90d)"
+            value={formatNumber(kpis.churnedRecurringLast90)}
+            sublabel="Recurring with no recent job"
+            accent={kpis.churnedRecurringLast90 > 0 ? "warning" : "success"}
+            icon={<Repeat size={18} />}
+          />
+        </div>
+      </section>
 
-          {latest.status === "failed" && (
-            <Card className="border-danger/30 bg-danger-bg">
-              <CardContent className="pt-6">
-                <p className="text-sm font-medium text-danger">
-                  Last audit failed
-                </p>
-                <p className="mt-1 text-sm text-danger/80">
-                  {latest.errorMessage}
-                </p>
-              </CardContent>
-            </Card>
-          )}
+      <section className="space-y-3">
+        <SectionTitle title="Customers" />
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          <StatCard
+            label="Total Customers"
+            value={formatNumber(kpis.totalCustomers)}
+            sublabel="All-time"
+            icon={<Users size={18} />}
+          />
+          <StatCard
+            label="Recurring Customers"
+            value={formatNumber(kpis.recurringCustomers)}
+            sublabel={
+              kpis.totalCustomers > 0
+                ? `${Math.round((kpis.recurringCustomers / kpis.totalCustomers) * 100)}% of base`
+                : undefined
+            }
+            accent="brand"
+            icon={<Repeat size={18} />}
+          />
+          <StatCard
+            label="New This Month"
+            value={formatNumber(kpis.newCustomersThisMonth)}
+            sublabel={`vs ${kpis.newCustomersLastMonth} last month`}
+            accent="success"
+            icon={<UserPlus size={18} />}
+          />
+          <StatCard
+            label="Recurring vs One-off (YTD)"
+            value={
+              kpis.recurringRevenueYTD + kpis.oneOffRevenueYTD > 0
+                ? `${Math.round(
+                    (kpis.recurringRevenueYTD /
+                      (kpis.recurringRevenueYTD + kpis.oneOffRevenueYTD)) *
+                      100
+                  )}%`
+                : "—"
+            }
+            sublabel="Share of revenue from recurring"
+            icon={<Repeat size={18} />}
+          />
+        </div>
+      </section>
 
-          <Card>
-            <CardHeader>
-              <CardTitle>Flagged Jobs</CardTitle>
-              <CardDescription>
-                Jobs in this range that are missing a completion status, an
-                invoice, or both.
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
-              {latest.flaggedJobItems.length === 0 ? (
-                <div className="rounded-lg border border-dashed border-border py-12 text-center">
-                  <CheckCircle2
-                    size={32}
-                    className="mx-auto text-success"
-                  />
-                  <p className="mt-3 text-sm font-medium">
-                    All jobs are complete and invoiced
-                  </p>
-                  <p className="mt-1 text-sm text-muted-foreground">
-                    Nothing needs attention for this range.
-                  </p>
-                </div>
-              ) : (
-                <FlaggedJobsTable items={latest.flaggedJobItems} />
-              )}
-            </CardContent>
-          </Card>
-        </>
-      ) : (
+      <section className="grid grid-cols-1 gap-6 lg:grid-cols-2">
         <Card>
-          <CardContent className="pt-6">
-            <p className="text-sm text-muted-foreground">
-              Run your first audit to see job and invoice status.
-            </p>
+          <CardHeader>
+            <CardTitle>Monthly Revenue</CardTitle>
+            <CardDescription>Invoiced revenue, trailing 12 months</CardDescription>
+          </CardHeader>
+          <CardContent>
+            {last12Months.length > 0 ? (
+              <RevenueLineChart data={last12Months} />
+            ) : (
+              <EmptyState message="No revenue data yet." />
+            )}
           </CardContent>
         </Card>
-      )}
+        <Card>
+          <CardHeader>
+            <CardTitle>New Customers per Month</CardTitle>
+            <CardDescription>Trailing 12 months</CardDescription>
+          </CardHeader>
+          <CardContent>
+            {last12Months.length > 0 ? (
+              <NewCustomersBarChart data={last12Months} />
+            ) : (
+              <EmptyState message="No customer data yet." />
+            )}
+          </CardContent>
+        </Card>
+      </section>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Recent Audits</CardTitle>
-          <CardDescription>History of past audit runs</CardDescription>
-        </CardHeader>
-        <CardContent>
-          {recentAudits.length === 0 ? (
-            <p className="text-sm text-muted-foreground">
-              No previous audits.
-            </p>
-          ) : (
-            <div className="overflow-hidden rounded-lg border border-border">
-              <table className="w-full text-sm">
-                <thead className="bg-muted/50">
-                  <tr className="text-left text-xs uppercase tracking-wide text-muted-foreground">
-                    <th className="px-4 py-2.5 font-medium">Range start</th>
-                    <th className="px-4 py-2.5 font-medium">Run at</th>
-                    <th className="px-4 py-2.5 font-medium">Trigger</th>
-                    <th className="px-4 py-2.5 font-medium">Total</th>
-                    <th className="px-4 py-2.5 font-medium">Flagged</th>
-                    <th className="px-4 py-2.5 font-medium">Status</th>
-                    <th className="px-4 py-2.5"></th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-border">
-                  {recentAudits.map((a) => (
-                    <tr key={a.id} className="hover:bg-muted/30">
-                      <td className="px-4 py-3 font-medium">
-                        {formatDate(a.weekStart)}
-                      </td>
-                      <td className="px-4 py-3 text-muted-foreground">
-                        {formatDateTime(a.startedAt)}
-                      </td>
-                      <td className="px-4 py-3 text-muted-foreground">
-                        {a.triggeredBy}
-                      </td>
-                      <td className="px-4 py-3">{a.totalJobs}</td>
-                      <td className="px-4 py-3">
-                        {a.flaggedJobs > 0 ? (
-                          <Badge variant="danger">{a.flaggedJobs}</Badge>
-                        ) : (
-                          <Badge variant="success">0</Badge>
-                        )}
-                      </td>
-                      <td className="px-4 py-3">
-                        <AuditStatusBadge status={a.status} />
-                      </td>
-                      <td className="px-4 py-3 text-right">
-                        <Link
-                          href={`/audits/${a.id}`}
-                          className="text-xs font-medium text-accent hover:underline"
-                        >
-                          View →
-                        </Link>
-                      </td>
+      <section className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+        <Card>
+          <CardHeader>
+            <CardTitle>Top 10 Customers by Revenue</CardTitle>
+            <CardDescription>YTD totals</CardDescription>
+          </CardHeader>
+          <CardContent>
+            {kpis.topCustomers.length === 0 ? (
+              <EmptyState message="No customer revenue recorded yet." />
+            ) : (
+              <div className="overflow-hidden rounded-lg border border-border">
+                <table className="w-full text-sm">
+                  <thead className="bg-muted/50">
+                    <tr className="text-left text-xs uppercase tracking-wide text-muted-foreground">
+                      <th className="px-4 py-2.5 font-medium">Customer</th>
+                      <th className="px-4 py-2.5 font-medium">Jobs</th>
+                      <th className="px-4 py-2.5 font-medium">Revenue</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </CardContent>
-      </Card>
+                  </thead>
+                  <tbody className="divide-y divide-border">
+                    {kpis.topCustomers.map((c, i) => (
+                      <tr key={c.id} className="hover:bg-muted/30">
+                        <td className="px-4 py-3">
+                          <div className="flex items-center gap-2">
+                            <span className="text-xs text-muted-foreground">{i + 1}.</span>
+                            <span className="font-medium">{c.name}</span>
+                            {c.isRecurring && (
+                              <Badge variant="success">Recurring</Badge>
+                            )}
+                          </div>
+                        </td>
+                        <td className="px-4 py-3 text-muted-foreground">{c.jobCount}</td>
+                        <td className="px-4 py-3 font-semibold">
+                          {formatCurrencyDetailed(c.revenue)}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>Revenue by Service Type</CardTitle>
+            <CardDescription>YTD breakdown</CardDescription>
+          </CardHeader>
+          <CardContent>
+            {kpis.serviceTypeRevenue.length === 0 ? (
+              <EmptyState message="No service type data yet." />
+            ) : (
+              <div className="overflow-hidden rounded-lg border border-border">
+                <table className="w-full text-sm">
+                  <thead className="bg-muted/50">
+                    <tr className="text-left text-xs uppercase tracking-wide text-muted-foreground">
+                      <th className="px-4 py-2.5 font-medium">Service</th>
+                      <th className="px-4 py-2.5 font-medium">Jobs</th>
+                      <th className="px-4 py-2.5 font-medium">Revenue</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-border">
+                    {kpis.serviceTypeRevenue.map((s) => (
+                      <tr key={s.serviceName} className="hover:bg-muted/30">
+                        <td className="px-4 py-3 font-medium">{s.serviceName}</td>
+                        <td className="px-4 py-3 text-muted-foreground">{s.jobCount}</td>
+                        <td className="px-4 py-3 font-semibold">
+                          {formatCurrencyDetailed(s.revenue)}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      </section>
     </div>
   );
 }
 
-function AuditStatusBadge({ status }: { status: string }) {
-  if (status === "complete") return <Badge variant="success">Complete</Badge>;
-  if (status === "failed") return <Badge variant="danger">Failed</Badge>;
-  if (status === "running") return <Badge variant="warning">Running</Badge>;
-  return <Badge variant="muted">{status}</Badge>;
+function DashboardHeader({ lastSyncAt }: { lastSyncAt: Date | null }) {
+  return (
+    <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+      <div>
+        <h2 className="text-2xl font-semibold tracking-tight">
+          Business Overview
+        </h2>
+        <p className="mt-1 text-sm text-muted-foreground">
+          {lastSyncAt
+            ? `Last synced ${formatDateTime(lastSyncAt)} from Jobber`
+            : "Not yet synced"}
+        </p>
+      </div>
+      <SyncButton />
+    </div>
+  );
 }
 
-function FlaggedJobsTable({ items }: { items: any[] }) {
+function SectionTitle({ title }: { title: string }) {
   return (
-    <div className="overflow-hidden rounded-lg border border-border">
-      <table className="w-full text-sm">
-        <thead className="bg-muted/50">
-          <tr className="text-left text-xs uppercase tracking-wide text-muted-foreground">
-            <th className="px-4 py-2.5 font-medium">Job</th>
-            <th className="px-4 py-2.5 font-medium">Client</th>
-            <th className="px-4 py-2.5 font-medium">End date</th>
-            <th className="px-4 py-2.5 font-medium">Status</th>
-            <th className="px-4 py-2.5 font-medium">Amount</th>
-            <th className="px-4 py-2.5 font-medium">Issues</th>
-          </tr>
-        </thead>
-        <tbody className="divide-y divide-border">
-          {items.map((j) => (
-            <tr key={j.id} className="hover:bg-muted/30">
-              <td className="px-4 py-3">
-                <div className="font-medium">
-                  {j.jobNumber ? `#${j.jobNumber}` : "—"}
-                </div>
-                <div className="text-xs text-muted-foreground">
-                  {j.jobTitle ?? ""}
-                </div>
-              </td>
-              <td className="px-4 py-3">{j.clientName ?? "—"}</td>
-              <td className="px-4 py-3 text-muted-foreground">
-                {formatDate(j.scheduledEnd ?? j.completedAt)}
-              </td>
-              <td className="px-4 py-3">
-                <Badge variant="muted">{j.jobStatus ?? "unknown"}</Badge>
-              </td>
-              <td className="px-4 py-3 font-medium">
-                {formatCurrency(j.totalAmount)}
-              </td>
-              <td className="px-4 py-3">
-                <div className="flex flex-wrap gap-1">
-                  {j.flagReasons.map((r: string) => (
-                    <Badge key={r} variant="danger">
-                      {r}
-                    </Badge>
-                  ))}
-                </div>
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+    <h3 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+      {title}
+    </h3>
+  );
+}
+
+function EmptyState({ message }: { message: string }) {
+  return (
+    <div className="rounded-lg border border-dashed border-border py-10 text-center">
+      <p className="text-sm text-muted-foreground">{message}</p>
     </div>
   );
 }
@@ -282,8 +310,8 @@ function ConnectJobberPrompt() {
         <CardHeader>
           <CardTitle>Connect Jobber to get started</CardTitle>
           <CardDescription>
-            Authorize this app to read jobs, invoices, and clients from your
-            Flex Landscaping Jobber account.
+            Authorize this app to read jobs, invoices, and clients from
+            Flexx Landscaping&apos;s Jobber account.
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -293,7 +321,30 @@ function ConnectJobberPrompt() {
             </Button>
           </a>
           <p className="mt-3 text-xs text-muted-foreground">
-            You&apos;ll be redirected to Jobber to grant read-only access.
+            Read-only access — this app never modifies Jobber data.
+          </p>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+function FirstSyncPrompt() {
+  return (
+    <div className="mx-auto mt-12 max-w-xl space-y-4">
+      <Card>
+        <CardHeader>
+          <CardTitle>Run your first sync</CardTitle>
+          <CardDescription>
+            Pull Flexx Landscaping&apos;s clients, jobs, and invoices from Jobber.
+            The first sync may take 5–10 minutes depending on data volume.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <SyncButton />
+          <p className="mt-3 text-xs text-muted-foreground">
+            After the sync completes, your KPI dashboard will populate
+            automatically.
           </p>
         </CardContent>
       </Card>

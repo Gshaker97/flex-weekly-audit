@@ -20,22 +20,15 @@ export default function ThemeToggle() {
   useEffect(() => {
     if (!mounted) return;
     const root = document.documentElement;
-    if (theme === "dark") {
-      root.classList.add("dark");
-    } else {
-      root.classList.remove("dark");
-    }
+    if (theme === "dark") root.classList.add("dark");
+    else root.classList.remove("dark");
     localStorage.setItem("theme", theme);
   }, [theme, mounted]);
-
-  function toggle() {
-    setTheme((t) => (t === "dark" ? "light" : "dark"));
-  }
 
   return (
     <button
       type="button"
-      onClick={toggle}
+      onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
       aria-label="Toggle theme"
       className="inline-flex h-9 w-9 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
     >

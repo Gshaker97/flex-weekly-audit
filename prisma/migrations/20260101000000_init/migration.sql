@@ -52,14 +52,8 @@ CREATE TABLE "FlaggedJob" (
 
 -- CreateIndex
 CREATE INDEX "Audit_weekStart_idx" ON "Audit"("weekStart");
-
--- CreateIndex
 CREATE INDEX "Audit_startedAt_idx" ON "Audit"("startedAt");
-
--- CreateIndex
 CREATE INDEX "FlaggedJob_auditId_idx" ON "FlaggedJob"("auditId");
-
--- CreateIndex
 CREATE INDEX "FlaggedJob_jobberJobId_idx" ON "FlaggedJob"("jobberJobId");
 
 -- AddForeignKey

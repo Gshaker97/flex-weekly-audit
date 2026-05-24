@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from "next/server";
 import { exchangeCodeForToken } from "@/lib/jobber";
 import { prisma } from "@/lib/prisma";
 
+export const dynamic = "force-dynamic";
+
 function decodeJwtExpiry(token: string): number | null {
   try {
     const parts = token.split(".");
@@ -23,17 +25,10 @@ export async function GET(req: NextRequest) {
   const cookieState = req.cookies.get("jobber_oauth_state")?.value;
 
   if (!code) {
-    return NextResponse.json(
-      { error: "Missing authorization code" },
-      { status: 400 }
-    );
+    return NextResponse.json({ error: "Missing authorization code" }, { status: 400 });
   }
-
   if (!state || !cookieState || state !== cookieState) {
-    return NextResponse.json(
-      { error: "Invalid OAuth state" },
-      { status: 400 }
-    );
+    return NextResponse.json({ error: "Invalid OAuth state" }, { status: 400 });
   }
 
   try {
@@ -44,11 +39,9 @@ export async function GET(req: NextRequest) {
       expiresAt = new Date(Date.now() + tokens.expires_in * 1000);
     } else {
       const jwtExp = decodeJwtExpiry(tokens.access_token);
-      if (jwtExp) {
-        expiresAt = new Date(jwtExp * 1000);
-      } else {
-        expiresAt = new Date(Date.now() + 55 * 60 * 1000);
-      }
+      expiresAt = jwtExp
+        ? new Date(jwtExp * 1000)
+        : new Date(Date.now() + 55 * 60 * 1000);
     }
 
     await prisma.jobberAuth.deleteMany({});

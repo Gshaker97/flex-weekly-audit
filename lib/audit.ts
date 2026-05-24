@@ -1,7 +1,7 @@
 import { prisma } from "./prisma";
 import { fetchJobsInRange, JobberJobNode } from "./jobber";
 
-export type RangePreset = "ytd" | "last30" | "thisWeek" | "lastWeek" | "last90";
+export type RangePreset = "ytd" | "last30" | "last90" | "thisWeek" | "lastWeek";
 
 export function getRange(preset: RangePreset, reference: Date = new Date()) {
   const now = new Date(reference);
@@ -43,7 +43,6 @@ export function getRange(preset: RangePreset, reference: Date = new Date()) {
     return { start, end, label: "This week" };
   }
 
-  // lastWeek
   const d = new Date(now);
   d.setHours(0, 0, 0, 0);
   const day = d.getDay();
@@ -54,16 +53,6 @@ export function getRange(preset: RangePreset, reference: Date = new Date()) {
   start.setDate(start.getDate() - 7);
   const end = new Date(thisMonday);
   return { start, end, label: "Last week" };
-}
-
-export function getCurrentWeekRange(reference: Date = new Date()) {
-  const r = getRange("thisWeek", reference);
-  return { weekStart: r.start, weekEnd: r.end };
-}
-
-export function getPreviousWeekRange(reference: Date = new Date()) {
-  const r = getRange("lastWeek", reference);
-  return { weekStart: r.start, weekEnd: r.end };
 }
 
 function isCompletedStatus(status: string | null | undefined) {
@@ -114,9 +103,7 @@ export async function runAudit(opts: {
 
       if (reasons.length > 0) {
         const clientName =
-          job.client?.companyName ||
-          job.client?.name ||
-          "Unknown client";
+          job.client?.companyName || job.client?.name || "Unknown client";
         const invoiceNumber =
           job.invoices?.nodes?.[0]?.invoiceNumber ?? null;
 
@@ -142,7 +129,7 @@ export async function runAudit(opts: {
       await prisma.flaggedJob.createMany({ data: flagged });
     }
 
-    const updated = await prisma.audit.update({
+    return await prisma.audit.update({
       where: { id: audit.id },
       data: {
         status: "complete",
@@ -153,8 +140,6 @@ export async function runAudit(opts: {
         flaggedJobs: flagged.length,
       },
     });
-
-    return updated;
   } catch (err: any) {
     await prisma.audit.update({
       where: { id: audit.id },

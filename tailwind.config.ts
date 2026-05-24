@@ -27,6 +27,9 @@ const config: Config = {
         accent: "hsl(var(--accent) / <alpha-value>)",
         "accent-foreground": "hsl(var(--accent-foreground) / <alpha-value>)",
         "page-bg": "hsl(var(--page-bg) / <alpha-value>)",
+        "flexx-green": "hsl(98 71% 51%)",
+        "flexx-silver": "hsl(0 0% 75%)",
+        "flexx-black": "hsl(0 0% 7%)",
       },
       fontFamily: {
         sans: ["ui-sans-serif", "system-ui", "-apple-system", "BlinkMacSystemFont", "Segoe UI", "Roboto", "sans-serif"],

@@ -10,7 +10,26 @@ export function formatCurrency(amount: number | null | undefined) {
   return new Intl.NumberFormat("en-US", {
     style: "currency",
     currency: "USD",
+    maximumFractionDigits: 0,
   }).format(amount);
+}
+
+export function formatCurrencyDetailed(amount: number | null | undefined) {
+  if (amount == null) return "—";
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+  }).format(amount);
+}
+
+export function formatNumber(n: number | null | undefined) {
+  if (n == null) return "—";
+  return new Intl.NumberFormat("en-US").format(n);
+}
+
+export function formatPercent(n: number | null | undefined, digits = 0) {
+  if (n == null) return "—";
+  return `${n.toFixed(digits)}%`;
 }
 
 export function formatDate(date: Date | string | null | undefined) {
@@ -33,4 +52,9 @@ export function formatDateTime(date: Date | string | null | undefined) {
     hour: "numeric",
     minute: "2-digit",
   });
+}
+
+export function monthLabel(year: number, month: number) {
+  const d = new Date(year, month - 1, 1);
+  return d.toLocaleDateString("en-US", { month: "short", year: "2-digit" });
 }

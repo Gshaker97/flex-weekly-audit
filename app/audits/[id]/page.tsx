@@ -23,14 +23,11 @@ export default async function AuditDetailPage({
   return (
     <div className="space-y-6">
       <div>
-        <Link
-          href="/"
-          className="text-sm text-muted-foreground hover:text-foreground"
-        >
-          ← Back to dashboard
+        <Link href="/audits" className="text-sm text-muted-foreground hover:text-foreground">
+          ← Back to audits
         </Link>
         <h2 className="mt-2 text-2xl font-semibold tracking-tight">
-          Audit · Week of {formatDate(audit.weekStart)}
+          Audit · {formatDate(audit.weekStart)}
         </h2>
         <p className="mt-1 text-sm text-muted-foreground">
           Run {formatDateTime(audit.startedAt)} · Trigger: {audit.triggeredBy}
@@ -57,9 +54,7 @@ export default async function AuditDetailPage({
         </CardHeader>
         <CardContent>
           {audit.flaggedJobItems.length === 0 ? (
-            <p className="text-sm text-muted-foreground">
-              No flagged jobs in this audit.
-            </p>
+            <p className="text-sm text-muted-foreground">No flagged jobs in this audit.</p>
           ) : (
             <div className="overflow-hidden rounded-lg border border-border">
               <table className="w-full text-sm">
