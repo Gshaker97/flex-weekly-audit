@@ -1,24 +1,69 @@
 import { prisma } from "./prisma";
-import { fetchJobsInWeek, JobberJobNode } from "./jobber";
+import { fetchJobsInRange, JobberJobNode } from "./jobber";
 
-export function getCurrentWeekRange(reference: Date = new Date()) {
-  const d = new Date(reference);
+export type RangePreset = "ytd" | "last30" | "thisWeek" | "lastWeek" | "last90";
+
+export function getRange(preset: RangePreset, reference: Date = new Date()) {
+  const now = new Date(reference);
+
+  if (preset === "ytd") {
+    const start = new Date(now.getFullYear(), 0, 1, 0, 0, 0, 0);
+    const end = new Date(now);
+    end.setHours(23, 59, 59, 999);
+    return { start, end, label: `Year to date (${now.getFullYear()})` };
+  }
+
+  if (preset === "last30") {
+    const end = new Date(now);
+    end.setHours(23, 59, 59, 999);
+    const start = new Date(now);
+    start.setDate(start.getDate() - 30);
+    start.setHours(0, 0, 0, 0);
+    return { start, end, label: "Last 30 days" };
+  }
+
+  if (preset === "last90") {
+    const end = new Date(now);
+    end.setHours(23, 59, 59, 999);
+    const start = new Date(now);
+    start.setDate(start.getDate() - 90);
+    start.setHours(0, 0, 0, 0);
+    return { start, end, label: "Last 90 days" };
+  }
+
+  if (preset === "thisWeek") {
+    const d = new Date(now);
+    d.setHours(0, 0, 0, 0);
+    const day = d.getDay();
+    const diffToMonday = (day + 6) % 7;
+    const start = new Date(d);
+    start.setDate(d.getDate() - diffToMonday);
+    const end = new Date(start);
+    end.setDate(start.getDate() + 7);
+    return { start, end, label: "This week" };
+  }
+
+  // lastWeek
+  const d = new Date(now);
   d.setHours(0, 0, 0, 0);
   const day = d.getDay();
   const diffToMonday = (day + 6) % 7;
-  const weekStart = new Date(d);
-  weekStart.setDate(d.getDate() - diffToMonday);
-  const weekEnd = new Date(weekStart);
-  weekEnd.setDate(weekStart.getDate() + 7);
-  return { weekStart, weekEnd };
+  const thisMonday = new Date(d);
+  thisMonday.setDate(d.getDate() - diffToMonday);
+  const start = new Date(thisMonday);
+  start.setDate(start.getDate() - 7);
+  const end = new Date(thisMonday);
+  return { start, end, label: "Last week" };
+}
+
+export function getCurrentWeekRange(reference: Date = new Date()) {
+  const r = getRange("thisWeek", reference);
+  return { weekStart: r.start, weekEnd: r.end };
 }
 
 export function getPreviousWeekRange(reference: Date = new Date()) {
-  const { weekStart } = getCurrentWeekRange(reference);
-  const prevEnd = new Date(weekStart);
-  const prevStart = new Date(weekStart);
-  prevStart.setDate(prevStart.getDate() - 7);
-  return { weekStart: prevStart, weekEnd: prevEnd };
+  const r = getRange("lastWeek", reference);
+  return { weekStart: r.start, weekEnd: r.end };
 }
 
 function isCompletedStatus(status: string | null | undefined) {
@@ -42,21 +87,21 @@ function classifyJob(job: JobberJobNode) {
 }
 
 export async function runAudit(opts: {
-  weekStart: Date;
-  weekEnd: Date;
+  rangeStart: Date;
+  rangeEnd: Date;
   triggeredBy?: "manual" | "cron";
 }) {
   const audit = await prisma.audit.create({
     data: {
-      weekStart: opts.weekStart,
-      weekEnd: opts.weekEnd,
+      weekStart: opts.rangeStart,
+      weekEnd: opts.rangeEnd,
       status: "running",
       triggeredBy: opts.triggeredBy ?? "manual",
     },
   });
 
   try {
-    const jobs = await fetchJobsInWeek(opts.weekStart, opts.weekEnd);
+    const jobs = await fetchJobsInRange(opts.rangeStart, opts.rangeEnd);
 
     let completedCount = 0;
     let invoicedCount = 0;
