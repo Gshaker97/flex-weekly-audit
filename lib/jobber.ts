@@ -155,7 +155,7 @@ export async function jobberGraphQL<T = any>(
 const JOBS_QUERY = `
   query GetJobs($after: String, $startDate: ISO8601DateTime!, $endDate: ISO8601DateTime!) {
     jobs(
-      first: 50
+      first: 25
       after: $after
       filter: {
         completedAt: { after: $startDate, before: $endDate }
@@ -175,7 +175,7 @@ const JOBS_QUERY = `
           name
           companyName
         }
-        invoices {
+        invoices(first: 5) {
           nodes { id invoiceNumber }
         }
       }
@@ -186,7 +186,7 @@ const JOBS_QUERY = `
 const JOBS_BY_END_QUERY = `
   query GetJobsByEnd($after: String, $startDate: ISO8601DateTime!, $endDate: ISO8601DateTime!) {
     jobs(
-      first: 50
+      first: 25
       after: $after
       filter: {
         endAt: { after: $startDate, before: $endDate }
@@ -206,7 +206,7 @@ const JOBS_BY_END_QUERY = `
           name
           companyName
         }
-        invoices {
+        invoices(first: 5) {
           nodes { id invoiceNumber }
         }
       }
@@ -257,7 +257,7 @@ export async function fetchJobsInRange(
         break;
       }
       if (hasNext) {
-        await new Promise((r) => setTimeout(r, 250));
+        await new Promise((r) => setTimeout(r, 500));
       }
     }
   };
