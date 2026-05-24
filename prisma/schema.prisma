@@ -1,0 +1,60 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model JobberAuth {
+  id            String   @id @default(cuid())
+  accessToken   String   @db.Text
+  refreshToken  String   @db.Text
+  expiresAt     DateTime
+  accountName   String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+model Audit {
+  id              String        @id @default(cuid())
+  weekStart       DateTime
+  weekEnd         DateTime
+  totalJobs       Int           @default(0)
+  completedJobs   Int           @default(0)
+  invoicedJobs    Int           @default(0)
+  flaggedJobs     Int           @default(0)
+  status          String        @default("pending")
+  errorMessage    String?       @db.Text
+  triggeredBy     String        @default("manual")
+  startedAt       DateTime      @default(now())
+  completedAt     DateTime?
+  flaggedJobItems FlaggedJob[]
+
+  @@index([weekStart])
+  @@index([startedAt])
+}
+
+model FlaggedJob {
+  id              String   @id @default(cuid())
+  auditId         String
+  jobberJobId     String
+  jobNumber       String?
+  jobTitle        String?
+  clientName      String?
+  jobStatus       String?
+  completedAt     DateTime?
+  scheduledEnd    DateTime?
+  totalAmount     Float?
+  hasInvoice      Boolean  @default(false)
+  invoiceNumber   String?
+  flagReasons     String[] 
+  jobberUrl       String?
+  createdAt       DateTime @default(now())
+
+  audit Audit @relation(fields: [auditId], references: [id], onDelete: Cascade)
+
+  @@index([auditId])
+  @@index([jobberJobId])
+}
