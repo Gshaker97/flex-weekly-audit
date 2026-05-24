@@ -5,6 +5,29 @@ const JOBBER_TOKEN_URL = "https://api.getjobber.com/api/oauth/token";
 const JOBBER_AUTHORIZE_URL = "https://api.getjobber.com/api/oauth/authorize";
 const JOBBER_API_VERSION = "2024-04-01";
 
+function decodeJwtExpiry(token: string): number | null {
+  try {
+    const parts = token.split(".");
+    if (parts.length < 2) return null;
+    const payload = JSON.parse(
+      Buffer.from(parts[1], "base64").toString("utf-8")
+    );
+    if (typeof payload.exp === "number") return payload.exp;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function computeExpiresAt(tokens: any): Date {
+  if (typeof tokens.expires_in === "number" && tokens.expires_in > 0) {
+    return new Date(Date.now() + tokens.expires_in * 1000);
+  }
+  const jwtExp = decodeJwtExpiry(tokens.access_token);
+  if (jwtExp) return new Date(jwtExp * 1000);
+  return new Date(Date.now() + 55 * 60 * 1000);
+}
+
 export function getAuthorizeUrl(state: string) {
   const params = new URLSearchParams({
     client_id: process.env.JOBBER_CLIENT_ID!,
@@ -38,8 +61,8 @@ export async function exchangeCodeForToken(code: string) {
   return res.json() as Promise<{
     access_token: string;
     refresh_token: string;
-    expires_in: number;
-    token_type: string;
+    expires_in?: number;
+    token_type?: string;
   }>;
 }
 
@@ -65,7 +88,7 @@ export async function refreshAccessToken(refreshToken: string) {
   return res.json() as Promise<{
     access_token: string;
     refresh_token: string;
-    expires_in: number;
+    expires_in?: number;
   }>;
 }
 
@@ -90,7 +113,7 @@ export async function getValidAccessToken(): Promise<string> {
     data: {
       accessToken: refreshed.access_token,
       refreshToken: refreshed.refresh_token,
-      expiresAt: new Date(Date.now() + refreshed.expires_in * 1000),
+      expiresAt: computeExpiresAt(refreshed),
     },
   });
 
