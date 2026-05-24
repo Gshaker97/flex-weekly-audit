@@ -45,7 +45,7 @@ export default async function DashboardPage() {
       <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
         <div>
           <h2 className="text-2xl font-semibold tracking-tight">
-            Weekly Operations Audit
+            Operations Audit
           </h2>
           <p className="mt-1 text-sm text-muted-foreground">
             {latest ? (
@@ -55,7 +55,7 @@ export default async function DashboardPage() {
                 {formatDate(new Date(latest.weekEnd.getTime() - 1))}
               </>
             ) : (
-              "No audits yet. Run your first audit to see results here."
+              "No audits yet. Pick a range and run your first audit."
             )}
           </p>
         </div>
@@ -66,7 +66,7 @@ export default async function DashboardPage() {
         <>
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
             <StatCard
-              label="Total Jobs This Week"
+              label="Total Jobs in Range"
               value={latest.totalJobs}
               sublabel="Jobs scheduled or completed"
               icon={<ListTodo size={18} />}
@@ -115,7 +115,7 @@ export default async function DashboardPage() {
             <CardHeader>
               <CardTitle>Flagged Jobs</CardTitle>
               <CardDescription>
-                Jobs from this week that are missing a completion status, an
+                Jobs in this range that are missing a completion status, an
                 invoice, or both.
               </CardDescription>
             </CardHeader>
@@ -130,7 +130,7 @@ export default async function DashboardPage() {
                     All jobs are complete and invoiced
                   </p>
                   <p className="mt-1 text-sm text-muted-foreground">
-                    Nothing needs attention for this week.
+                    Nothing needs attention for this range.
                   </p>
                 </div>
               ) : (
@@ -143,8 +143,7 @@ export default async function DashboardPage() {
         <Card>
           <CardContent className="pt-6">
             <p className="text-sm text-muted-foreground">
-              Run your first audit to see this week&apos;s job and invoice
-              status.
+              Run your first audit to see job and invoice status.
             </p>
           </CardContent>
         </Card>
@@ -165,7 +164,7 @@ export default async function DashboardPage() {
               <table className="w-full text-sm">
                 <thead className="bg-muted/50">
                   <tr className="text-left text-xs uppercase tracking-wide text-muted-foreground">
-                    <th className="px-4 py-2.5 font-medium">Week of</th>
+                    <th className="px-4 py-2.5 font-medium">Range start</th>
                     <th className="px-4 py-2.5 font-medium">Run at</th>
                     <th className="px-4 py-2.5 font-medium">Trigger</th>
                     <th className="px-4 py-2.5 font-medium">Total</th>
