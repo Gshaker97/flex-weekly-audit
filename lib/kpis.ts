@@ -1,24 +1,28 @@
 import { prisma } from "./prisma";
+import { DateRange, getDateRange, DateRangePreset } from "./dateRange";
 
 export interface DashboardKPIs {
-  revenueYTD: number;
-  revenueLastMonth: number;
-  revenueThisMonth: number;
-  momChangePercent: number | null;
+  range: DateRange;
 
-  revenueAtRisk: number;
+  revenueInRange: number;
+  revenueCompareValue: number;
+  revenueChangePercent: number | null;
+
+  overdueRevenue: number;
+  overdueJobCount: number;
   uninvoicedRevenue: number;
+  uninvoicedJobCount: number;
   outstandingReceivables: number;
   averageJobValue: number;
 
   totalCustomers: number;
   recurringCustomers: number;
-  newCustomersThisMonth: number;
-  newCustomersLastMonth: number;
+  newCustomersInRange: number;
+  newCustomersCompare: number;
   churnedRecurringLast90: number;
 
-  recurringRevenueYTD: number;
-  oneOffRevenueYTD: number;
+  recurringRevenueInRange: number;
+  oneOffRevenueInRange: number;
 
   monthlySeries: Array<{
     year: number;
@@ -47,14 +51,18 @@ export interface DashboardKPIs {
   lastSyncAt: Date | null;
 }
 
-export async function computeDashboardKPIs(): Promise<DashboardKPIs> {
-  const now = new Date();
-  const year = now.getFullYear();
-  const month = now.getMonth() + 1;
+function previousPeriod(range: DateRange): { start: Date; end: Date } {
+  const ms = range.end.getTime() - range.start.getTime();
+  const end = new Date(range.start.getTime() - 1);
+  const start = new Date(range.start.getTime() - ms - 1);
+  return { start, end };
+}
 
-  const lastMonthDate = new Date(year, month - 2, 1);
-  const lastMonthY = lastMonthDate.getFullYear();
-  const lastMonthM = lastMonthDate.getMonth() + 1;
+export async function computeDashboardKPIs(
+  preset: DateRangePreset = "ytd"
+): Promise<DashboardKPIs> {
+  const range = getDateRange(preset);
+  const prev = previousPeriod(range);
 
   const monthlyAll = await prisma.monthlySnapshot.findMany({
     orderBy: [{ year: "asc" }, { month: "asc" }],
@@ -73,80 +81,86 @@ export async function computeDashboardKPIs(): Promise<DashboardKPIs> {
     averageJobValue: m.averageJobValue,
   }));
 
-  const thisMonthSnap = monthlyAll.find((m) => m.year === year && m.month === month);
-  const lastMonthSnap = monthlyAll.find(
-    (m) => m.year === lastMonthY && m.month === lastMonthM
-  );
-
-  const revenueThisMonth = thisMonthSnap?.invoicedRevenue ?? 0;
-  const revenueLastMonth = lastMonthSnap?.invoicedRevenue ?? 0;
-  const momChangePercent =
-    revenueLastMonth > 0
-      ? ((revenueThisMonth - revenueLastMonth) / revenueLastMonth) * 100
-      : null;
-
-  const revenueYTD = monthlyAll
-    .filter((m) => m.year === year)
-    .reduce((acc, m) => acc + m.invoicedRevenue, 0);
-
-  const recurringRevenueYTD = monthlyAll
-    .filter((m) => m.year === year)
-    .reduce((acc, m) => acc + m.recurringRevenue, 0);
-
-  const oneOffRevenueYTD = monthlyAll
-    .filter((m) => m.year === year)
-    .reduce((acc, m) => acc + m.oneOffRevenue, 0);
-
-  const newCustomersThisMonth = thisMonthSnap?.newCustomers ?? 0;
-  const newCustomersLastMonth = lastMonthSnap?.newCustomers ?? 0;
-
-  // Revenue at risk: jobs not marked complete but past end date, with a $ value
-  const now0 = new Date();
-  const revAtRiskAgg = await prisma.jobRecord.aggregate({
-    where: {
-      completedAt: null,
-      endAt: { lt: now0 },
-    },
+  const revInRange = await prisma.invoiceRecord.aggregate({
+    where: { issuedAt: { gte: range.start, lte: range.end } },
     _sum: { total: true },
   });
-  const revenueAtRisk = revAtRiskAgg._sum.total ?? 0;
+  const revenueInRange = revInRange._sum.total ?? 0;
 
-  // Uninvoiced revenue: completed jobs with no invoice
+  const revPrev = await prisma.invoiceRecord.aggregate({
+    where: { issuedAt: { gte: prev.start, lte: prev.end } },
+    _sum: { total: true },
+  });
+  const revenueCompareValue = revPrev._sum.total ?? 0;
+  const revenueChangePercent =
+    revenueCompareValue > 0
+      ? ((revenueInRange - revenueCompareValue) / revenueCompareValue) * 100
+      : null;
+
+  // Overdue Revenue: NOT recurring, end date past, no completion, no invoice
+  const now0 = new Date();
+  const overdueAgg = await prisma.jobRecord.aggregate({
+    where: {
+      isRecurring: false,
+      completedAt: null,
+      hasInvoice: false,
+      endAt: { lt: now0, not: null },
+      total: { gt: 0 },
+    },
+    _sum: { total: true },
+    _count: true,
+  });
+  const overdueRevenue = overdueAgg._sum.total ?? 0;
+  const overdueJobCount = overdueAgg._count ?? 0;
+
   const uninvAgg = await prisma.jobRecord.aggregate({
     where: {
       completedAt: { not: null },
       hasInvoice: false,
+      total: { gt: 0 },
     },
     _sum: { total: true },
+    _count: true,
   });
   const uninvoicedRevenue = uninvAgg._sum.total ?? 0;
+  const uninvoicedJobCount = uninvAgg._count ?? 0;
 
-  // Outstanding receivables: sum of amountDue on invoices
   const outstandingAgg = await prisma.invoiceRecord.aggregate({
     where: { amountDue: { gt: 0 } },
     _sum: { amountDue: true },
   });
   const outstandingReceivables = outstandingAgg._sum.amountDue ?? 0;
 
-  // Average job value YTD (over completed jobs in this year with non-zero total)
-  const ytdJobs = await prisma.jobRecord.findMany({
+  const rangeJobs = await prisma.jobRecord.findMany({
     where: {
-      completedAt: { gte: new Date(year, 0, 1), lte: new Date(year, 11, 31, 23, 59, 59) },
+      completedAt: { gte: range.start, lte: range.end },
       total: { gt: 0 },
     },
-    select: { total: true },
+    select: { total: true, isRecurring: true },
   });
   const averageJobValue =
-    ytdJobs.length > 0
-      ? ytdJobs.reduce((a, j) => a + j.total, 0) / ytdJobs.length
+    rangeJobs.length > 0
+      ? rangeJobs.reduce((a, j) => a + j.total, 0) / rangeJobs.length
       : 0;
+  const recurringRevenueInRange = rangeJobs
+    .filter((j) => j.isRecurring)
+    .reduce((a, j) => a + j.total, 0);
+  const oneOffRevenueInRange = rangeJobs
+    .filter((j) => !j.isRecurring)
+    .reduce((a, j) => a + j.total, 0);
 
   const totalCustomers = await prisma.customer.count();
   const recurringCustomers = await prisma.customer.count({
     where: { isRecurring: true },
   });
 
-  // Churn: recurring customers whose lastJobAt is older than 90 days
+  const newCustomersInRange = await prisma.customer.count({
+    where: { createdAtJobber: { gte: range.start, lte: range.end } },
+  });
+  const newCustomersCompare = await prisma.customer.count({
+    where: { createdAtJobber: { gte: prev.start, lte: prev.end } },
+  });
+
   const ninetyAgo = new Date(now0);
   ninetyAgo.setDate(ninetyAgo.getDate() - 90);
   const churnedRecurringLast90 = await prisma.customer.count({
@@ -156,28 +170,60 @@ export async function computeDashboardKPIs(): Promise<DashboardKPIs> {
     },
   });
 
-  const topCustomerRows = await prisma.customer.findMany({
-    where: { totalRevenue: { gt: 0 } },
-    orderBy: { totalRevenue: "desc" },
-    take: 10,
+  // Top 10 customers within the date range
+  const rangeCustomerJobs = await prisma.jobRecord.findMany({
+    where: {
+      completedAt: { gte: range.start, lte: range.end },
+      total: { gt: 0 },
+      customerId: { not: null },
+    },
+    select: { customerId: true, total: true, isRecurring: true },
   });
-  const topCustomers = topCustomerRows.map((c) => ({
-    id: c.id,
-    name: c.companyName || c.name || "Unknown",
-    revenue: c.totalRevenue,
-    jobCount: c.jobCount,
-    isRecurring: c.isRecurring,
-  }));
+  const customerTotals = new Map<string, { revenue: number; jobs: number; recurring: boolean }>();
+  for (const j of rangeCustomerJobs) {
+    if (!j.customerId) continue;
+    const ex = customerTotals.get(j.customerId) ?? { revenue: 0, jobs: 0, recurring: false };
+    ex.revenue += j.total;
+    ex.jobs += 1;
+    if (j.isRecurring) ex.recurring = true;
+    customerTotals.set(j.customerId, ex);
+  }
+  const sortedCustomerIds = Array.from(customerTotals.entries())
+    .sort((a, b) => b[1].revenue - a[1].revenue)
+    .slice(0, 10);
+  const customerLookups = await prisma.customer.findMany({
+    where: { id: { in: sortedCustomerIds.map(([id]) => id) } },
+  });
+  const customerById = new Map(customerLookups.map((c) => [c.id, c]));
+  const topCustomers = sortedCustomerIds
+    .map(([id, agg]) => {
+      const c = customerById.get(id);
+      if (!c) return null;
+      return {
+        id: c.id,
+        name: c.companyName || c.name || "Unknown",
+        revenue: agg.revenue,
+        jobCount: agg.jobs,
+        isRecurring: agg.recurring,
+      };
+    })
+    .filter(Boolean) as DashboardKPIs["topCustomers"];
 
-  const stRows = await prisma.serviceTypeRevenue.findMany({
-    where: { year },
-    orderBy: { revenue: "desc" },
+  const rangeJobsWithType = await prisma.jobRecord.findMany({
+    where: { completedAt: { gte: range.start, lte: range.end } },
+    select: { jobType: true, total: true },
   });
-  const serviceTypeRevenue = stRows.map((r) => ({
-    serviceName: r.serviceName,
-    revenue: r.revenue,
-    jobCount: r.jobCount,
-  }));
+  const stMap = new Map<string, { revenue: number; jobCount: number }>();
+  for (const j of rangeJobsWithType) {
+    const key = j.jobType || "Other";
+    const ex = stMap.get(key) ?? { revenue: 0, jobCount: 0 };
+    ex.revenue += j.total || 0;
+    ex.jobCount += 1;
+    stMap.set(key, ex);
+  }
+  const serviceTypeRevenue = Array.from(stMap.entries())
+    .map(([serviceName, agg]) => ({ serviceName, ...agg }))
+    .sort((a, b) => b.revenue - a.revenue);
 
   const lastSync = await prisma.syncRun.findFirst({
     where: { status: "complete" },
@@ -185,21 +231,23 @@ export async function computeDashboardKPIs(): Promise<DashboardKPIs> {
   });
 
   return {
-    revenueYTD,
-    revenueLastMonth,
-    revenueThisMonth,
-    momChangePercent,
-    revenueAtRisk,
+    range,
+    revenueInRange,
+    revenueCompareValue,
+    revenueChangePercent,
+    overdueRevenue,
+    overdueJobCount,
     uninvoicedRevenue,
+    uninvoicedJobCount,
     outstandingReceivables,
     averageJobValue,
     totalCustomers,
     recurringCustomers,
-    newCustomersThisMonth,
-    newCustomersLastMonth,
+    newCustomersInRange,
+    newCustomersCompare,
     churnedRecurringLast90,
-    recurringRevenueYTD,
-    oneOffRevenueYTD,
+    recurringRevenueInRange,
+    oneOffRevenueInRange,
     monthlySeries,
     topCustomers,
     serviceTypeRevenue,

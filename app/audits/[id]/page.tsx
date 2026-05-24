@@ -4,7 +4,7 @@ import { prisma } from "@/lib/prisma";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/Card";
 import { Badge } from "@/components/ui/Badge";
 import { StatCard } from "@/components/ui/StatCard";
-import { formatCurrency, formatDate, formatDateTime } from "@/lib/utils";
+import { formatCurrency, formatCurrencyDetailed, formatDate, formatDateTime } from "@/lib/utils";
 
 export const dynamic = "force-dynamic";
 
@@ -19,6 +19,11 @@ export default async function AuditDetailPage({
   });
 
   if (!audit) return notFound();
+
+  const totalFlaggedValue = audit.flaggedJobItems.reduce(
+    (acc, j) => acc + (j.totalAmount || 0),
+    0
+  );
 
   return (
     <div className="space-y-6">
@@ -39,8 +44,9 @@ export default async function AuditDetailPage({
         <StatCard label="Completed" value={audit.completedJobs} accent="success" />
         <StatCard label="Invoiced" value={audit.invoicedJobs} accent="success" />
         <StatCard
-          label="Flagged"
-          value={audit.flaggedJobs}
+          label="Flagged Value"
+          value={formatCurrency(totalFlaggedValue)}
+          sublabel={`${audit.flaggedJobs} jobs`}
           accent={audit.flaggedJobs > 0 ? "danger" : "success"}
         />
       </div>
@@ -64,7 +70,7 @@ export default async function AuditDetailPage({
                     <th className="px-4 py-2.5 font-medium">Client</th>
                     <th className="px-4 py-2.5 font-medium">End</th>
                     <th className="px-4 py-2.5 font-medium">Status</th>
-                    <th className="px-4 py-2.5 font-medium">Amount</th>
+                    <th className="px-4 py-2.5 font-medium">Value</th>
                     <th className="px-4 py-2.5 font-medium">Issues</th>
                   </tr>
                 </thead>
@@ -86,8 +92,8 @@ export default async function AuditDetailPage({
                       <td className="px-4 py-3">
                         <Badge variant="muted">{j.jobStatus ?? "unknown"}</Badge>
                       </td>
-                      <td className="px-4 py-3 font-medium">
-                        {formatCurrency(j.totalAmount)}
+                      <td className="px-4 py-3 font-semibold">
+                        {formatCurrencyDetailed(j.totalAmount)}
                       </td>
                       <td className="px-4 py-3">
                         <div className="flex flex-wrap gap-1">

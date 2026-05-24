@@ -2,7 +2,9 @@ import Link from "next/link";
 import { prisma } from "@/lib/prisma";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/Card";
 import { Badge } from "@/components/ui/Badge";
-import { formatDate, formatDateTime } from "@/lib/utils";
+import { StatCard } from "@/components/ui/StatCard";
+import { formatCurrency, formatDate, formatDateTime } from "@/lib/utils";
+import { AlertCircle, ListTodo, CheckCircle2, FileText } from "lucide-react";
 import RunAuditButton from "./RunAuditButton";
 
 export const dynamic = "force-dynamic";
@@ -18,13 +20,15 @@ export default async function AuditsPage() {
     take: 20,
   });
 
+  const totalFlaggedValue = latest
+    ? latest.flaggedJobItems.reduce((acc, j) => acc + (j.totalAmount || 0), 0)
+    : 0;
+
   return (
     <div className="space-y-6">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
         <div>
-          <h2 className="text-2xl font-semibold tracking-tight">
-            Job Completion Audits
-          </h2>
+          <h2 className="text-2xl font-semibold tracking-tight">Job Completion Audits</h2>
           <p className="mt-1 text-sm text-muted-foreground">
             Find jobs that aren&apos;t marked complete or are missing an invoice.
           </p>
@@ -33,57 +37,112 @@ export default async function AuditsPage() {
       </div>
 
       {latest && (
-        <Card>
-          <CardHeader>
-            <CardTitle>Most Recent Audit</CardTitle>
-            <CardDescription>
-              {formatDate(latest.weekStart)} — {formatDate(new Date(latest.weekEnd.getTime() - 1))}
-              {" · "}
-              {latest.totalJobs} jobs scanned, {latest.flaggedJobs} flagged
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            {latest.flaggedJobItems.length === 0 ? (
-              <p className="text-sm text-muted-foreground">No flagged jobs.</p>
-            ) : (
-              <div className="overflow-hidden rounded-lg border border-border">
-                <table className="w-full text-sm">
-                  <thead className="bg-muted/50">
-                    <tr className="text-left text-xs uppercase tracking-wide text-muted-foreground">
-                      <th className="px-4 py-2.5 font-medium">Job</th>
-                      <th className="px-4 py-2.5 font-medium">Client</th>
-                      <th className="px-4 py-2.5 font-medium">Issues</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-border">
-                    {latest.flaggedJobItems.slice(0, 25).map((j) => (
-                      <tr key={j.id} className="hover:bg-muted/30">
-                        <td className="px-4 py-3">
-                          <div className="font-medium">
-                            {j.jobNumber ? `#${j.jobNumber}` : "—"}
-                          </div>
-                          <div className="text-xs text-muted-foreground">
-                            {j.jobTitle ?? ""}
-                          </div>
-                        </td>
-                        <td className="px-4 py-3">{j.clientName ?? "—"}</td>
-                        <td className="px-4 py-3">
-                          <div className="flex flex-wrap gap-1">
-                            {j.flagReasons.map((r) => (
-                              <Badge key={r} variant="danger">
-                                {r}
-                              </Badge>
-                            ))}
-                          </div>
-                        </td>
+        <>
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            <StatCard
+              label="Total Jobs Audited"
+              value={latest.totalJobs}
+              sublabel={`Range: ${formatDate(latest.weekStart)} – ${formatDate(new Date(latest.weekEnd.getTime() - 1))}`}
+              icon={<ListTodo size={18} />}
+            />
+            <StatCard
+              label="Marked Complete"
+              value={latest.completedJobs}
+              sublabel={
+                latest.totalJobs > 0
+                  ? `${Math.round((latest.completedJobs / latest.totalJobs) * 100)}% completion rate`
+                  : undefined
+              }
+              accent="success"
+              icon={<CheckCircle2 size={18} />}
+            />
+            <StatCard
+              label="Invoiced"
+              value={latest.invoicedJobs}
+              sublabel={
+                latest.totalJobs > 0
+                  ? `${Math.round((latest.invoicedJobs / latest.totalJobs) * 100)}% invoiced rate`
+                  : undefined
+              }
+              accent="success"
+              icon={<FileText size={18} />}
+            />
+            <StatCard
+              label="Flagged Value"
+              value={formatCurrency(totalFlaggedValue)}
+              sublabel={`${latest.flaggedJobs} jobs need attention`}
+              accent={latest.flaggedJobs > 0 ? "danger" : "success"}
+              icon={<AlertCircle size={18} />}
+            />
+          </div>
+
+          <Card>
+            <CardHeader>
+              <CardTitle>Most Recent Audit · {formatDateTime(latest.startedAt)}</CardTitle>
+              <CardDescription>
+                {latest.flaggedJobs > 0
+                  ? `${latest.flaggedJobs} flagged jobs · ${formatCurrency(totalFlaggedValue)} in flagged value`
+                  : "All jobs in this audit look good."}
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              {latest.flaggedJobItems.length === 0 ? (
+                <p className="text-sm text-muted-foreground">No flagged jobs.</p>
+              ) : (
+                <div className="overflow-hidden rounded-lg border border-border">
+                  <table className="w-full text-sm">
+                    <thead className="bg-muted/50">
+                      <tr className="text-left text-xs uppercase tracking-wide text-muted-foreground">
+                        <th className="px-4 py-2.5 font-medium">Job</th>
+                        <th className="px-4 py-2.5 font-medium">Client</th>
+                        <th className="px-4 py-2.5 font-medium">Value</th>
+                        <th className="px-4 py-2.5 font-medium">Issues</th>
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </CardContent>
-        </Card>
+                    </thead>
+                    <tbody className="divide-y divide-border">
+                      {latest.flaggedJobItems.slice(0, 50).map((j) => (
+                        <tr key={j.id} className="hover:bg-muted/30">
+                          <td className="px-4 py-3">
+                            <div className="font-medium">
+                              {j.jobNumber ? `#${j.jobNumber}` : "—"}
+                            </div>
+                            <div className="text-xs text-muted-foreground">
+                              {j.jobTitle ?? ""}
+                            </div>
+                          </td>
+                          <td className="px-4 py-3">{j.clientName ?? "—"}</td>
+                          <td className="px-4 py-3 font-semibold">
+                            {formatCurrency(j.totalAmount)}
+                          </td>
+                          <td className="px-4 py-3">
+                            <div className="flex flex-wrap gap-1">
+                              {j.flagReasons.map((r) => (
+                                <Badge key={r} variant="danger">
+                                  {r}
+                                </Badge>
+                              ))}
+                            </div>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  {latest.flaggedJobItems.length > 50 && (
+                    <div className="border-t border-border bg-muted/30 px-4 py-2 text-xs text-muted-foreground">
+                      Showing 50 of {latest.flaggedJobItems.length} flagged jobs.{" "}
+                      <Link
+                        href={`/audits/${latest.id}`}
+                        className="text-accent hover:underline"
+                      >
+                        View all →
+                      </Link>
+                    </div>
+                  )}
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        </>
       )}
 
       <Card>

@@ -1,9 +1,12 @@
 import { prisma } from "@/lib/prisma";
 import { computeDashboardKPIs } from "@/lib/kpis";
+import { parsePreset } from "@/lib/dateRange";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { Badge } from "@/components/ui/Badge";
 import { StatCard } from "@/components/ui/StatCard";
+import { ClickableStatCard } from "@/components/ui/ClickableStatCard";
+import DateRangeFilter from "@/components/ui/DateRangeFilter";
 import RevenueLineChart from "@/components/ui/RevenueLineChart";
 import NewCustomersBarChart from "@/components/ui/NewCustomersBarChart";
 import SyncButton from "./SyncButton";
@@ -26,7 +29,11 @@ import {
 
 export const dynamic = "force-dynamic";
 
-export default async function DashboardPage() {
+export default async function DashboardPage({
+  searchParams,
+}: {
+  searchParams: { range?: string };
+}) {
   const auth = await prisma.jobberAuth.findFirst({
     orderBy: { createdAt: "desc" },
   });
@@ -40,73 +47,93 @@ export default async function DashboardPage() {
 
   if (!lastSync) return <FirstSyncPrompt />;
 
-  const kpis = await computeDashboardKPIs();
+  const preset = parsePreset(searchParams.range);
+  const kpis = await computeDashboardKPIs(preset);
 
   const last12Months = kpis.monthlySeries.slice(-12);
 
+  const compareLabel =
+    kpis.revenueCompareValue > 0
+      ? `vs ${formatCurrency(kpis.revenueCompareValue)} prior period`
+      : "No prior period data";
+
   return (
     <div className="space-y-8">
-      <DashboardHeader lastSyncAt={kpis.lastSyncAt} />
+      <DashboardHeader
+        lastSyncAt={kpis.lastSyncAt}
+        rangeLabel={kpis.range.label}
+        preset={preset}
+      />
 
       <section className="space-y-3">
         <SectionTitle title="Revenue" />
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
           <StatCard
-            label="Revenue YTD"
-            value={formatCurrency(kpis.revenueYTD)}
-            sublabel={`Invoiced this year`}
+            label={`Revenue (${kpis.range.label})`}
+            value={formatCurrency(kpis.revenueInRange)}
+            sublabel="Invoiced in range"
             accent="brand"
             icon={<DollarSign size={18} />}
-          />
-          <StatCard
-            label="This Month"
-            value={formatCurrency(kpis.revenueThisMonth)}
-            sublabel={
-              kpis.momChangePercent != null
-                ? `vs ${formatCurrency(kpis.revenueLastMonth)} last month`
-                : "First month tracked"
-            }
-            accent="success"
-            icon={<TrendingUp size={18} />}
-            changePercent={kpis.momChangePercent}
+            changePercent={kpis.revenueChangePercent}
           />
           <StatCard
             label="Average Job Value"
             value={formatCurrency(kpis.averageJobValue)}
-            sublabel="YTD completed jobs"
+            sublabel="Completed jobs in range"
             icon={<Receipt size={18} />}
           />
           <StatCard
             label="Outstanding Receivables"
             value={formatCurrency(kpis.outstandingReceivables)}
-            sublabel="Invoiced but unpaid"
+            sublabel="Invoiced but unpaid (all time)"
             accent={kpis.outstandingReceivables > 0 ? "warning" : "default"}
             icon={<PiggyBank size={18} />}
           />
+          <StatCard
+            label="Recurring vs One-off"
+            value={
+              kpis.recurringRevenueInRange + kpis.oneOffRevenueInRange > 0
+                ? `${Math.round(
+                    (kpis.recurringRevenueInRange /
+                      (kpis.recurringRevenueInRange + kpis.oneOffRevenueInRange)) *
+                      100
+                  )}%`
+                : "—"
+            }
+            sublabel="Recurring share of revenue"
+            icon={<Repeat size={18} />}
+          />
         </div>
+        <p className="text-xs text-muted-foreground">{compareLabel}</p>
       </section>
 
       <section className="space-y-3">
         <SectionTitle title="Risk &amp; Gaps" />
+        <p className="text-xs text-muted-foreground">
+          Click any card to see the specific jobs or customers behind the number.
+        </p>
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          <StatCard
-            label="Revenue at Risk"
-            value={formatCurrency(kpis.revenueAtRisk)}
-            sublabel="Past end date, not completed"
-            accent={kpis.revenueAtRisk > 0 ? "danger" : "success"}
+          <ClickableStatCard
+            href="/risk/overdue"
+            label="Overdue Revenue"
+            value={formatCurrency(kpis.overdueRevenue)}
+            sublabel={`${kpis.overdueJobCount} one-off jobs past end date, not closed out`}
+            accent={kpis.overdueRevenue > 0 ? "danger" : "success"}
             icon={<AlertCircle size={18} />}
           />
-          <StatCard
+          <ClickableStatCard
+            href="/risk/uninvoiced"
             label="Uninvoiced Revenue"
             value={formatCurrency(kpis.uninvoicedRevenue)}
-            sublabel="Completed but no invoice"
+            sublabel={`${kpis.uninvoicedJobCount} completed jobs with no invoice`}
             accent={kpis.uninvoicedRevenue > 0 ? "warning" : "success"}
             icon={<Receipt size={18} />}
           />
-          <StatCard
+          <ClickableStatCard
+            href="/risk/churn"
             label="Recurring Churn (90d)"
             value={formatNumber(kpis.churnedRecurringLast90)}
-            sublabel="Recurring with no recent job"
+            sublabel="Recurring customers with no recent job"
             accent={kpis.churnedRecurringLast90 > 0 ? "warning" : "success"}
             icon={<Repeat size={18} />}
           />
@@ -134,25 +161,25 @@ export default async function DashboardPage() {
             icon={<Repeat size={18} />}
           />
           <StatCard
-            label="New This Month"
-            value={formatNumber(kpis.newCustomersThisMonth)}
-            sublabel={`vs ${kpis.newCustomersLastMonth} last month`}
+            label={`New (${kpis.range.label})`}
+            value={formatNumber(kpis.newCustomersInRange)}
+            sublabel={`vs ${kpis.newCustomersCompare} prior period`}
             accent="success"
             icon={<UserPlus size={18} />}
           />
           <StatCard
-            label="Recurring vs One-off (YTD)"
+            label="One-off vs Recurring Rev"
             value={
-              kpis.recurringRevenueYTD + kpis.oneOffRevenueYTD > 0
+              kpis.recurringRevenueInRange + kpis.oneOffRevenueInRange > 0
                 ? `${Math.round(
-                    (kpis.recurringRevenueYTD /
-                      (kpis.recurringRevenueYTD + kpis.oneOffRevenueYTD)) *
+                    (kpis.oneOffRevenueInRange /
+                      (kpis.recurringRevenueInRange + kpis.oneOffRevenueInRange)) *
                       100
                   )}%`
                 : "—"
             }
-            sublabel="Share of revenue from recurring"
-            icon={<Repeat size={18} />}
+            sublabel="One-off share of revenue"
+            icon={<TrendingUp size={18} />}
           />
         </div>
       </section>
@@ -190,11 +217,11 @@ export default async function DashboardPage() {
         <Card>
           <CardHeader>
             <CardTitle>Top 10 Customers by Revenue</CardTitle>
-            <CardDescription>YTD totals</CardDescription>
+            <CardDescription>Within selected range</CardDescription>
           </CardHeader>
           <CardContent>
             {kpis.topCustomers.length === 0 ? (
-              <EmptyState message="No customer revenue recorded yet." />
+              <EmptyState message="No customer revenue in this range." />
             ) : (
               <div className="overflow-hidden rounded-lg border border-border">
                 <table className="w-full text-sm">
@@ -212,9 +239,7 @@ export default async function DashboardPage() {
                           <div className="flex items-center gap-2">
                             <span className="text-xs text-muted-foreground">{i + 1}.</span>
                             <span className="font-medium">{c.name}</span>
-                            {c.isRecurring && (
-                              <Badge variant="success">Recurring</Badge>
-                            )}
+                            {c.isRecurring && <Badge variant="success">Recurring</Badge>}
                           </div>
                         </td>
                         <td className="px-4 py-3 text-muted-foreground">{c.jobCount}</td>
@@ -233,11 +258,11 @@ export default async function DashboardPage() {
         <Card>
           <CardHeader>
             <CardTitle>Revenue by Service Type</CardTitle>
-            <CardDescription>YTD breakdown</CardDescription>
+            <CardDescription>Within selected range</CardDescription>
           </CardHeader>
           <CardContent>
             {kpis.serviceTypeRevenue.length === 0 ? (
-              <EmptyState message="No service type data yet." />
+              <EmptyState message="No service type data in this range." />
             ) : (
               <div className="overflow-hidden rounded-lg border border-border">
                 <table className="w-full text-sm">
@@ -269,20 +294,31 @@ export default async function DashboardPage() {
   );
 }
 
-function DashboardHeader({ lastSyncAt }: { lastSyncAt: Date | null }) {
+function DashboardHeader({
+  lastSyncAt,
+  rangeLabel,
+  preset,
+}: {
+  lastSyncAt: Date | null;
+  rangeLabel: string;
+  preset: any;
+}) {
   return (
     <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
       <div>
-        <h2 className="text-2xl font-semibold tracking-tight">
-          Business Overview
-        </h2>
+        <h2 className="text-2xl font-semibold tracking-tight">Business Overview</h2>
         <p className="mt-1 text-sm text-muted-foreground">
+          Showing data for <span className="font-medium text-foreground">{rangeLabel}</span>
+          {" · "}
           {lastSyncAt
-            ? `Last synced ${formatDateTime(lastSyncAt)} from Jobber`
-            : "Not yet synced"}
+            ? `synced ${formatDateTime(lastSyncAt)}`
+            : "not yet synced"}
         </p>
       </div>
-      <SyncButton />
+      <div className="flex items-center gap-3">
+        <DateRangeFilter current={preset} />
+        <SyncButton />
+      </div>
     </div>
   );
 }
@@ -342,10 +378,6 @@ function FirstSyncPrompt() {
         </CardHeader>
         <CardContent>
           <SyncButton />
-          <p className="mt-3 text-xs text-muted-foreground">
-            After the sync completes, your KPI dashboard will populate
-            automatically.
-          </p>
         </CardContent>
       </Card>
     </div>
