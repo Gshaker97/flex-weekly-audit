@@ -19,10 +19,38 @@ function isCompletedStatus(status: string | null | undefined) {
   );
 }
 
-function isRecurringJobType(jobType: string | null | undefined) {
-  if (!jobType) return false;
-  const t = jobType.toLowerCase();
-  return t.includes("recurring") || t === "recurring";
+function isRecurringJob(j: JobberJobNode): boolean {
+  // Signal 1: explicit jobType field
+  if (j.jobType) {
+    const t = j.jobType.toLowerCase();
+    if (t.includes("recurring")) return true;
+    if (t.includes("one") && t.includes("off")) return false;
+  }
+
+  // Signal 2: billingType — recurring jobs are billed per visit / monthly / etc
+  if (j.billingType) {
+    const b = j.billingType.toLowerCase();
+    if (
+      b.includes("per_visit") ||
+      b.includes("monthly") ||
+      b.includes("fixed_price_per_visit") ||
+      b.includes("recurring")
+    ) {
+      return true;
+    }
+  }
+
+  // Signal 3: visit count — recurring jobs almost always have multiple visits
+  const visitCount = j.visits?.totalCount ?? 0;
+  if (visitCount >= 2) return true;
+
+  // Signal 4: jobStatus — Jobber sometimes uses "Active" for ongoing recurring
+  if (j.jobStatus) {
+    const s = j.jobStatus.toLowerCase();
+    if (s === "active" && visitCount >= 1) return true;
+  }
+
+  return false;
 }
 
 export async function runFullSync(opts: { triggeredBy?: "manual" | "cron" } = {}) {
@@ -34,40 +62,29 @@ export async function runFullSync(opts: { triggeredBy?: "manual" | "cron" } = {}
   });
 
   try {
-    // 1. Fetch all clients
     const clientNodes = await fetchAllClients();
     await upsertClients(clientNodes);
-
     await prisma.syncRun.update({
       where: { id: run.id },
       data: { customersFetched: clientNodes.length },
     });
 
-    // 2. Fetch all jobs
     const jobNodes = await fetchAllJobs();
     await upsertJobs(jobNodes);
-
     await prisma.syncRun.update({
       where: { id: run.id },
       data: { jobsFetched: jobNodes.length },
     });
 
-    // 3. Fetch all invoices
     const invoiceNodes = await fetchAllInvoices();
     await upsertInvoices(invoiceNodes);
-
     await prisma.syncRun.update({
       where: { id: run.id },
       data: { invoicesFetched: invoiceNodes.length },
     });
 
-    // 4. Compute customer aggregates
     await recomputeCustomerAggregates();
-
-    // 5. Compute monthly snapshots
     await recomputeMonthlySnapshots();
-
-    // 6. Compute service type revenue
     await recomputeServiceTypeRevenue();
 
     return await prisma.syncRun.update({
@@ -127,10 +144,14 @@ async function upsertJobs(nodes: JobberJobNode[]) {
       customerId = existing?.id ?? null;
     }
 
-    const completed = isCompletedStatus(j.jobStatus) || Boolean(j.completedAt);
-    const recurring = isRecurringJobType(j.jobType);
+    const recurring = isRecurringJob(j);
     const invoiceNumber = j.invoices?.nodes?.[0]?.invoiceNumber ?? null;
     const hasInvoice = (j.invoices?.nodes?.length ?? 0) > 0;
+
+    // Store a richer jobType string so the service-type breakdown is useful
+    const storedJobType =
+      j.jobType ||
+      (recurring ? "Recurring" : "One-off");
 
     await prisma.jobRecord.upsert({
       where: { jobberJobId: j.id },
@@ -139,7 +160,7 @@ async function upsertJobs(nodes: JobberJobNode[]) {
         jobNumber: j.jobNumber != null ? String(j.jobNumber) : null,
         title: j.title ?? null,
         jobStatus: j.jobStatus ?? null,
-        jobType: j.jobType ?? null,
+        jobType: storedJobType,
         isRecurring: recurring,
         total: j.total != null ? Number(j.total) : 0,
         completedAt: j.completedAt ? new Date(j.completedAt) : null,
@@ -155,7 +176,7 @@ async function upsertJobs(nodes: JobberJobNode[]) {
         jobNumber: j.jobNumber != null ? String(j.jobNumber) : null,
         title: j.title ?? null,
         jobStatus: j.jobStatus ?? null,
-        jobType: j.jobType ?? null,
+        jobType: storedJobType,
         isRecurring: recurring,
         total: j.total != null ? Number(j.total) : 0,
         completedAt: j.completedAt ? new Date(j.completedAt) : null,
@@ -169,8 +190,6 @@ async function upsertJobs(nodes: JobberJobNode[]) {
         lastSyncedAt: new Date(),
       },
     });
-    // suppress unused var warning
-    void completed;
   }
 }
 
@@ -251,11 +270,10 @@ async function recomputeCustomerAggregates() {
 }
 
 async function recomputeMonthlySnapshots() {
-  // Clear and rebuild
   await prisma.monthlySnapshot.deleteMany({});
 
   const now = new Date();
-  const startYear = now.getFullYear() - 1; // 24 months back
+  const startYear = now.getFullYear() - 1;
 
   const buckets: Map<string, {
     year: number;
@@ -293,7 +311,6 @@ async function recomputeMonthlySnapshots() {
     return b;
   }
 
-  // Seed 24 months so empty months render as zero
   for (let y = startYear; y <= now.getFullYear(); y++) {
     const monthStart = y === startYear ? now.getMonth() + 1 : 1;
     const monthEnd = y === now.getFullYear() ? now.getMonth() + 1 : 12;
@@ -302,7 +319,6 @@ async function recomputeMonthlySnapshots() {
     }
   }
 
-  // Invoiced revenue (by issuedAt)
   const invoices = await prisma.invoiceRecord.findMany();
   for (const inv of invoices) {
     if (!inv.issuedAt) continue;
@@ -311,7 +327,6 @@ async function recomputeMonthlySnapshots() {
     b.collectedRevenue += inv.amountPaid || 0;
   }
 
-  // Jobs completed + job-value/recurring breakdowns (by completedAt)
   const jobs = await prisma.jobRecord.findMany();
   for (const j of jobs) {
     if (!j.completedAt) continue;
@@ -322,7 +337,6 @@ async function recomputeMonthlySnapshots() {
     else b.oneOffRevenue += j.total || 0;
   }
 
-  // New customers (by createdAtJobber)
   const customers = await prisma.customer.findMany();
   for (const c of customers) {
     if (!c.createdAtJobber) continue;
@@ -330,7 +344,6 @@ async function recomputeMonthlySnapshots() {
     b.newCustomers += 1;
   }
 
-  // Write
   for (const b of Array.from(buckets.values())) {
     const avg =
       b.jobValues.length > 0
