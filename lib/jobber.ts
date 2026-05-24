@@ -3,7 +3,7 @@ import { prisma } from "./prisma";
 const JOBBER_API_URL = "https://api.getjobber.com/api/graphql";
 const JOBBER_TOKEN_URL = "https://api.getjobber.com/api/oauth/token";
 const JOBBER_AUTHORIZE_URL = "https://api.getjobber.com/api/oauth/authorize";
-const JOBBER_API_VERSION = "2024-04-01";
+const JOBBER_API_VERSION = "2025-04-16";
 
 function decodeJwtExpiry(token: string): number | null {
   try {
@@ -226,18 +226,19 @@ export interface JobberJobNode {
   invoices: { nodes: Array<{ id: string; invoiceNumber: string | null }> };
 }
 
-export async function fetchJobsInWeek(
-  weekStart: Date,
-  weekEnd: Date
+export async function fetchJobsInRange(
+  rangeStart: Date,
+  rangeEnd: Date
 ): Promise<JobberJobNode[]> {
-  const startIso = weekStart.toISOString();
-  const endIso = weekEnd.toISOString();
+  const startIso = rangeStart.toISOString();
+  const endIso = rangeEnd.toISOString();
 
   const collected: Map<string, JobberJobNode> = new Map();
 
   const runPaginated = async (query: string) => {
     let after: string | null = null;
     let hasNext = true;
+    let pageCount = 0;
     while (hasNext) {
       const data: any = await jobberGraphQL(query, {
         after,
@@ -250,6 +251,11 @@ export async function fetchJobsInWeek(
       }
       hasNext = data?.jobs?.pageInfo?.hasNextPage ?? false;
       after = data?.jobs?.pageInfo?.endCursor ?? null;
+      pageCount += 1;
+      if (pageCount > 200) {
+        console.warn("fetchJobsInRange: exceeded 200 pages, stopping");
+        break;
+      }
       if (hasNext) {
         await new Promise((r) => setTimeout(r, 250));
       }
@@ -271,3 +277,5 @@ export async function fetchJobsInWeek(
 
   return Array.from(collected.values());
 }
+
+export const fetchJobsInWeek = fetchJobsInRange;
