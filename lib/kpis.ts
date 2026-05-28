@@ -1,5 +1,5 @@
 import { prisma } from "./prisma";
-import { DateRange, getDateRange, DateRangePreset } from "./dateRange";
+import { DateRange } from "./dateRange";
 
 export interface DashboardKPIs {
   range: DateRange;
@@ -59,10 +59,13 @@ function previousPeriod(range: DateRange): { start: Date; end: Date } {
 }
 
 export async function computeDashboardKPIs(
-  preset: DateRangePreset = "ytd"
+  range: DateRange
 ): Promise<DashboardKPIs> {
-  const range = getDateRange(preset);
   const prev = previousPeriod(range);
+  const now0 = new Date();
+  // Cap the "as of now" bound to the end of the selected range so past
+  // ranges only count what was overdue/uninvoiced within that window.
+  const asOf = range.end.getTime() < now0.getTime() ? range.end : now0;
 
   const monthlyAll = await prisma.monthlySnapshot.findMany({
     orderBy: [{ year: "asc" }, { month: "asc" }],
@@ -97,14 +100,14 @@ export async function computeDashboardKPIs(
       ? ((revenueInRange - revenueCompareValue) / revenueCompareValue) * 100
       : null;
 
-  // Overdue Revenue: NOT recurring, end date past, no completion, no invoice
-  const now0 = new Date();
+  // Overdue Revenue (range-aware): one-off jobs whose end date falls in the
+  // range, already past, not completed, not invoiced.
   const overdueAgg = await prisma.jobRecord.aggregate({
     where: {
       isRecurring: false,
       completedAt: null,
       hasInvoice: false,
-      endAt: { lt: now0, not: null },
+      endAt: { gte: range.start, lte: range.end, lt: asOf },
       total: { gt: 0 },
     },
     _sum: { total: true },
@@ -113,9 +116,10 @@ export async function computeDashboardKPIs(
   const overdueRevenue = overdueAgg._sum.total ?? 0;
   const overdueJobCount = overdueAgg._count ?? 0;
 
+  // Uninvoiced Revenue (range-aware): completed in range, no invoice.
   const uninvAgg = await prisma.jobRecord.aggregate({
     where: {
-      completedAt: { not: null },
+      completedAt: { gte: range.start, lte: range.end },
       hasInvoice: false,
       total: { gt: 0 },
     },
@@ -125,8 +129,12 @@ export async function computeDashboardKPIs(
   const uninvoicedRevenue = uninvAgg._sum.total ?? 0;
   const uninvoicedJobCount = uninvAgg._count ?? 0;
 
+  // Outstanding Receivables (range-aware): invoices issued in range still owed.
   const outstandingAgg = await prisma.invoiceRecord.aggregate({
-    where: { amountDue: { gt: 0 } },
+    where: {
+      amountDue: { gt: 0 },
+      issuedAt: { gte: range.start, lte: range.end },
+    },
     _sum: { amountDue: true },
   });
   const outstandingReceivables = outstandingAgg._sum.amountDue ?? 0;
@@ -161,6 +169,8 @@ export async function computeDashboardKPIs(
     where: { createdAtJobber: { gte: prev.start, lte: prev.end } },
   });
 
+  // Recurring churn stays a fixed trailing-90-day metric (it answers
+  // "who's gone quiet recently", independent of the dashboard range).
   const ninetyAgo = new Date(now0);
   ninetyAgo.setDate(ninetyAgo.getDate() - 90);
   const churnedRecurringLast90 = await prisma.customer.count({

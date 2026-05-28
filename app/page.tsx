@@ -1,6 +1,6 @@
 import { prisma } from "@/lib/prisma";
 import { computeDashboardKPIs } from "@/lib/kpis";
-import { parsePreset } from "@/lib/dateRange";
+import { resolveDateRange, rangeQueryString } from "@/lib/dateRange";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { Badge } from "@/components/ui/Badge";
@@ -32,7 +32,7 @@ export const dynamic = "force-dynamic";
 export default async function DashboardPage({
   searchParams,
 }: {
-  searchParams: { range?: string };
+  searchParams: { range?: string; start?: string; end?: string };
 }) {
   const auth = await prisma.jobberAuth.findFirst({
     orderBy: { createdAt: "desc" },
@@ -47,8 +47,19 @@ export default async function DashboardPage({
 
   if (!lastSync) return <FirstSyncPrompt />;
 
-  const preset = parsePreset(searchParams.range);
-  const kpis = await computeDashboardKPIs(preset);
+  const range = resolveDateRange(searchParams);
+  const kpis = await computeDashboardKPIs(range);
+
+  // Carry the active range into detail-page links so the number you click
+  // matches the list you land on. Default to YTD when nothing is set.
+  const qs = rangeQueryString({
+    range:
+      searchParams.start || searchParams.end
+        ? undefined
+        : searchParams.range ?? "ytd",
+    start: searchParams.start,
+    end: searchParams.end,
+  });
 
   const last12Months = kpis.monthlySeries.slice(-12);
 
@@ -62,7 +73,6 @@ export default async function DashboardPage({
       <DashboardHeader
         lastSyncAt={kpis.lastSyncAt}
         rangeLabel={kpis.range.label}
-        preset={preset}
       />
 
       <section className="space-y-3">
@@ -85,7 +95,7 @@ export default async function DashboardPage({
           <StatCard
             label="Outstanding Receivables"
             value={formatCurrency(kpis.outstandingReceivables)}
-            sublabel="Invoiced but unpaid (all time)"
+            sublabel="Invoiced in range, unpaid"
             accent={kpis.outstandingReceivables > 0 ? "warning" : "default"}
             icon={<PiggyBank size={18} />}
           />
@@ -114,7 +124,7 @@ export default async function DashboardPage({
         </p>
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
           <ClickableStatCard
-            href="/risk/overdue"
+            href={`/risk/overdue${qs}`}
             label="Overdue Revenue"
             value={formatCurrency(kpis.overdueRevenue)}
             sublabel={`${kpis.overdueJobCount} one-off jobs past end date, not closed out`}
@@ -122,7 +132,7 @@ export default async function DashboardPage({
             icon={<AlertCircle size={18} />}
           />
           <ClickableStatCard
-            href="/risk/uninvoiced"
+            href={`/risk/uninvoiced${qs}`}
             label="Uninvoiced Revenue"
             value={formatCurrency(kpis.uninvoicedRevenue)}
             sublabel={`${kpis.uninvoicedJobCount} completed jobs with no invoice`}
@@ -130,7 +140,7 @@ export default async function DashboardPage({
             icon={<Receipt size={18} />}
           />
           <ClickableStatCard
-            href="/risk/churn"
+            href={`/risk/churn${qs}`}
             label="Recurring Churn (90d)"
             value={formatNumber(kpis.churnedRecurringLast90)}
             sublabel="Recurring customers with no recent job"
@@ -297,11 +307,9 @@ export default async function DashboardPage({
 function DashboardHeader({
   lastSyncAt,
   rangeLabel,
-  preset,
 }: {
   lastSyncAt: Date | null;
   rangeLabel: string;
-  preset: any;
 }) {
   return (
     <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
@@ -316,7 +324,7 @@ function DashboardHeader({
         </p>
       </div>
       <div className="flex items-center gap-3">
-        <DateRangeFilter current={preset} />
+        <DateRangeFilter />
         <SyncButton />
       </div>
     </div>

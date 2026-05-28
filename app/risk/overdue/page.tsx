@@ -3,23 +3,35 @@ import { prisma } from "@/lib/prisma";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/Card";
 import { Badge } from "@/components/ui/Badge";
 import { StatCard } from "@/components/ui/StatCard";
+import DateRangeFilter from "@/components/ui/DateRangeFilter";
+import { resolveDateRange, getDateRange } from "@/lib/dateRange";
 import { formatCurrency, formatCurrencyDetailed, formatDate } from "@/lib/utils";
 import { AlertCircle, ListTodo, Users } from "lucide-react";
 
 export const dynamic = "force-dynamic";
 
-export default async function OverdueRevenuePage() {
+export default async function OverdueRevenuePage({
+  searchParams,
+}: {
+  searchParams: { range?: string; start?: string; end?: string };
+}) {
   const now = new Date();
+
+  const hasFilter =
+    !!searchParams.range || !!searchParams.start || !!searchParams.end;
+  const range = hasFilter ? resolveDateRange(searchParams) : getDateRange("allTime");
+  // Only count jobs that are actually past due as of now (or the range end).
+  const asOf = range.end.getTime() < now.getTime() ? range.end : now;
 
   const jobs = await prisma.jobRecord.findMany({
     where: {
       isRecurring: false,
       completedAt: null,
       hasInvoice: false,
-      endAt: { lt: now, not: null },
+      endAt: { gte: range.start, lte: range.end, lt: asOf },
       total: { gt: 0 },
     },
-    orderBy: { total: "desc" },
+    orderBy: { endAt: "desc" },
   });
 
   const totalValue = jobs.reduce((acc, j) => acc + (j.total || 0), 0);
@@ -31,11 +43,17 @@ export default async function OverdueRevenuePage() {
         <Link href="/" className="text-sm text-muted-foreground hover:text-foreground">
           ← Back to dashboard
         </Link>
-        <h2 className="mt-2 text-2xl font-semibold tracking-tight">Overdue Revenue</h2>
-        <p className="mt-1 text-sm text-muted-foreground">
-          One-off jobs past their end date that haven&apos;t been marked complete
-          or invoiced. These need either completion + invoicing, or to be cancelled.
-        </p>
+        <div className="mt-2 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+          <div>
+            <h2 className="text-2xl font-semibold tracking-tight">Overdue Revenue</h2>
+            <p className="mt-1 text-sm text-muted-foreground">
+              One-off jobs past their end date that haven&apos;t been marked complete
+              or invoiced. Showing{" "}
+              <span className="font-medium text-foreground">{range.label}</span>.
+            </p>
+          </div>
+          <DateRangeFilter />
+        </div>
       </div>
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
@@ -63,11 +81,11 @@ export default async function OverdueRevenuePage() {
       <Card>
         <CardHeader>
           <CardTitle>Overdue Jobs</CardTitle>
-          <CardDescription>Sorted by dollar value, highest first</CardDescription>
+          <CardDescription>Most recent end date first</CardDescription>
         </CardHeader>
         <CardContent>
           {jobs.length === 0 ? (
-            <p className="text-sm text-muted-foreground">No overdue jobs. 🎉</p>
+            <p className="text-sm text-muted-foreground">No overdue jobs in this range. 🎉</p>
           ) : (
             <div className="overflow-hidden rounded-lg border border-border">
               <table className="w-full text-sm">
