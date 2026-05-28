@@ -1,0 +1,199 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model JobberAuth {
+  id            String   @id @default(cuid())
+  accessToken   String   @db.Text
+  refreshToken  String   @db.Text
+  expiresAt     DateTime
+  accountName   String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+model Audit {
+  id              String        @id @default(cuid())
+  weekStart       DateTime
+  weekEnd         DateTime
+  totalJobs       Int           @default(0)
+  completedJobs   Int           @default(0)
+  invoicedJobs    Int           @default(0)
+  flaggedJobs     Int           @default(0)
+  status          String        @default("pending")
+  errorMessage    String?       @db.Text
+  triggeredBy     String        @default("manual")
+  startedAt       DateTime      @default(now())
+  completedAt     DateTime?
+  flaggedJobItems FlaggedJob[]
+
+  @@index([weekStart])
+  @@index([startedAt])
+}
+
+model FlaggedJob {
+  id              String   @id @default(cuid())
+  auditId         String
+  jobberJobId     String
+  jobNumber       String?
+  jobTitle        String?
+  clientName      String?
+  jobStatus       String?
+  completedAt     DateTime?
+  scheduledEnd    DateTime?
+  totalAmount     Float?
+  hasInvoice      Boolean  @default(false)
+  invoiceNumber   String?
+  flagReasons     String[]
+  jobberUrl       String?
+  createdAt       DateTime @default(now())
+
+  audit Audit @relation(fields: [auditId], references: [id], onDelete: Cascade)
+
+  @@index([auditId])
+  @@index([jobberJobId])
+}
+
+model SyncRun {
+  id            String    @id @default(cuid())
+  status        String    @default("running")
+  startedAt     DateTime  @default(now())
+  completedAt   DateTime?
+  errorMessage  String?   @db.Text
+  triggeredBy   String    @default("manual")
+  customersFetched Int    @default(0)
+  jobsFetched      Int    @default(0)
+  invoicesFetched  Int    @default(0)
+  quotesFetched    Int    @default(0)
+  timeEntriesFetched Int  @default(0)
+
+  @@index([startedAt])
+}
+
+model TimeEntry {
+  id              String    @id @default(cuid())
+  jobberEntryId   String    @unique
+  jobberJobId     String?
+  jobNumber       String?
+  jobTitle        String?
+  clientName      String?
+  employeeId      String?
+  employeeName    String?
+  durationSeconds Int       @default(0)
+  approved        Boolean   @default(false)
+  ticking         Boolean   @default(false)
+  note            String?
+  occurredAt      DateTime?
+  lastSyncedAt    DateTime  @default(now())
+
+  @@index([jobberJobId])
+  @@index([employeeId])
+  @@index([occurredAt])
+}
+
+model Customer {
+  id              String    @id @default(cuid())
+  jobberClientId  String    @unique
+  name            String?
+  companyName     String?
+  email           String?
+  phone           String?
+  createdAtJobber DateTime?
+  isRecurring     Boolean   @default(false)
+  totalRevenue    Float     @default(0)
+  jobCount        Int       @default(0)
+  lastJobAt       DateTime?
+  lastSyncedAt    DateTime  @default(now())
+
+  jobs     JobRecord[]
+  invoices InvoiceRecord[]
+
+  @@index([createdAtJobber])
+  @@index([isRecurring])
+}
+
+model JobRecord {
+  id                String    @id @default(cuid())
+  jobberJobId       String    @unique
+  jobNumber         String?
+  title             String?
+  jobStatus         String?
+  jobType           String?
+  isRecurring       Boolean   @default(false)
+  total             Float     @default(0)
+  completedAt       DateTime?
+  startAt           DateTime?
+  endAt             DateTime?
+  createdAtJobber   DateTime?
+  customerId        String?
+  clientName        String?
+  hasInvoice        Boolean   @default(false)
+  invoiceNumber     String?
+  lastSyncedAt      DateTime  @default(now())
+
+  customer Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+
+  @@index([customerId])
+  @@index([completedAt])
+  @@index([endAt])
+  @@index([jobStatus])
+  @@index([isRecurring])
+}
+
+model InvoiceRecord {
+  id                String    @id @default(cuid())
+  jobberInvoiceId   String    @unique
+  invoiceNumber     String?
+  invoiceStatus     String?
+  subtotal          Float     @default(0)
+  total             Float     @default(0)
+  amountPaid        Float     @default(0)
+  amountDue         Float     @default(0)
+  issuedAt          DateTime?
+  dueAt             DateTime?
+  paidAt            DateTime?
+  createdAtJobber   DateTime?
+  customerId        String?
+  clientName        String?
+  lastSyncedAt      DateTime  @default(now())
+
+  customer Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+
+  @@index([customerId])
+  @@index([issuedAt])
+  @@index([invoiceStatus])
+}
+
+model MonthlySnapshot {
+  id                    String   @id @default(cuid())
+  year                  Int
+  month                 Int
+  invoicedRevenue       Float    @default(0)
+  collectedRevenue      Float    @default(0)
+  newCustomers          Int      @default(0)
+  jobsCompleted         Int      @default(0)
+  averageJobValue       Float    @default(0)
+  recurringRevenue      Float    @default(0)
+  oneOffRevenue         Float    @default(0)
+  computedAt            DateTime @default(now())
+
+  @@unique([year, month])
+  @@index([year, month])
+}
+
+model ServiceTypeRevenue {
+  id            String   @id @default(cuid())
+  serviceName   String
+  revenue       Float    @default(0)
+  jobCount      Int      @default(0)
+  year          Int
+  computedAt    DateTime @default(now())
+
+  @@unique([year, serviceName])
+  @@index([year])
+}
