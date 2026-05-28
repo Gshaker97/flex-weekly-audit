@@ -92,7 +92,8 @@ export default async function DashboardPage({
             sublabel="Completed jobs in range"
             icon={<Receipt size={18} />}
           />
-          <StatCard
+          <ClickableStatCard
+            href={`/risk/receivables${qs}`}
             label="Outstanding Receivables"
             value={formatCurrency(kpis.outstandingReceivables)}
             sublabel="Invoiced in range, unpaid"

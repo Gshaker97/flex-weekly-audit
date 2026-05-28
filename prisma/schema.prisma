@@ -70,8 +70,30 @@ model SyncRun {
   jobsFetched      Int    @default(0)
   invoicesFetched  Int    @default(0)
   quotesFetched    Int    @default(0)
+  timeEntriesFetched Int  @default(0)
 
   @@index([startedAt])
+}
+
+model TimeEntry {
+  id              String    @id @default(cuid())
+  jobberEntryId   String    @unique
+  jobberJobId     String?
+  jobNumber       String?
+  jobTitle        String?
+  clientName      String?
+  employeeId      String?
+  employeeName    String?
+  durationSeconds Int       @default(0)
+  approved        Boolean   @default(false)
+  ticking         Boolean   @default(false)
+  note            String?
+  occurredAt      DateTime?
+  lastSyncedAt    DateTime  @default(now())
+
+  @@index([jobberJobId])
+  @@index([employeeId])
+  @@index([occurredAt])
 }
 
 model Customer {

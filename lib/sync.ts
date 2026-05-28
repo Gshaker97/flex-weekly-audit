@@ -3,9 +3,11 @@ import {
   fetchAllClients,
   fetchAllJobs,
   fetchAllInvoices,
+  fetchAllJobTimesheets,
   JobberJobNode,
   JobberClientNode,
   JobberInvoiceNode,
+  FlatTimeEntry,
 } from "./jobber";
 
 function isCompletedStatus(status: string | null | undefined) {
@@ -82,6 +84,19 @@ export async function runFullSync(opts: { triggeredBy?: "manual" | "cron" } = {}
       where: { id: run.id },
       data: { invoicesFetched: invoiceNodes.length },
     });
+
+    // Timesheets are best-effort: requires the time-tracking scope + a plan
+    // that supports it. A failure here must not fail the whole sync.
+    try {
+      const timeEntries = await fetchAllJobTimesheets();
+      await upsertTimeEntries(timeEntries);
+      await prisma.syncRun.update({
+        where: { id: run.id },
+        data: { timeEntriesFetched: timeEntries.length },
+      });
+    } catch (err: any) {
+      console.error("Timesheet sync failed (continuing):", err?.message ?? err);
+    }
 
     await recomputeCustomerAggregates();
     await recomputeMonthlySnapshots();
@@ -238,6 +253,43 @@ async function upsertInvoices(nodes: JobberInvoiceNode[]) {
         createdAtJobber: inv.createdAt ? new Date(inv.createdAt) : null,
         customerId,
         clientName: inv.client?.companyName || inv.client?.name || null,
+        lastSyncedAt: new Date(),
+      },
+    });
+  }
+}
+
+async function upsertTimeEntries(entries: FlatTimeEntry[]) {
+  for (const e of entries) {
+    const occurredAt = e.occurredAt ? new Date(e.occurredAt) : null;
+    await prisma.timeEntry.upsert({
+      where: { jobberEntryId: e.jobberEntryId },
+      create: {
+        jobberEntryId: e.jobberEntryId,
+        jobberJobId: e.jobberJobId,
+        jobNumber: e.jobNumber,
+        jobTitle: e.jobTitle,
+        clientName: e.clientName,
+        employeeId: e.employeeId,
+        employeeName: e.employeeName,
+        durationSeconds: e.durationSeconds,
+        approved: e.approved,
+        ticking: e.ticking,
+        note: e.note,
+        occurredAt,
+      },
+      update: {
+        jobberJobId: e.jobberJobId,
+        jobNumber: e.jobNumber,
+        jobTitle: e.jobTitle,
+        clientName: e.clientName,
+        employeeId: e.employeeId,
+        employeeName: e.employeeName,
+        durationSeconds: e.durationSeconds,
+        approved: e.approved,
+        ticking: e.ticking,
+        note: e.note,
+        occurredAt,
         lastSyncedAt: new Date(),
       },
     });

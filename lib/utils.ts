@@ -58,3 +58,15 @@ export function monthLabel(year: number, month: number) {
   const d = new Date(year, month - 1, 1);
   return d.toLocaleDateString("en-US", { month: "short", year: "2-digit" });
 }
+
+export function formatDuration(totalSeconds: number | null | undefined) {
+  if (!totalSeconds || totalSeconds <= 0) return "0h 0m";
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.round((totalSeconds % 3600) / 60);
+  return `${hours}h ${minutes}m`;
+}
+
+export function formatHoursDecimal(totalSeconds: number | null | undefined) {
+  if (!totalSeconds || totalSeconds <= 0) return "0.0";
+  return (totalSeconds / 3600).toFixed(1);
+}

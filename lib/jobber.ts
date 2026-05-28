@@ -274,6 +274,34 @@ const CLIENTS_QUERY = `
   }
 `;
 
+// Isolated query: pull timesheet entries nested under each job. Uses only
+// fields confirmed present on Job.timesheetEntries / TimeSheetEntry so a
+// schema mismatch here can't break the core client/job/invoice sync.
+const JOB_TIMESHEETS_QUERY = `
+  query GetJobTimesheets($after: String) {
+    jobs(first: 25, after: $after) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        id
+        jobNumber
+        title
+        client { id name companyName }
+        timesheetEntries(first: 50) {
+          nodes {
+            id
+            finalDuration
+            approved
+            ticking
+            note
+            user { id name { full } }
+            visit { id startAt endAt }
+          }
+        }
+      }
+    }
+  }
+`;
+
 const INVOICES_QUERY = `
   query GetInvoices($after: String) {
     invoices(first: 25, after: $after) {
@@ -377,6 +405,66 @@ export async function fetchAllClients(): Promise<JobberClientNode[]> {
 
 export async function fetchAllInvoices(): Promise<JobberInvoiceNode[]> {
   return paginate<JobberInvoiceNode>(INVOICES_QUERY, "invoices");
+}
+
+export interface FlatTimeEntry {
+  jobberEntryId: string;
+  jobberJobId: string | null;
+  jobNumber: string | null;
+  jobTitle: string | null;
+  clientName: string | null;
+  employeeId: string | null;
+  employeeName: string | null;
+  durationSeconds: number;
+  approved: boolean;
+  ticking: boolean;
+  note: string | null;
+  occurredAt: string | null;
+}
+
+interface TimesheetJobNode {
+  id: string;
+  jobNumber: string | number | null;
+  title: string | null;
+  client: { id: string; name?: string | null; companyName?: string | null } | null;
+  timesheetEntries?: {
+    nodes: Array<{
+      id: string;
+      finalDuration: number | null;
+      approved: boolean | null;
+      ticking: boolean | null;
+      note: string | null;
+      user: { id: string; name?: { full?: string | null } | null } | null;
+      visit: { id: string; startAt: string | null; endAt: string | null } | null;
+    }>;
+  } | null;
+}
+
+// Best-effort: flattens all timesheet entries across jobs. Returns [] on any
+// failure so the rest of the sync is unaffected.
+export async function fetchAllJobTimesheets(): Promise<FlatTimeEntry[]> {
+  const jobs = await paginate<TimesheetJobNode>(JOB_TIMESHEETS_QUERY, "jobs");
+  const out: FlatTimeEntry[] = [];
+  for (const job of jobs) {
+    const entries = job.timesheetEntries?.nodes ?? [];
+    for (const e of entries) {
+      out.push({
+        jobberEntryId: e.id,
+        jobberJobId: job.id,
+        jobNumber: job.jobNumber != null ? String(job.jobNumber) : null,
+        jobTitle: job.title ?? null,
+        clientName: job.client?.companyName || job.client?.name || null,
+        employeeId: e.user?.id ?? null,
+        employeeName: e.user?.name?.full ?? null,
+        durationSeconds: e.finalDuration != null ? Number(e.finalDuration) : 0,
+        approved: Boolean(e.approved),
+        ticking: Boolean(e.ticking),
+        note: e.note ?? null,
+        occurredAt: e.visit?.startAt ?? null,
+      });
+    }
+  }
+  return out;
 }
 
 export async function fetchJobsInRange(
