@@ -286,15 +286,17 @@ const JOB_TIMESHEETS_QUERY = `
         jobNumber
         title
         client { id name companyName }
-        timesheetEntries(first: 50) {
+        timeSheetEntries(first: 50) {
           nodes {
             id
             finalDuration
             approved
             ticking
             note
+            startAt
+            endAt
             user { id name { full } }
-            visit { id startAt endAt }
+            visit { id startAt }
           }
         }
       }
@@ -427,15 +429,17 @@ interface TimesheetJobNode {
   jobNumber: string | number | null;
   title: string | null;
   client: { id: string; name?: string | null; companyName?: string | null } | null;
-  timesheetEntries?: {
+  timeSheetEntries?: {
     nodes: Array<{
       id: string;
       finalDuration: number | null;
       approved: boolean | null;
       ticking: boolean | null;
       note: string | null;
+      startAt: string | null;
+      endAt: string | null;
       user: { id: string; name?: { full?: string | null } | null } | null;
-      visit: { id: string; startAt: string | null; endAt: string | null } | null;
+      visit: { id: string; startAt: string | null } | null;
     }>;
   } | null;
 }
@@ -446,7 +450,7 @@ export async function fetchAllJobTimesheets(): Promise<FlatTimeEntry[]> {
   const jobs = await paginate<TimesheetJobNode>(JOB_TIMESHEETS_QUERY, "jobs");
   const out: FlatTimeEntry[] = [];
   for (const job of jobs) {
-    const entries = job.timesheetEntries?.nodes ?? [];
+    const entries = job.timeSheetEntries?.nodes ?? [];
     for (const e of entries) {
       out.push({
         jobberEntryId: e.id,
@@ -460,7 +464,7 @@ export async function fetchAllJobTimesheets(): Promise<FlatTimeEntry[]> {
         approved: Boolean(e.approved),
         ticking: Boolean(e.ticking),
         note: e.note ?? null,
-        occurredAt: e.visit?.startAt ?? null,
+        occurredAt: e.startAt ?? e.visit?.startAt ?? null,
       });
     }
   }
