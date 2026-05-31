@@ -274,60 +274,44 @@ const CLIENTS_QUERY = `
   }
 `;
 
-// Isolated query: pull timesheet entries nested under each job. Uses only
-// fields confirmed present on Job.timesheetEntries / TimeSheetEntry so a
-// schema mismatch here can't break the core client/job/invoice sync.
-const JOB_TIMESHEETS_QUERY = `
-  query GetJobTimesheets($after: String) {
-    jobs(first: 25, after: $after) {
+// Top-level (flat) timesheet query. Pulling entries nested under every job
+// blew past Jobber's query-cost limit ("Throttled"); a flat connection is cheap.
+const TIMESHEETS_QUERY = `
+  query GetTimeEntries($after: String) {
+    timeSheetEntries(first: 100, after: $after) {
       pageInfo { hasNextPage endCursor }
       nodes {
         id
-        jobNumber
-        title
+        finalDuration
+        approved
+        ticking
+        note
+        startAt
+        endAt
+        user { id name { full } }
+        job { id jobNumber title }
         client { id name companyName }
-        timeSheetEntries(first: 50) {
-          nodes {
-            id
-            finalDuration
-            approved
-            ticking
-            note
-            startAt
-            endAt
-            user { id name { full } }
-            visit { id startAt }
-          }
-        }
       }
     }
   }
 `;
 
-// Isolated query: pull visits nested under each job. Only fields confirmed on
-// Job.visits / Visit are used, so a mismatch can't break the core sync.
-const JOB_VISITS_QUERY = `
-  query GetJobVisits($after: String) {
-    jobs(first: 25, after: $after) {
+// Top-level (flat) visits query — same throttle fix as timesheets.
+const VISITS_QUERY = `
+  query GetVisits($after: String) {
+    visits(first: 100, after: $after) {
       pageInfo { hasNextPage endCursor }
       nodes {
         id
-        jobNumber
-        total
+        isComplete
+        completedAt
+        startAt
+        endAt
+        title
+        visitStatus
+        invoice { id }
+        job { id jobNumber total }
         client { id name companyName }
-        visits(first: 100) {
-          totalCount
-          nodes {
-            id
-            isComplete
-            completedAt
-            startAt
-            endAt
-            title
-            visitStatus
-            invoice { id }
-          }
-        }
       }
     }
   }
@@ -450,56 +434,48 @@ export interface FlatVisit {
   estimatedValue: number;
 }
 
-interface VisitsJobNode {
+interface FlatVisitNode {
   id: string;
-  jobNumber: string | number | null;
-  total: number | null;
+  isComplete: boolean | null;
+  completedAt: string | null;
+  startAt: string | null;
+  endAt: string | null;
+  title: string | null;
+  visitStatus: string | null;
+  invoice: { id: string } | null;
+  job: { id: string; jobNumber: string | number | null; total: number | null } | null;
   client: { id: string; name?: string | null; companyName?: string | null } | null;
-  visits?: {
-    totalCount?: number | null;
-    nodes: Array<{
-      id: string;
-      isComplete: boolean | null;
-      completedAt: string | null;
-      startAt: string | null;
-      endAt: string | null;
-      title: string | null;
-      visitStatus: string | null;
-      invoice: { id: string } | null;
-    }>;
-  } | null;
 }
 
-// Best-effort: flattens visits across jobs. Per-visit value is the job total
-// split evenly across its visits (Jobber has no per-visit dollar field).
 export async function fetchAllJobVisits(): Promise<FlatVisit[]> {
-  const jobs = await paginate<VisitsJobNode>(JOB_VISITS_QUERY, "jobs");
-  const out: FlatVisit[] = [];
-  for (const job of jobs) {
-    const nodes = job.visits?.nodes ?? [];
-    const count = job.visits?.totalCount ?? nodes.length ?? 0;
-    const jobTotal = job.total != null ? Number(job.total) : 0;
-    const perVisit = count > 0 ? jobTotal / count : 0;
-    const clientName = job.client?.companyName || job.client?.name || null;
-    for (const v of nodes) {
-      out.push({
-        jobberVisitId: v.id,
-        jobberJobId: job.id,
-        jobNumber: job.jobNumber != null ? String(job.jobNumber) : null,
-        title: v.title ?? null,
-        clientName,
-        isComplete: Boolean(v.isComplete),
-        visitStatus: v.visitStatus ?? null,
-        startAt: v.startAt ?? null,
-        endAt: v.endAt ?? null,
-        completedAt: v.completedAt ?? null,
-        hasInvoice: v.invoice != null,
-        estimatedValue: perVisit,
-      });
-    }
+  const visits = await paginate<FlatVisitNode>(VISITS_QUERY, "visits");
+  // Count visits per job so we can split each job's total across its visits.
+  const countByJob = new Map<string, number>();
+  for (const v of visits) {
+    const jid = v.job?.id;
+    if (jid) countByJob.set(jid, (countByJob.get(jid) ?? 0) + 1);
   }
-  return out;
+  return visits.map((v) => {
+    const jid = v.job?.id ?? null;
+    const jobTotal = v.job?.total != null ? Number(v.job.total) : 0;
+    const count = jid ? countByJob.get(jid) ?? 1 : 1;
+    return {
+      jobberVisitId: v.id,
+      jobberJobId: jid,
+      jobNumber: v.job?.jobNumber != null ? String(v.job.jobNumber) : null,
+      title: v.title ?? null,
+      clientName: v.client?.companyName || v.client?.name || null,
+      isComplete: Boolean(v.isComplete),
+      visitStatus: v.visitStatus ?? null,
+      startAt: v.startAt ?? null,
+      endAt: v.endAt ?? null,
+      completedAt: v.completedAt ?? null,
+      hasInvoice: v.invoice != null,
+      estimatedValue: count > 0 ? jobTotal / count : 0,
+    };
+  });
 }
+
 
 export async function fetchAllInvoices(): Promise<JobberInvoiceNode[]> {
   return paginate<JobberInvoiceNode>(INVOICES_QUERY, "invoices");
@@ -520,52 +496,37 @@ export interface FlatTimeEntry {
   occurredAt: string | null;
 }
 
-interface TimesheetJobNode {
+interface FlatTimeEntryNode {
   id: string;
-  jobNumber: string | number | null;
-  title: string | null;
+  finalDuration: number | null;
+  approved: boolean | null;
+  ticking: boolean | null;
+  note: string | null;
+  startAt: string | null;
+  endAt: string | null;
+  user: { id: string; name?: { full?: string | null } | null } | null;
+  job: { id: string; jobNumber: string | number | null; title: string | null } | null;
   client: { id: string; name?: string | null; companyName?: string | null } | null;
-  timeSheetEntries?: {
-    nodes: Array<{
-      id: string;
-      finalDuration: number | null;
-      approved: boolean | null;
-      ticking: boolean | null;
-      note: string | null;
-      startAt: string | null;
-      endAt: string | null;
-      user: { id: string; name?: { full?: string | null } | null } | null;
-      visit: { id: string; startAt: string | null } | null;
-    }>;
-  } | null;
 }
 
-// Best-effort: flattens all timesheet entries across jobs. Returns [] on any
-// failure so the rest of the sync is unaffected.
 export async function fetchAllJobTimesheets(): Promise<FlatTimeEntry[]> {
-  const jobs = await paginate<TimesheetJobNode>(JOB_TIMESHEETS_QUERY, "jobs");
-  const out: FlatTimeEntry[] = [];
-  for (const job of jobs) {
-    const entries = job.timeSheetEntries?.nodes ?? [];
-    for (const e of entries) {
-      out.push({
-        jobberEntryId: e.id,
-        jobberJobId: job.id,
-        jobNumber: job.jobNumber != null ? String(job.jobNumber) : null,
-        jobTitle: job.title ?? null,
-        clientName: job.client?.companyName || job.client?.name || null,
-        employeeId: e.user?.id ?? null,
-        employeeName: e.user?.name?.full ?? null,
-        durationSeconds: e.finalDuration != null ? Number(e.finalDuration) : 0,
-        approved: Boolean(e.approved),
-        ticking: Boolean(e.ticking),
-        note: e.note ?? null,
-        occurredAt: e.startAt ?? e.visit?.startAt ?? null,
-      });
-    }
-  }
-  return out;
+  const entries = await paginate<FlatTimeEntryNode>(TIMESHEETS_QUERY, "timeSheetEntries");
+  return entries.map((e) => ({
+    jobberEntryId: e.id,
+    jobberJobId: e.job?.id ?? null,
+    jobNumber: e.job?.jobNumber != null ? String(e.job.jobNumber) : null,
+    jobTitle: e.job?.title ?? null,
+    clientName: e.client?.companyName || e.client?.name || null,
+    employeeId: e.user?.id ?? null,
+    employeeName: e.user?.name?.full ?? null,
+    durationSeconds: e.finalDuration != null ? Number(e.finalDuration) : 0,
+    approved: Boolean(e.approved),
+    ticking: Boolean(e.ticking),
+    note: e.note ?? null,
+    occurredAt: e.startAt ?? null,
+  }));
 }
+
 
 export async function fetchJobsInRange(
   rangeStart: Date,
