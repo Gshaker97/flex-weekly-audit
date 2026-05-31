@@ -310,7 +310,7 @@ const VISITS_QUERY = `
         title
         visitStatus
         invoice { id }
-        job { id jobNumber total }
+        job { id jobNumber total visits(first: 1) { totalCount } }
         client { id name companyName }
       }
     }
@@ -410,12 +410,47 @@ async function paginate<T>(
   return out;
 }
 
-export async function fetchAllJobs(): Promise<JobberJobNode[]> {
-  return paginate<JobberJobNode>(JOBS_QUERY, "jobs");
+// Inject an updatedAt filter into the top-level connection of a query so we
+// only pull records modified since the last sync. We INLINE the date (no typed
+// $filter variable) so a wrong filter shape fails as a plain validation error
+// rather than requiring us to know the exact *FilterAttributes type name.
+function injectSince(query: string, since: Date | null): string {
+  if (!since) return query;
+  const clause = `, filter: { updatedAt: { after: "${since.toISOString()}" } }`;
+  return query.replace("after: $after)", `after: $after${clause})`);
 }
 
-export async function fetchAllClients(): Promise<JobberClientNode[]> {
-  return paginate<JobberClientNode>(CLIENTS_QUERY, "clients");
+// Try an incremental (filtered) pull; on ANY error fall back to the full pull
+// for that entity, so a bad/unsupported filter can never break the sync.
+async function fetchIncremental<T>(
+  query: string,
+  rootKey: string,
+  since: Date | null,
+  label: string
+): Promise<T[]> {
+  if (!since) {
+    const all = await paginate<T>(query, rootKey);
+    console.log(`[sync] ${label}: full pull (${all.length})`);
+    return all;
+  }
+  try {
+    const r = await paginate<T>(injectSince(query, since), rootKey);
+    console.log(`[sync] ${label}: incremental ok (${r.length} changed since ${since.toISOString()})`);
+    return r;
+  } catch (e: any) {
+    console.warn(`[sync] ${label}: incremental filter rejected (${e?.message ?? e}) — falling back to full pull`);
+    const all = await paginate<T>(query, rootKey);
+    console.log(`[sync] ${label}: full pull fallback (${all.length})`);
+    return all;
+  }
+}
+
+export async function fetchAllJobs(since: Date | null = null): Promise<JobberJobNode[]> {
+  return fetchIncremental<JobberJobNode>(JOBS_QUERY, "jobs", since, "jobs");
+}
+
+export async function fetchAllClients(since: Date | null = null): Promise<JobberClientNode[]> {
+  return fetchIncremental<JobberClientNode>(CLIENTS_QUERY, "clients", since, "clients");
 }
 
 
@@ -443,25 +478,23 @@ interface FlatVisitNode {
   title: string | null;
   visitStatus: string | null;
   invoice: { id: string } | null;
-  job: { id: string; jobNumber: string | number | null; total: number | null } | null;
+  job: {
+    id: string;
+    jobNumber: string | number | null;
+    total: number | null;
+    visits?: { totalCount?: number | null } | null;
+  } | null;
   client: { id: string; name?: string | null; companyName?: string | null } | null;
 }
 
-export async function fetchAllJobVisits(): Promise<FlatVisit[]> {
-  const visits = await paginate<FlatVisitNode>(VISITS_QUERY, "visits");
-  // Count visits per job so we can split each job's total across its visits.
-  const countByJob = new Map<string, number>();
-  for (const v of visits) {
-    const jid = v.job?.id;
-    if (jid) countByJob.set(jid, (countByJob.get(jid) ?? 0) + 1);
-  }
+export async function fetchAllJobVisits(since: Date | null = null): Promise<FlatVisit[]> {
+  const visits = await fetchIncremental<FlatVisitNode>(VISITS_QUERY, "visits", since, "visits");
   return visits.map((v) => {
-    const jid = v.job?.id ?? null;
     const jobTotal = v.job?.total != null ? Number(v.job.total) : 0;
-    const count = jid ? countByJob.get(jid) ?? 1 : 1;
+    const count = v.job?.visits?.totalCount ?? 1;
     return {
       jobberVisitId: v.id,
-      jobberJobId: jid,
+      jobberJobId: v.job?.id ?? null,
       jobNumber: v.job?.jobNumber != null ? String(v.job.jobNumber) : null,
       title: v.title ?? null,
       clientName: v.client?.companyName || v.client?.name || null,
@@ -477,8 +510,9 @@ export async function fetchAllJobVisits(): Promise<FlatVisit[]> {
 }
 
 
-export async function fetchAllInvoices(): Promise<JobberInvoiceNode[]> {
-  return paginate<JobberInvoiceNode>(INVOICES_QUERY, "invoices");
+
+export async function fetchAllInvoices(since: Date | null = null): Promise<JobberInvoiceNode[]> {
+  return fetchIncremental<JobberInvoiceNode>(INVOICES_QUERY, "invoices", since, "invoices");
 }
 
 export interface FlatTimeEntry {
@@ -509,8 +543,8 @@ interface FlatTimeEntryNode {
   client: { id: string; name?: string | null; companyName?: string | null } | null;
 }
 
-export async function fetchAllJobTimesheets(): Promise<FlatTimeEntry[]> {
-  const entries = await paginate<FlatTimeEntryNode>(TIMESHEETS_QUERY, "timeSheetEntries");
+export async function fetchAllJobTimesheets(since: Date | null = null): Promise<FlatTimeEntry[]> {
+  const entries = await fetchIncremental<FlatTimeEntryNode>(TIMESHEETS_QUERY, "timeSheetEntries", since, "timesheets");
   return entries.map((e) => ({
     jobberEntryId: e.id,
     jobberJobId: e.job?.id ?? null,
@@ -526,6 +560,7 @@ export async function fetchAllJobTimesheets(): Promise<FlatTimeEntry[]> {
     occurredAt: e.startAt ?? null,
   }));
 }
+
 
 
 export async function fetchJobsInRange(

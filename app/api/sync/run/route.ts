@@ -11,8 +11,12 @@ async function handle(req: NextRequest) {
     url.searchParams.get("cron_secret") === process.env.CRON_SECRET;
 
   try {
+    const forceFull =
+      url.searchParams.get("full") === "1" ||
+      url.searchParams.get("full") === "true";
     const run = await runFullSync({
       triggeredBy: isCron ? "cron" : "manual",
+      full: forceFull,
     });
     return NextResponse.json({ ok: true, syncId: run.id });
   } catch (err: any) {

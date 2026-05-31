@@ -57,30 +57,59 @@ function isRecurringJob(j: JobberJobNode): boolean {
   return false;
 }
 
-export async function runFullSync(opts: { triggeredBy?: "manual" | "cron" } = {}) {
+export async function runFullSync(
+  opts: { triggeredBy?: "manual" | "cron"; full?: boolean } = {}
+) {
+  // Decide full vs incremental. Incremental pulls only records modified since
+  // the last successful sync (with a 24h overlap for safety). We force a full
+  // sync when there's no prior sync, when the last full sync is over 7 days
+  // old (a weekly reconcile to catch anything incremental missed), or when
+  // explicitly requested.
+  const lastComplete = await prisma.syncRun.findFirst({
+    where: { status: "complete" },
+    orderBy: { completedAt: "desc" },
+  });
+  const lastFull = await prisma.syncRun.findFirst({
+    where: { status: "complete", mode: "full" },
+    orderBy: { completedAt: "desc" },
+  });
+  const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+  const fullStale =
+    !lastFull ||
+    !lastFull.completedAt ||
+    Date.now() - new Date(lastFull.completedAt).getTime() > WEEK_MS;
+  const doFull = Boolean(opts.full) || !lastComplete || fullStale;
+  const since =
+    doFull || !lastComplete
+      ? null
+      : new Date(new Date(lastComplete.startedAt).getTime() - 24 * 60 * 60 * 1000);
+  const mode = doFull ? "full" : "incremental";
+  console.log(`[sync] mode=${mode}${since ? ` since=${since.toISOString()}` : ""}`);
+
   const run = await prisma.syncRun.create({
     data: {
       status: "running",
       triggeredBy: opts.triggeredBy ?? "manual",
+      mode,
     },
   });
 
   try {
-    const clientNodes = await fetchAllClients();
+    const clientNodes = await fetchAllClients(since);
     await upsertClients(clientNodes);
     await prisma.syncRun.update({
       where: { id: run.id },
       data: { customersFetched: clientNodes.length },
     });
 
-    const jobNodes = await fetchAllJobs();
+    const jobNodes = await fetchAllJobs(since);
     await upsertJobs(jobNodes);
     await prisma.syncRun.update({
       where: { id: run.id },
       data: { jobsFetched: jobNodes.length },
     });
 
-    const invoiceNodes = await fetchAllInvoices();
+    const invoiceNodes = await fetchAllInvoices(since);
     await upsertInvoices(invoiceNodes);
     await prisma.syncRun.update({
       where: { id: run.id },
@@ -90,7 +119,7 @@ export async function runFullSync(opts: { triggeredBy?: "manual" | "cron" } = {}
     // Timesheets are best-effort: requires the time-tracking scope + a plan
     // that supports it. A failure here must not fail the whole sync.
     try {
-      const timeEntries = await fetchAllJobTimesheets();
+      const timeEntries = await fetchAllJobTimesheets(since);
       await upsertTimeEntries(timeEntries);
       await prisma.syncRun.update({
         where: { id: run.id },
@@ -102,7 +131,7 @@ export async function runFullSync(opts: { triggeredBy?: "manual" | "cron" } = {}
 
     // Visits are best-effort too. Drives the visit-level Overdue/Uninvoiced tabs.
     try {
-      const visits = await fetchAllJobVisits();
+      const visits = await fetchAllJobVisits(since);
       await upsertVisits(visits);
       await prisma.syncRun.update({
         where: { id: run.id },

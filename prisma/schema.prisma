@@ -66,6 +66,7 @@ model SyncRun {
   completedAt   DateTime?
   errorMessage  String?   @db.Text
   triggeredBy   String    @default("manual")
+  mode          String    @default("full")
   customersFetched Int    @default(0)
   jobsFetched      Int    @default(0)
   invoicesFetched  Int    @default(0)
