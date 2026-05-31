@@ -304,6 +304,35 @@ const JOB_TIMESHEETS_QUERY = `
   }
 `;
 
+// Isolated query: pull visits nested under each job. Only fields confirmed on
+// Job.visits / Visit are used, so a mismatch can't break the core sync.
+const JOB_VISITS_QUERY = `
+  query GetJobVisits($after: String) {
+    jobs(first: 25, after: $after) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        id
+        jobNumber
+        total
+        client { id name companyName }
+        visits(first: 100) {
+          totalCount
+          nodes {
+            id
+            isComplete
+            completedAt
+            startAt
+            endAt
+            title
+            visitStatus
+            invoice { id }
+          }
+        }
+      }
+    }
+  }
+`;
+
 const INVOICES_QUERY = `
   query GetInvoices($after: String) {
     invoices(first: 25, after: $after) {
@@ -403,6 +432,73 @@ export async function fetchAllJobs(): Promise<JobberJobNode[]> {
 
 export async function fetchAllClients(): Promise<JobberClientNode[]> {
   return paginate<JobberClientNode>(CLIENTS_QUERY, "clients");
+}
+
+
+export interface FlatVisit {
+  jobberVisitId: string;
+  jobberJobId: string | null;
+  jobNumber: string | null;
+  title: string | null;
+  clientName: string | null;
+  isComplete: boolean;
+  visitStatus: string | null;
+  startAt: string | null;
+  endAt: string | null;
+  completedAt: string | null;
+  hasInvoice: boolean;
+  estimatedValue: number;
+}
+
+interface VisitsJobNode {
+  id: string;
+  jobNumber: string | number | null;
+  total: number | null;
+  client: { id: string; name?: string | null; companyName?: string | null } | null;
+  visits?: {
+    totalCount?: number | null;
+    nodes: Array<{
+      id: string;
+      isComplete: boolean | null;
+      completedAt: string | null;
+      startAt: string | null;
+      endAt: string | null;
+      title: string | null;
+      visitStatus: string | null;
+      invoice: { id: string } | null;
+    }>;
+  } | null;
+}
+
+// Best-effort: flattens visits across jobs. Per-visit value is the job total
+// split evenly across its visits (Jobber has no per-visit dollar field).
+export async function fetchAllJobVisits(): Promise<FlatVisit[]> {
+  const jobs = await paginate<VisitsJobNode>(JOB_VISITS_QUERY, "jobs");
+  const out: FlatVisit[] = [];
+  for (const job of jobs) {
+    const nodes = job.visits?.nodes ?? [];
+    const count = job.visits?.totalCount ?? nodes.length ?? 0;
+    const jobTotal = job.total != null ? Number(job.total) : 0;
+    const perVisit = count > 0 ? jobTotal / count : 0;
+    const clientName = job.client?.companyName || job.client?.name || null;
+    for (const v of nodes) {
+      out.push({
+        jobberVisitId: v.id,
+        jobberJobId: job.id,
+        jobNumber: job.jobNumber != null ? String(job.jobNumber) : null,
+        title: v.title ?? null,
+        clientName,
+        isComplete: Boolean(v.isComplete),
+        visitStatus: v.visitStatus ?? null,
+        startAt: v.startAt ?? null,
+        endAt: v.endAt ?? null,
+        completedAt: v.completedAt ?? null,
+        hasInvoice: v.invoice != null,
+        estimatedValue: perVisit,
+      });
+    }
+  }
+  return out;
 }
 
 export async function fetchAllInvoices(): Promise<JobberInvoiceNode[]> {

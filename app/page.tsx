@@ -128,7 +128,7 @@ export default async function DashboardPage({
             href={`/risk/overdue${qs}`}
             label="Overdue Revenue"
             value={formatCurrency(kpis.overdueRevenue)}
-            sublabel={`${kpis.overdueJobCount} one-off jobs past end date, not closed out`}
+            sublabel={`${kpis.overdueJobCount} visits past their date, not completed`}
             accent={kpis.overdueRevenue > 0 ? "danger" : "success"}
             icon={<AlertCircle size={18} />}
           />
@@ -136,7 +136,7 @@ export default async function DashboardPage({
             href={`/risk/uninvoiced${qs}`}
             label="Uninvoiced Revenue"
             value={formatCurrency(kpis.uninvoicedRevenue)}
-            sublabel={`${kpis.uninvoicedJobCount} completed jobs with no invoice`}
+            sublabel={`${kpis.uninvoicedJobCount} completed visits with no invoice`}
             accent={kpis.uninvoicedRevenue > 0 ? "warning" : "success"}
             icon={<Receipt size={18} />}
           />

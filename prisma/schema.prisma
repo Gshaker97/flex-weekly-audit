@@ -71,8 +71,31 @@ model SyncRun {
   invoicesFetched  Int    @default(0)
   quotesFetched    Int    @default(0)
   timeEntriesFetched Int  @default(0)
+  visitsFetched    Int    @default(0)
 
   @@index([startedAt])
+}
+
+model VisitRecord {
+  id              String    @id @default(cuid())
+  jobberVisitId   String    @unique
+  jobberJobId     String?
+  jobNumber       String?
+  title           String?
+  clientName      String?
+  isComplete      Boolean   @default(false)
+  visitStatus     String?
+  visitDate       DateTime?
+  startAt         DateTime?
+  endAt           DateTime?
+  completedAt     DateTime?
+  hasInvoice      Boolean   @default(false)
+  estimatedValue  Float     @default(0)
+  lastSyncedAt    DateTime  @default(now())
+
+  @@index([visitDate])
+  @@index([isComplete])
+  @@index([hasInvoice])
 }
 
 model TimeEntry {

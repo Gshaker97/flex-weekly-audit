@@ -16,26 +16,24 @@ export default async function OverdueRevenuePage({
   searchParams: { range?: string; start?: string; end?: string };
 }) {
   const now = new Date();
-
   const hasFilter =
     !!searchParams.range || !!searchParams.start || !!searchParams.end;
   const range = hasFilter ? resolveDateRange(searchParams) : getDateRange("allTime");
-  // Only count jobs that are actually past due as of now (or the range end).
   const asOf = range.end.getTime() < now.getTime() ? range.end : now;
 
-  const jobs = await prisma.jobRecord.findMany({
+  // Visits whose scheduled date has passed but aren't marked complete (and
+  // aren't invoiced) — work that should have happened and hasn't been closed out.
+  const visits = await prisma.visitRecord.findMany({
     where: {
-      isRecurring: false,
-      completedAt: null,
+      isComplete: false,
       hasInvoice: false,
-      endAt: { gte: range.start, lte: range.end, lt: asOf },
-      total: { gt: 0 },
+      visitDate: { gte: range.start, lte: range.end, lt: asOf },
     },
-    orderBy: { endAt: "desc" },
+    orderBy: { visitDate: "desc" },
   });
 
-  const totalValue = jobs.reduce((acc, j) => acc + (j.total || 0), 0);
-  const uniqueCustomers = new Set(jobs.map((j) => j.customerId).filter(Boolean)).size;
+  const totalValue = visits.reduce((acc, v) => acc + (v.estimatedValue || 0), 0);
+  const uniqueCustomers = new Set(visits.map((v) => v.clientName).filter(Boolean)).size;
 
   return (
     <div className="space-y-6">
@@ -47,8 +45,8 @@ export default async function OverdueRevenuePage({
           <div>
             <h2 className="text-2xl font-semibold tracking-tight">Overdue Revenue</h2>
             <p className="mt-1 text-sm text-muted-foreground">
-              One-off jobs past their end date that haven&apos;t been marked complete
-              or invoiced. Showing{" "}
+              Visits whose scheduled date has passed that haven&apos;t been marked
+              complete or invoiced. Showing{" "}
               <span className="font-medium text-foreground">{range.label}</span>.
             </p>
           </div>
@@ -60,14 +58,14 @@ export default async function OverdueRevenuePage({
         <StatCard
           label="Total Value"
           value={formatCurrency(totalValue)}
-          sublabel="Sum of overdue jobs"
+          sublabel="Est. value of overdue visits"
           accent="danger"
           icon={<AlertCircle size={18} />}
         />
         <StatCard
-          label="Job Count"
-          value={jobs.length}
-          sublabel="Jobs flagged"
+          label="Visit Count"
+          value={visits.length}
+          sublabel="Visits flagged"
           icon={<ListTodo size={18} />}
         />
         <StatCard
@@ -80,44 +78,45 @@ export default async function OverdueRevenuePage({
 
       <Card>
         <CardHeader>
-          <CardTitle>Overdue Jobs</CardTitle>
-          <CardDescription>Most recent end date first</CardDescription>
+          <CardTitle>Overdue Visits</CardTitle>
+          <CardDescription>Most recent date first</CardDescription>
         </CardHeader>
         <CardContent>
-          {jobs.length === 0 ? (
-            <p className="text-sm text-muted-foreground">No overdue jobs in this range. 🎉</p>
+          {visits.length === 0 ? (
+            <p className="text-sm text-muted-foreground">
+              No overdue visits in this range. 🎉 (If you expected results, run a Sync —
+              visit data populates on sync.)
+            </p>
           ) : (
             <div className="overflow-hidden rounded-lg border border-border">
               <table className="w-full text-sm">
                 <thead className="bg-muted/50">
                   <tr className="text-left text-xs uppercase tracking-wide text-muted-foreground">
-                    <th className="px-4 py-2.5 font-medium">Job</th>
+                    <th className="px-4 py-2.5 font-medium">Job / Visit</th>
                     <th className="px-4 py-2.5 font-medium">Customer</th>
-                    <th className="px-4 py-2.5 font-medium">End date</th>
+                    <th className="px-4 py-2.5 font-medium">Scheduled date</th>
                     <th className="px-4 py-2.5 font-medium">Status</th>
-                    <th className="px-4 py-2.5 font-medium">Value</th>
+                    <th className="px-4 py-2.5 font-medium">Est. Value</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-border">
-                  {jobs.map((j) => (
-                    <tr key={j.id} className="hover:bg-muted/30">
+                  {visits.map((v) => (
+                    <tr key={v.id} className="hover:bg-muted/30">
                       <td className="px-4 py-3">
                         <div className="font-medium">
-                          {j.jobNumber ? `#${j.jobNumber}` : "—"}
+                          {v.jobNumber ? `#${v.jobNumber}` : "—"}
                         </div>
-                        <div className="text-xs text-muted-foreground">
-                          {j.title ?? ""}
-                        </div>
+                        <div className="text-xs text-muted-foreground">{v.title ?? ""}</div>
                       </td>
-                      <td className="px-4 py-3">{j.clientName ?? "—"}</td>
+                      <td className="px-4 py-3">{v.clientName ?? "—"}</td>
                       <td className="px-4 py-3 text-muted-foreground">
-                        {formatDate(j.endAt)}
+                        {formatDate(v.visitDate)}
                       </td>
                       <td className="px-4 py-3">
-                        <Badge variant="muted">{j.jobStatus ?? "unknown"}</Badge>
+                        <Badge variant="muted">{v.visitStatus ?? "incomplete"}</Badge>
                       </td>
                       <td className="px-4 py-3 font-semibold">
-                        {formatCurrencyDetailed(j.total)}
+                        {formatCurrencyDetailed(v.estimatedValue)}
                       </td>
                     </tr>
                   ))}

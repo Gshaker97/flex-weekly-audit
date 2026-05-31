@@ -4,10 +4,12 @@ import {
   fetchAllJobs,
   fetchAllInvoices,
   fetchAllJobTimesheets,
+  fetchAllJobVisits,
   JobberJobNode,
   JobberClientNode,
   JobberInvoiceNode,
   FlatTimeEntry,
+  FlatVisit,
 } from "./jobber";
 
 function isCompletedStatus(status: string | null | undefined) {
@@ -96,6 +98,18 @@ export async function runFullSync(opts: { triggeredBy?: "manual" | "cron" } = {}
       });
     } catch (err: any) {
       console.error("Timesheet sync failed (continuing):", err?.message ?? err);
+    }
+
+    // Visits are best-effort too. Drives the visit-level Overdue/Uninvoiced tabs.
+    try {
+      const visits = await fetchAllJobVisits();
+      await upsertVisits(visits);
+      await prisma.syncRun.update({
+        where: { id: run.id },
+        data: { visitsFetched: visits.length },
+      });
+    } catch (err: any) {
+      console.error("Visit sync failed (continuing):", err?.message ?? err);
     }
 
     await recomputeCustomerAggregates();
@@ -290,6 +304,49 @@ async function upsertTimeEntries(entries: FlatTimeEntry[]) {
         ticking: e.ticking,
         note: e.note,
         occurredAt,
+        lastSyncedAt: new Date(),
+      },
+    });
+  }
+}
+
+async function upsertVisits(visits: FlatVisit[]) {
+  for (const v of visits) {
+    const start = v.startAt ? new Date(v.startAt) : null;
+    const end = v.endAt ? new Date(v.endAt) : null;
+    const completed = v.completedAt ? new Date(v.completedAt) : null;
+    // Effective date used for range filtering and overdue checks
+    const visitDate = end ?? start ?? completed ?? null;
+    await prisma.visitRecord.upsert({
+      where: { jobberVisitId: v.jobberVisitId },
+      create: {
+        jobberVisitId: v.jobberVisitId,
+        jobberJobId: v.jobberJobId,
+        jobNumber: v.jobNumber,
+        title: v.title,
+        clientName: v.clientName,
+        isComplete: v.isComplete,
+        visitStatus: v.visitStatus,
+        visitDate,
+        startAt: start,
+        endAt: end,
+        completedAt: completed,
+        hasInvoice: v.hasInvoice,
+        estimatedValue: v.estimatedValue,
+      },
+      update: {
+        jobberJobId: v.jobberJobId,
+        jobNumber: v.jobNumber,
+        title: v.title,
+        clientName: v.clientName,
+        isComplete: v.isComplete,
+        visitStatus: v.visitStatus,
+        visitDate,
+        startAt: start,
+        endAt: end,
+        completedAt: completed,
+        hasInvoice: v.hasInvoice,
+        estimatedValue: v.estimatedValue,
         lastSyncedAt: new Date(),
       },
     });

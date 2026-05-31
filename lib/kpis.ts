@@ -100,33 +100,31 @@ export async function computeDashboardKPIs(
       ? ((revenueInRange - revenueCompareValue) / revenueCompareValue) * 100
       : null;
 
-  // Overdue Revenue (range-aware): one-off jobs whose end date falls in the
-  // range, already past, not completed, not invoiced.
-  const overdueAgg = await prisma.jobRecord.aggregate({
+  // Overdue Revenue (visit-level): visits whose date has passed that aren't
+  // marked complete and aren't invoiced.
+  const overdueAgg = await prisma.visitRecord.aggregate({
     where: {
-      isRecurring: false,
-      completedAt: null,
+      isComplete: false,
       hasInvoice: false,
-      endAt: { gte: range.start, lte: range.end, lt: asOf },
-      total: { gt: 0 },
+      visitDate: { gte: range.start, lte: range.end, lt: asOf },
     },
-    _sum: { total: true },
+    _sum: { estimatedValue: true },
     _count: true,
   });
-  const overdueRevenue = overdueAgg._sum.total ?? 0;
+  const overdueRevenue = overdueAgg._sum.estimatedValue ?? 0;
   const overdueJobCount = overdueAgg._count ?? 0;
 
-  // Uninvoiced Revenue (range-aware): completed in range, no invoice.
-  const uninvAgg = await prisma.jobRecord.aggregate({
+  // Uninvoiced Revenue (visit-level): completed visits with no invoice.
+  const uninvAgg = await prisma.visitRecord.aggregate({
     where: {
-      completedAt: { gte: range.start, lte: range.end },
+      isComplete: true,
       hasInvoice: false,
-      total: { gt: 0 },
+      visitDate: { gte: range.start, lte: range.end },
     },
-    _sum: { total: true },
+    _sum: { estimatedValue: true },
     _count: true,
   });
-  const uninvoicedRevenue = uninvAgg._sum.total ?? 0;
+  const uninvoicedRevenue = uninvAgg._sum.estimatedValue ?? 0;
   const uninvoicedJobCount = uninvAgg._count ?? 0;
 
   // Outstanding Receivables (range-aware): invoices issued in range still owed.
