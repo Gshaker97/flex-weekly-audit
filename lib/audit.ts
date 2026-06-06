@@ -1,5 +1,9 @@
 import { prisma } from "./prisma";
-import { fetchJobsInRange, JobberJobNode } from "./jobber";
+import { fetchJobsInRange, JobberJobNode, concatJobNotes } from "./jobber";
+
+// Jobs the client intentionally leaves uninvoiced are marked with "No Invoice"
+// in their Jobber notes — don't flag those for a missing invoice.
+const NO_INVOICE_PHRASE = "no invoice";
 
 export type RangePreset = "ytd" | "last30" | "last90" | "thisWeek" | "lastWeek";
 
@@ -69,9 +73,10 @@ function isCompletedStatus(status: string | null | undefined) {
 function classifyJob(job: JobberJobNode) {
   const completed = isCompletedStatus(job.jobStatus) || Boolean(job.completedAt);
   const hasInvoice = (job.invoices?.nodes?.length ?? 0) > 0;
+  const noInvoiceNote = concatJobNotes(job).toLowerCase().includes(NO_INVOICE_PHRASE);
   const reasons: string[] = [];
   if (!completed) reasons.push("Not marked complete");
-  if (!hasInvoice) reasons.push("No invoice attached");
+  if (!hasInvoice && !noInvoiceNote) reasons.push("No invoice attached");
   return { completed, hasInvoice, reasons };
 }
 

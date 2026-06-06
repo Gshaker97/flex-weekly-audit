@@ -10,7 +10,32 @@ import {
   JobberInvoiceNode,
   FlatTimeEntry,
   FlatVisit,
+  concatJobNotes,
 } from "./jobber";
+
+// Clients mark jobs that intentionally don't need an invoice by writing
+// "No Invoice" in the job's Notes in Jobber. Any job whose notes contain this
+// phrase (case-insensitive substring) is excluded from Uninvoiced Revenue,
+// along with all of its visits.
+const NO_INVOICE_PHRASE = "no invoice";
+
+function hasNoInvoiceNote(notesText: string): boolean {
+  return notesText.toLowerCase().includes(NO_INVOICE_PHRASE);
+}
+
+// Run an async op over many items with bounded concurrency. The old code awaited
+// each upsert one at a time (thousands of sequential round-trips → multi-minute
+// syncs). A small batch size parallelizes without exhausting the DB pool.
+const DB_BATCH_SIZE = 10;
+async function inBatches<T>(
+  items: T[],
+  fn: (item: T) => Promise<void>,
+  size = DB_BATCH_SIZE
+): Promise<void> {
+  for (let i = 0; i < items.length; i += size) {
+    await Promise.all(items.slice(i, i + size).map(fn));
+  }
+}
 
 function isCompletedStatus(status: string | null | undefined) {
   if (!status) return false;
@@ -141,6 +166,10 @@ export async function runFullSync(
       console.error("Visit sync failed (continuing):", err?.message ?? err);
     }
 
+    // Stamp the "No Invoice" note flag onto visits so the Uninvoiced Revenue
+    // metric excludes intentionally-uninvoiced jobs and all their visits.
+    await reconcileVisitNoInvoiceFlags();
+
     await recomputeCustomerAggregates();
     await recomputeMonthlySnapshots();
     await recomputeServiceTypeRevenue();
@@ -166,7 +195,7 @@ export async function runFullSync(
 }
 
 async function upsertClients(nodes: JobberClientNode[]) {
-  for (const c of nodes) {
+  await inBatches(nodes, async (c) => {
     const email = c.emails?.find((e) => e.primary)?.address ?? c.emails?.[0]?.address ?? null;
     const phone = c.phones?.find((p) => p.primary)?.number ?? c.phones?.[0]?.number ?? null;
 
@@ -189,22 +218,32 @@ async function upsertClients(nodes: JobberClientNode[]) {
         lastSyncedAt: new Date(),
       },
     });
-  }
+  });
 }
 
 async function upsertJobs(nodes: JobberJobNode[]) {
-  for (const j of nodes) {
-    let customerId: string | null = null;
-    if (j.client?.id) {
-      const existing = await prisma.customer.findUnique({
-        where: { jobberClientId: j.client.id },
-      });
-      customerId = existing?.id ?? null;
-    }
+  // Preload the customer id map once instead of a findUnique per job.
+  const clientIds = Array.from(
+    new Set(nodes.map((n) => n.client?.id).filter(Boolean) as string[])
+  );
+  const customers = clientIds.length
+    ? await prisma.customer.findMany({
+        where: { jobberClientId: { in: clientIds } },
+        select: { id: true, jobberClientId: true },
+      })
+    : [];
+  const customerByClientId = new Map(customers.map((c) => [c.jobberClientId, c.id]));
+
+  await inBatches(nodes, async (j) => {
+    const customerId = j.client?.id
+      ? customerByClientId.get(j.client.id) ?? null
+      : null;
 
     const recurring = isRecurringJob(j);
     const invoiceNumber = j.invoices?.nodes?.[0]?.invoiceNumber ?? null;
     const hasInvoice = (j.invoices?.nodes?.length ?? 0) > 0;
+    const notesText = concatJobNotes(j);
+    const noInvoiceFlag = hasNoInvoiceNote(notesText);
 
     // Store a richer jobType string so the service-type breakdown is useful
     const storedJobType =
@@ -229,6 +268,8 @@ async function upsertJobs(nodes: JobberJobNode[]) {
         clientName: j.client?.companyName || j.client?.name || null,
         hasInvoice,
         invoiceNumber,
+        notes: notesText || null,
+        noInvoiceFlag,
       },
       update: {
         jobNumber: j.jobNumber != null ? String(j.jobNumber) : null,
@@ -245,21 +286,56 @@ async function upsertJobs(nodes: JobberJobNode[]) {
         clientName: j.client?.companyName || j.client?.name || null,
         hasInvoice,
         invoiceNumber,
+        notes: notesText || null,
+        noInvoiceFlag,
         lastSyncedAt: new Date(),
       },
     });
-  }
+  });
+}
+
+// Propagate each job's "No Invoice" note flag down to its visits, so the
+// visit-level Uninvoiced Revenue metric can exclude them. Runs every sync and
+// reconciles in both directions (notes added AND removed), independent of
+// whether a given visit was re-fetched this run.
+async function reconcileVisitNoInvoiceFlags() {
+  const flaggedJobIds = (
+    await prisma.jobRecord.findMany({
+      where: { noInvoiceFlag: true },
+      select: { jobberJobId: true },
+    })
+  ).map((j) => j.jobberJobId);
+
+  // Mark visits belonging to flagged jobs.
+  await prisma.visitRecord.updateMany({
+    where: { jobberJobId: { in: flaggedJobIds }, noInvoiceFlag: false },
+    data: { noInvoiceFlag: true },
+  });
+
+  // Clear the flag on any visit whose job is no longer flagged (note removed).
+  // An empty flaggedJobIds list correctly clears everything.
+  await prisma.visitRecord.updateMany({
+    where: { noInvoiceFlag: true, jobberJobId: { notIn: flaggedJobIds } },
+    data: { noInvoiceFlag: false },
+  });
 }
 
 async function upsertInvoices(nodes: JobberInvoiceNode[]) {
-  for (const inv of nodes) {
-    let customerId: string | null = null;
-    if (inv.client?.id) {
-      const existing = await prisma.customer.findUnique({
-        where: { jobberClientId: inv.client.id },
-      });
-      customerId = existing?.id ?? null;
-    }
+  const clientIds = Array.from(
+    new Set(nodes.map((n) => n.client?.id).filter(Boolean) as string[])
+  );
+  const customers = clientIds.length
+    ? await prisma.customer.findMany({
+        where: { jobberClientId: { in: clientIds } },
+        select: { id: true, jobberClientId: true },
+      })
+    : [];
+  const customerByClientId = new Map(customers.map((c) => [c.jobberClientId, c.id]));
+
+  await inBatches(nodes, async (inv) => {
+    const customerId = inv.client?.id
+      ? customerByClientId.get(inv.client.id) ?? null
+      : null;
 
     const total = inv.amounts?.total ?? 0;
     const balance = inv.amounts?.invoiceBalance ?? 0;
@@ -299,11 +375,11 @@ async function upsertInvoices(nodes: JobberInvoiceNode[]) {
         lastSyncedAt: new Date(),
       },
     });
-  }
+  });
 }
 
 async function upsertTimeEntries(entries: FlatTimeEntry[]) {
-  for (const e of entries) {
+  await inBatches(entries, async (e) => {
     const occurredAt = e.occurredAt ? new Date(e.occurredAt) : null;
     await prisma.timeEntry.upsert({
       where: { jobberEntryId: e.jobberEntryId },
@@ -336,11 +412,11 @@ async function upsertTimeEntries(entries: FlatTimeEntry[]) {
         lastSyncedAt: new Date(),
       },
     });
-  }
+  });
 }
 
 async function upsertVisits(visits: FlatVisit[]) {
-  for (const v of visits) {
+  await inBatches(visits, async (v) => {
     const start = v.startAt ? new Date(v.startAt) : null;
     const end = v.endAt ? new Date(v.endAt) : null;
     const completed = v.completedAt ? new Date(v.completedAt) : null;
@@ -379,32 +455,46 @@ async function upsertVisits(visits: FlatVisit[]) {
         lastSyncedAt: new Date(),
       },
     });
-  }
+  });
 }
 
 async function recomputeCustomerAggregates() {
-  const customers = await prisma.customer.findMany();
-  for (const c of customers) {
-    const jobs = await prisma.jobRecord.findMany({
-      where: { customerId: c.id },
-    });
-    const totalRevenue = jobs.reduce((acc, j) => acc + (j.total || 0), 0);
-    const isRecurring = jobs.some((j) => j.isRecurring);
-    const lastJob = jobs
-      .map((j) => j.completedAt || j.endAt)
-      .filter(Boolean)
-      .sort((a, b) => (b!.getTime() - a!.getTime()))[0] || null;
+  const customers = await prisma.customer.findMany({ select: { id: true } });
+
+  // Load all customer-linked jobs once and group in memory, instead of a
+  // findMany per customer.
+  const jobs = await prisma.jobRecord.findMany({
+    where: { customerId: { not: null } },
+    select: { customerId: true, total: true, isRecurring: true, completedAt: true, endAt: true },
+  });
+  const jobsByCustomer = new Map<string, typeof jobs>();
+  for (const j of jobs) {
+    if (!j.customerId) continue;
+    const arr = jobsByCustomer.get(j.customerId);
+    if (arr) arr.push(j);
+    else jobsByCustomer.set(j.customerId, [j]);
+  }
+
+  await inBatches(customers, async (c) => {
+    const cJobs = jobsByCustomer.get(c.id) ?? [];
+    const totalRevenue = cJobs.reduce((acc, j) => acc + (j.total || 0), 0);
+    const isRecurring = cJobs.some((j) => j.isRecurring);
+    const lastJob =
+      cJobs
+        .map((j) => j.completedAt || j.endAt)
+        .filter(Boolean)
+        .sort((a, b) => b!.getTime() - a!.getTime())[0] || null;
 
     await prisma.customer.update({
       where: { id: c.id },
       data: {
         totalRevenue,
-        jobCount: jobs.length,
+        jobCount: cJobs.length,
         isRecurring,
         lastJobAt: lastJob,
       },
     });
-  }
+  });
 }
 
 async function recomputeMonthlySnapshots() {

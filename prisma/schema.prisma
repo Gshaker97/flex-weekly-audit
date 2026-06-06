@@ -91,12 +91,14 @@ model VisitRecord {
   endAt           DateTime?
   completedAt     DateTime?
   hasInvoice      Boolean   @default(false)
+  noInvoiceFlag   Boolean   @default(false)
   estimatedValue  Float     @default(0)
   lastSyncedAt    DateTime  @default(now())
 
   @@index([visitDate])
   @@index([isComplete])
   @@index([hasInvoice])
+  @@index([noInvoiceFlag])
 }
 
 model TimeEntry {
@@ -158,6 +160,8 @@ model JobRecord {
   clientName        String?
   hasInvoice        Boolean   @default(false)
   invoiceNumber     String?
+  notes             String?   @db.Text
+  noInvoiceFlag     Boolean   @default(false)
   lastSyncedAt      DateTime  @default(now())
 
   customer Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
