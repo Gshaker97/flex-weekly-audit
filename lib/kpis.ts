@@ -115,10 +115,12 @@ export async function computeDashboardKPIs(
   const overdueJobCount = overdueAgg._count ?? 0;
 
   // Uninvoiced Revenue (visit-level): completed visits with no invoice.
+  // Excludes visits whose job is marked "No Invoice" in its Jobber notes.
   const uninvAgg = await prisma.visitRecord.aggregate({
     where: {
       isComplete: true,
       hasInvoice: false,
+      noInvoiceFlag: false,
       visitDate: { gte: range.start, lte: range.end },
     },
     _sum: { estimatedValue: true },

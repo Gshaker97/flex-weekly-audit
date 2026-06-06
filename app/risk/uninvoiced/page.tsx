@@ -20,10 +20,12 @@ export default async function UninvoicedRevenuePage({
   const range = hasFilter ? resolveDateRange(searchParams) : getDateRange("allTime");
 
   // Completed visits (work that's been done) with no invoice attached.
+  // Excludes visits whose job is marked "No Invoice" in its Jobber notes.
   const visits = await prisma.visitRecord.findMany({
     where: {
       isComplete: true,
       hasInvoice: false,
+      noInvoiceFlag: false,
       visitDate: { gte: range.start, lte: range.end },
     },
     orderBy: { visitDate: "desc" },

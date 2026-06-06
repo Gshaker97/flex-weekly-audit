@@ -181,6 +181,14 @@ const JOBS_QUERY = `
         invoices(first: 5) {
           nodes { id invoiceNumber }
         }
+        notes(first: 20) {
+          nodes {
+            ... on JobNote {
+              id
+              message
+            }
+          }
+        }
       }
     }
   }
@@ -217,6 +225,14 @@ const JOBS_BY_RANGE_QUERY = `
         invoices(first: 5) {
           nodes { id invoiceNumber }
         }
+        notes(first: 20) {
+          nodes {
+            ... on JobNote {
+              id
+              message
+            }
+          }
+        }
       }
     }
   }
@@ -252,6 +268,14 @@ const JOBS_BY_END_QUERY = `
         }
         invoices(first: 5) {
           nodes { id invoiceNumber }
+        }
+        notes(first: 20) {
+          nodes {
+            ... on JobNote {
+              id
+              message
+            }
+          }
         }
       }
     }
@@ -355,6 +379,22 @@ export interface JobberJobNode {
   visits?: { totalCount: number | null } | null;
   client: { id: string; name?: string | null; companyName?: string | null } | null;
   invoices: { nodes: Array<{ id: string; invoiceNumber: string | null }> };
+  // `notes` is a JobNoteUnionConnection; only the JobNote member carries a
+  // `message`, so other union members come back as empty objects.
+  notes?: { nodes: Array<{ id?: string; message?: string | null } | null> } | null;
+}
+
+/**
+ * Concatenate all note text attached to a job into a single string.
+ * Returns "" when the job has no notes.
+ */
+export function concatJobNotes(job: JobberJobNode): string {
+  const nodes = job.notes?.nodes ?? [];
+  return nodes
+    .map((n) => n?.message ?? "")
+    .filter((m) => m.trim().length > 0)
+    .join("\n")
+    .trim();
 }
 
 export interface JobberClientNode {
@@ -426,9 +466,13 @@ async function fetchIncremental<T>(
   query: string,
   rootKey: string,
   since: Date | null,
-  label: string
+  label: string,
+  supportsSinceFilter = true
 ): Promise<T[]> {
-  if (!since) {
+  // Some Jobber connections (jobs, visits) don't accept an updatedAt filter, so
+  // attempting one just wastes a request and always falls back to a full pull.
+  // Skip straight to the full pull for those.
+  if (!since || !supportsSinceFilter) {
     const all = await paginate<T>(query, rootKey);
     console.log(`[sync] ${label}: full pull (${all.length})`);
     return all;
@@ -446,7 +490,8 @@ async function fetchIncremental<T>(
 }
 
 export async function fetchAllJobs(since: Date | null = null): Promise<JobberJobNode[]> {
-  return fetchIncremental<JobberJobNode>(JOBS_QUERY, "jobs", since, "jobs");
+  // Jobber's JobFilterAttributes has no updatedAt — always full pull.
+  return fetchIncremental<JobberJobNode>(JOBS_QUERY, "jobs", since, "jobs", false);
 }
 
 export async function fetchAllClients(since: Date | null = null): Promise<JobberClientNode[]> {
@@ -488,7 +533,8 @@ interface FlatVisitNode {
 }
 
 export async function fetchAllJobVisits(since: Date | null = null): Promise<FlatVisit[]> {
-  const visits = await fetchIncremental<FlatVisitNode>(VISITS_QUERY, "visits", since, "visits");
+  // Jobber's VisitFilterAttributes has no updatedAt — always full pull.
+  const visits = await fetchIncremental<FlatVisitNode>(VISITS_QUERY, "visits", since, "visits", false);
   return visits.map((v) => {
     const jobTotal = v.job?.total != null ? Number(v.job.total) : 0;
     const count = v.job?.visits?.totalCount ?? 1;
