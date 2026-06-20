@@ -15,6 +15,7 @@ import {
 import {
   getInvoicePipelineRefs,
   findContactByEmail,
+  createContact,
   searchOpportunities,
   moveOpportunityToStage,
   createOpportunity,
@@ -461,29 +462,48 @@ async function syncGhlInvoiceOverdue(): Promise<number> {
   });
 
   let synced = 0;
-  let contactsFound = 0;
-  let contactsNotFound = 0;
+  let contactsMatched = 0;
+  let contactsCreated = 0;
+  let noEmail = 0;
   let oppsMoved = 0;
   let oppsCreated = 0;
   for (const inv of overdue) {
     const email = inv.customer?.email;
     const invId = inv.invoiceNumber ?? inv.jobberInvoiceId ?? inv.id;
-    // No email on the Jobber customer — can't match a GHL contact.
+    // No email on the Jobber customer — can't match or create a GHL contact.
     if (!email) {
-      contactsNotFound += 1;
+      noEmail += 1;
       log(`[ghl] no contact found for invoice ${invId} email (none)`);
       continue;
     }
     try {
-      const contact = await findContactByEmail(email);
-      if (!contact) {
-        contactsNotFound += 1;
-        log(`[ghl] no contact found for invoice ${invId} email ${email}`);
-        continue;
-      }
-      contactsFound += 1;
+      const found = await findContactByEmail(email);
+      // findContactByEmail falls back to a fuzzy first hit, so only treat an
+      // EXACT email match as a real match — otherwise create the contact with
+      // the correct email so the opportunity attaches to the right person.
+      const exact =
+        found && (found.email ?? "").toLowerCase() === email.toLowerCase();
 
-      const opps = await searchOpportunities(contact.id, refs.pipelineId);
+      let contactId: string;
+      if (exact) {
+        contactsMatched += 1;
+        contactId = found!.id;
+      } else {
+        // Option 3: log the mismatch so the pattern is visible (and the closest
+        // fuzzy hit, if any, to spot near-misses like jake@gmail vs jake@work).
+        const near = found ? ` (closest GHL email: ${found.email ?? "n/a"})` : " (no GHL match)";
+        log(`[ghl] email not matched in GHL for invoice ${invId} email ${email}${near}`);
+        // Option 1: auto-create the contact, then attach the opportunity.
+        const created = await createContact({
+          email,
+          name: inv.customer?.name ?? inv.customer?.companyName ?? inv.clientName ?? null,
+          phone: inv.customer?.phone ?? null,
+        });
+        contactsCreated += 1;
+        contactId = created.id;
+      }
+
+      const opps = await searchOpportunities(contactId, refs.pipelineId);
       const match = opps.find((o) => matchesInvoice(o, inv));
 
       if (match) {
@@ -495,7 +515,7 @@ async function syncGhlInvoiceOverdue(): Promise<number> {
         await createOpportunity({
           pipelineId: refs.pipelineId,
           pipelineStageId: refs.overdueStageId,
-          contactId: contact.id,
+          contactId,
           name: opportunityName(inv),
           monetaryValue: inv.amountDue || inv.total || 0,
         });
@@ -513,8 +533,8 @@ async function syncGhlInvoiceOverdue(): Promise<number> {
 
   log(
     `[ghl] invoice overdue sync summary — processed=${overdue.length} ` +
-      `contactsFound=${contactsFound} contactsNotFound=${contactsNotFound} ` +
-      `oppsMoved=${oppsMoved} oppsCreated=${oppsCreated}`
+      `contactsMatched=${contactsMatched} contactsCreated=${contactsCreated} ` +
+      `noEmail=${noEmail} oppsMoved=${oppsMoved} oppsCreated=${oppsCreated}`
   );
   return synced;
 }

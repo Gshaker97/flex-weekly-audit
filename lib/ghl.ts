@@ -164,6 +164,36 @@ export async function findContactByEmail(
   return exact ?? contacts[0] ?? null;
 }
 
+// Create a contact (used when no GHL contact matches the invoice's email, so an
+// opportunity can still be attached). On a duplicate (400), GHL returns the
+// existing contact id in meta.contactId — use that instead of failing.
+export async function createContact(opts: {
+  email: string;
+  name?: string | null;
+  phone?: string | null;
+}): Promise<GhlContact> {
+  const body: Record<string, any> = {
+    locationId: ghlLocationId(),
+    email: opts.email,
+  };
+  if (opts.name) body.name = opts.name;
+  if (opts.phone) body.phone = opts.phone;
+  try {
+    const data = await ghlFetch<{ contact: GhlContact }>(`/contacts/`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    return data.contact;
+  } catch (err: any) {
+    const existingId: string | undefined =
+      err?.status === 400
+        ? err?.body?.meta?.contactId ?? err?.body?.meta?.existingId
+        : undefined;
+    if (existingId) return { id: existingId, email: opts.email };
+    throw err;
+  }
+}
+
 export interface GhlOpportunity {
   id: string;
   name?: string | null;
