@@ -76,7 +76,18 @@ async function ghlFetch<T = any>(
     }
     if (!res.ok) {
       const text = await res.text();
-      throw new Error(`GHL API ${res.status} (${path}): ${text}`);
+      let body: any = undefined;
+      try {
+        body = JSON.parse(text);
+      } catch {
+        /* non-JSON error body */
+      }
+      // Attach status + parsed body so callers can handle specific errors
+      // (e.g. createOpportunity recovering meta.existingId on a duplicate).
+      const err: any = new Error(`GHL API ${res.status} (${path}): ${text}`);
+      err.status = res.status;
+      err.body = body;
+      throw err;
     }
     if (res.status === 204) return undefined as T;
     return (await res.json()) as T;
@@ -204,9 +215,30 @@ export async function createOpportunity(opts: {
     status: "open",
     monetaryValue: opts.monetaryValue ?? 0,
   };
-  const data = await ghlFetch<{ opportunity: GhlOpportunity }>(
-    `/opportunities/`,
-    { method: "POST", body: JSON.stringify(body) }
-  );
-  return data.opportunity;
+  try {
+    const data = await ghlFetch<{ opportunity: GhlOpportunity }>(
+      `/opportunities/`,
+      { method: "POST", body: JSON.stringify(body) }
+    );
+    return data.opportunity;
+  } catch (err: any) {
+    // GHL rejects an already-existing opportunity with 400 "Can not create
+    // duplicate opportunity" and returns its id in meta.existingId. Rather than
+    // failing, move that existing opportunity into the target stage — this is
+    // what makes overdue invoices update existing cards instead of only the
+    // brand-new ones.
+    const existingId: string | undefined =
+      err?.status === 400 ? err?.body?.meta?.existingId : undefined;
+    if (existingId) {
+      await moveOpportunityToStage(existingId, opts.pipelineStageId);
+      return {
+        id: existingId,
+        name: opts.name,
+        pipelineId: opts.pipelineId,
+        pipelineStageId: opts.pipelineStageId,
+        contactId: opts.contactId,
+      };
+    }
+    throw err;
+  }
 }
