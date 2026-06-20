@@ -12,6 +12,15 @@ import {
   FlatVisit,
   concatJobNotes,
 } from "./jobber";
+import {
+  getInvoicePipelineRefs,
+  findContactByEmail,
+  searchOpportunities,
+  moveOpportunityToStage,
+  createOpportunity,
+  GhlOpportunity,
+  InvoicePipelineRefs,
+} from "./ghl";
 
 // Clients mark jobs that intentionally don't need an invoice by writing
 // "No Invoice" in the job's Notes in Jobber. Any job whose notes contain this
@@ -173,6 +182,20 @@ export async function runFullSync(
     await recomputeCustomerAggregates();
     await recomputeMonthlySnapshots();
     await recomputeServiceTypeRevenue();
+
+    // Mirror overdue invoices into the GHL "Invoice Pipeline". Best-effort: a
+    // GHL outage or missing config (no API key, pipeline/stage renamed) must
+    // not fail the whole Jobber sync.
+    try {
+      const ghlSynced = await syncGhlInvoiceOverdue();
+      await prisma.syncRun.update({
+        where: { id: run.id },
+        data: { ghlOpportunitiesSynced: ghlSynced },
+      });
+      console.log(`[sync] ghlInvoiceSync: ${ghlSynced} overdue invoices synced to GHL`);
+    } catch (err: any) {
+      console.error("GHL invoice sync failed (continuing):", err?.message ?? err);
+    }
 
     return await prisma.syncRun.update({
       where: { id: run.id },
@@ -376,6 +399,95 @@ async function upsertInvoices(nodes: JobberInvoiceNode[]) {
       },
     });
   });
+}
+
+// Build the opportunity name we use when creating an overdue-invoice card.
+// Also used as a fallback match target (see matchesInvoice).
+function opportunityName(inv: {
+  invoiceNumber: string | null;
+  clientName: string | null;
+}): string {
+  const num = inv.invoiceNumber ? `#${inv.invoiceNumber}` : "";
+  const who = inv.clientName ? ` — ${inv.clientName}` : "";
+  return `Invoice ${num}${who}`.trim();
+}
+
+// Match an existing GHL opportunity to an invoice on invoice number or title.
+function matchesInvoice(
+  opp: GhlOpportunity,
+  inv: { invoiceNumber: string | null; clientName: string | null }
+): boolean {
+  const name = (opp.name ?? "").toLowerCase();
+  if (!name) return false;
+  const num = (inv.invoiceNumber ?? "").toLowerCase();
+  if (num && name.includes(num)) return true;
+  return name === opportunityName(inv).toLowerCase();
+}
+
+// For every overdue, unpaid invoice, ensure a GHL opportunity exists in the
+// "Invoice Overdue" stage of the "Invoice Pipeline" — moving an existing card
+// or creating a new one. Returns the number of invoices processed.
+async function syncGhlInvoiceOverdue(): Promise<number> {
+  console.log('[ghl] starting invoice overdue sync');
+
+  // Resolving the pipeline/stage ids is the most likely thing to hang or fail
+  // (network + config). Isolate it so a failure logs and skips rather than
+  // stalling or aborting the sync.
+  let refs: InvoicePipelineRefs;
+  try {
+    refs = await getInvoicePipelineRefs();
+  } catch (err: any) {
+    console.error('[ghl] failed to resolve pipeline refs (skipping):', err?.message ?? err);
+    return 0;
+  }
+  console.log('[ghl] pipeline refs resolved', refs.pipelineId, refs.overdueStageId);
+
+  // Overdue = due date in the past. Status filtering is done in JS so casing
+  // variations of "paid"/"void" are all excluded reliably.
+  const candidates = await prisma.invoiceRecord.findMany({
+    where: { dueAt: { not: null, lt: new Date() } },
+    include: { customer: true },
+  });
+  console.log('[ghl] past-due invoices found', candidates.length);
+  const overdue = candidates.filter((inv) => {
+    const s = (inv.invoiceStatus ?? "").toLowerCase();
+    return s !== "paid" && s !== "void";
+  });
+
+  let synced = 0;
+  for (const inv of overdue) {
+    const email = inv.customer?.email;
+    if (!email) continue;
+    try {
+      const contact = await findContactByEmail(email);
+      if (!contact) continue;
+
+      const opps = await searchOpportunities(contact.id, refs.pipelineId);
+      const match = opps.find((o) => matchesInvoice(o, inv));
+
+      if (match) {
+        if (match.pipelineStageId !== refs.overdueStageId) {
+          await moveOpportunityToStage(match.id, refs.overdueStageId);
+        }
+      } else {
+        await createOpportunity({
+          pipelineId: refs.pipelineId,
+          pipelineStageId: refs.overdueStageId,
+          contactId: contact.id,
+          name: opportunityName(inv),
+          monetaryValue: inv.amountDue || inv.total || 0,
+        });
+      }
+      synced += 1;
+    } catch (err: any) {
+      // One bad invoice/contact shouldn't abort the rest.
+      console.error(
+        `[sync] ghlInvoiceSync: invoice ${inv.invoiceNumber ?? inv.id} failed (continuing):`,
+        err?.message ?? err
+      );
+    }
+  }
+  return synced;
 }
 
 async function upsertTimeEntries(entries: FlatTimeEntry[]) {

@@ -70,7 +70,7 @@ export default async function SettingsPage() {
                   Last sync: {formatDateTime(lastSync.startedAt)}
                   {" · "}Status: <Badge variant={lastSync.status === "complete" ? "success" : lastSync.status === "failed" ? "danger" : "warning"}>{lastSync.status}</Badge>
                   <div className="mt-2 text-xs">
-                    {lastSync.customersFetched} customers · {lastSync.jobsFetched} jobs · {lastSync.invoicesFetched} invoices
+                    {lastSync.customersFetched} customers · {lastSync.jobsFetched} jobs · {lastSync.invoicesFetched} invoices · {lastSync.ghlOpportunitiesSynced} GHL opps
                   </div>
                 </>
               ) : (

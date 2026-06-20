@@ -51,6 +51,8 @@ Run a sync manually with the "Sync from Jobber" button, or set up a daily cron t
 | `JOBBER_REDIRECT_URI` | `https://<railway-domain>/api/auth/jobber/callback` |
 | `CRON_SECRET` | Any random string |
 | `APP_URL` | `https://<railway-domain>` |
+| `GHL_API_KEY` | GoHighLevel API key (Bearer token) |
+| `GHL_LOCATION_ID` | GoHighLevel location/sub-account ID |
 
 ### First run
 

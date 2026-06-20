@@ -73,6 +73,7 @@ model SyncRun {
   quotesFetched    Int    @default(0)
   timeEntriesFetched Int  @default(0)
   visitsFetched    Int    @default(0)
+  ghlOpportunitiesSynced Int @default(0)
 
   @@index([startedAt])
 }
