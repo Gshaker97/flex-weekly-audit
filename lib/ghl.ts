@@ -8,10 +8,10 @@
 const GHL_API_URL = "https://services.leadconnectorhq.com";
 const GHL_API_VERSION = "2021-07-28";
 
-// Pipeline + stage we sync overdue invoices into. Resolved by name at runtime
-// (their ids differ per location) via GET /opportunities/pipelines.
+// Pipeline we sync invoices into. Resolved by name at runtime (ids differ per
+// location) via GET /opportunities/pipelines; all of its stages are mapped so
+// the caller can route each invoice to the right stage by name.
 const INVOICE_PIPELINE_NAME = "Invoice Pipeline";
-const OVERDUE_STAGE_NAME = "Invoice Overdue";
 
 function ghlApiKey(): string {
   const key = process.env.GHL_API_KEY;
@@ -97,7 +97,8 @@ async function ghlFetch<T = any>(
 
 export interface InvoicePipelineRefs {
   pipelineId: string;
-  overdueStageId: string;
+  // lowercased stage name -> stage id, for every stage in the Invoice Pipeline.
+  stageIdByName: Record<string, string>;
 }
 
 interface GhlPipeline {
@@ -126,16 +127,13 @@ export async function getInvoicePipelineRefs(): Promise<InvoicePipelineRefs> {
   if (!pipeline) {
     throw new Error(`GHL pipeline "${INVOICE_PIPELINE_NAME}" not found`);
   }
-  const stage = (pipeline.stages ?? []).find((s) =>
-    eq(s.name, OVERDUE_STAGE_NAME)
-  );
-  if (!stage) {
-    throw new Error(
-      `GHL stage "${OVERDUE_STAGE_NAME}" not found in pipeline "${INVOICE_PIPELINE_NAME}"`
-    );
+
+  const stageIdByName: Record<string, string> = {};
+  for (const s of pipeline.stages ?? []) {
+    stageIdByName[(s.name ?? "").trim().toLowerCase()] = s.id;
   }
 
-  cachedRefs = { pipelineId: pipeline.id, overdueStageId: stage.id };
+  cachedRefs = { pipelineId: pipeline.id, stageIdByName };
   return cachedRefs;
 }
 

@@ -37,7 +37,7 @@ A business intelligence dashboard for Flexx Landscaping that pulls data from Job
 
 The dashboard is powered by a **local Postgres cache** of Jobber data. A sync job pulls clients, jobs, and invoices from Jobber and stores them in Postgres. The dashboard queries Postgres (fast) instead of Jobber (rate-limited).
 
-Run a sync manually with the "Sync from Jobber" button, or set up a daily cron to keep it fresh.
+Run a sync manually with the "Sync from Jobber" button, or set up an hourly cron to keep it fresh.
 
 ## Setup
 
@@ -61,9 +61,11 @@ Run a sync manually with the "Sync from Jobber" button, or set up a daily cron t
 3. Click **Sync from Jobber** (takes 5-10 minutes the first time)
 4. KPI dashboard populates automatically
 
-### Daily sync cron
+### Hourly sync cron
 
 Hit `POST /api/sync/run` with header `x-cron-secret: <your CRON_SECRET>` on a schedule.
+The standalone `npm run sync:cron` service runs **hourly** (`0 * * * *`) so the GHL
+Invoice Pipeline (Sent / Overdue / Paid / Canceled) stays current through the day.
 
 ## Notes on Jobber rate limits
 

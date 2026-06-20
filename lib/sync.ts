@@ -190,16 +190,16 @@ export async function runFullSync(
     log("[sync] step: recomputeServiceTypeRevenue");
     await recomputeServiceTypeRevenue();
 
-    // Mirror overdue invoices into the GHL "Invoice Pipeline". Best-effort: a
-    // GHL outage or missing config (no API key, pipeline/stage renamed) must
-    // not fail the whole Jobber sync.
+    // Mirror invoices into the GHL "Invoice Pipeline" (Sent / Overdue / Paid /
+    // Canceled by status). Best-effort: a GHL outage or missing config (no API
+    // key, pipeline renamed) must not fail the whole Jobber sync.
     try {
-      const ghlSynced = await syncGhlInvoiceOverdue();
+      const ghlSynced = await syncGhlInvoicePipeline();
       await prisma.syncRun.update({
         where: { id: run.id },
         data: { ghlOpportunitiesSynced: ghlSynced },
       });
-      log(`[sync] ghlInvoiceSync: ${ghlSynced} overdue invoices synced to GHL`);
+      log(`[sync] ghlInvoicePipeline: ${ghlSynced} invoices synced to GHL`);
     } catch (err: any) {
       logError("GHL invoice sync failed (continuing):", err?.message ?? err);
     }
@@ -434,12 +434,41 @@ function matchesInvoice(
 // For every overdue, unpaid invoice, ensure a GHL opportunity exists in the
 // "Invoice Overdue" stage of the "Invoice Pipeline" — moving an existing card
 // or creating a new one. Returns the number of invoices processed.
-async function syncGhlInvoiceOverdue(): Promise<number> {
-  log('[ghl] starting invoice overdue sync');
+// GHL Invoice Pipeline stage names (matched case-insensitively against the
+// pipeline's stages resolved at runtime).
+const GHL_STAGE_SENT = "Invoice Sent";
+const GHL_STAGE_OVERDUE = "Invoice Overdue";
+const GHL_STAGE_PAID = "Invoice Paid";
+const GHL_STAGE_CANCELED = "Invoice Canceled";
 
-  // Resolving the pipeline/stage ids is the most likely thing to hang or fail
-  // (network + config). Isolate it so a failure logs and skips rather than
-  // stalling or aborting the sync.
+// Map a Jobber invoice to the GHL stage it belongs in (null = skip).
+// Jobber's own statuses already distinguish sent (awaiting_payment) vs overdue
+// (past_due); we also honour the dueAt fallback the spec describes.
+function ghlStageForInvoice(
+  inv: { invoiceStatus: string | null; dueAt: Date | null },
+  now: Date
+): string | null {
+  const status = (inv.invoiceStatus ?? "").toLowerCase();
+  if (!status || status === "draft") return null; // skip drafts
+  if (status === "paid") return GHL_STAGE_PAID;
+  if (status === "void" || status === "bad_debt") return GHL_STAGE_CANCELED;
+  if (status === "past_due") return GHL_STAGE_OVERDUE;
+  if (status === "awaiting_payment") {
+    return inv.dueAt && inv.dueAt < now ? GHL_STAGE_OVERDUE : GHL_STAGE_SENT;
+  }
+  // Unknown status — fall back to the due date so nothing silently vanishes.
+  if (inv.dueAt) return inv.dueAt < now ? GHL_STAGE_OVERDUE : GHL_STAGE_SENT;
+  return null;
+}
+
+// Full GHL "Invoice Pipeline" sync: route every invoice to the stage matching
+// its status (Sent / Overdue / Paid / Canceled), creating the GHL contact and
+// opportunity when missing. Returns the number of invoices processed.
+async function syncGhlInvoicePipeline(): Promise<number> {
+  log('[ghl] starting invoice pipeline sync');
+
+  // Resolving the pipeline + its stages is the most likely thing to fail
+  // (network + config). Isolate it so a failure logs and skips cleanly.
   let refs: InvoicePipelineRefs;
   try {
     refs = await getInvoicePipelineRefs();
@@ -447,96 +476,100 @@ async function syncGhlInvoiceOverdue(): Promise<number> {
     logError('[ghl] failed to resolve pipeline refs (skipping):', err?.message ?? err);
     return 0;
   }
-  log('[ghl] pipeline refs resolved', refs.pipelineId, refs.overdueStageId);
+  log('[ghl] pipeline resolved', refs.pipelineId, '| stages:', Object.keys(refs.stageIdByName).join(', '));
 
-  // Overdue = due date in the past. Status filtering is done in JS so casing
-  // variations of "paid"/"void" are all excluded reliably.
-  const candidates = await prisma.invoiceRecord.findMany({
-    where: { dueAt: { not: null, lt: new Date() } },
+  const now = new Date();
+  // Every invoice in the DB — the stage is derived from status, not the query.
+  const invoices = await prisma.invoiceRecord.findMany({
     include: { customer: true },
   });
-  log('[ghl] past-due invoices found', candidates.length);
-  const overdue = candidates.filter((inv) => {
-    const s = (inv.invoiceStatus ?? "").toLowerCase();
-    return s !== "paid" && s !== "void";
-  });
+  log('[ghl] invoices in DB', invoices.length);
 
-  let synced = 0;
-  let contactsMatched = 0;
+  let processed = 0;
+  let created = 0;
+  let moved = 0;
+  let skipped = 0;
   let contactsCreated = 0;
-  let noEmail = 0;
-  let oppsMoved = 0;
-  let oppsCreated = 0;
-  for (const inv of overdue) {
-    const email = inv.customer?.email;
+
+  for (const inv of invoices) {
     const invId = inv.invoiceNumber ?? inv.jobberInvoiceId ?? inv.id;
-    // No email on the Jobber customer — can't match or create a GHL contact.
-    if (!email) {
-      noEmail += 1;
-      log(`[ghl] no contact found for invoice ${invId} email (none)`);
+
+    // Drafts (and unknown/dateless statuses) are skipped entirely.
+    const stageName = ghlStageForInvoice(inv, now);
+    if (!stageName) {
+      skipped += 1;
       continue;
     }
+    const stageId = refs.stageIdByName[stageName.toLowerCase()];
+    if (!stageId) {
+      skipped += 1;
+      log(`[ghl] stage "${stageName}" not found in pipeline — skipping invoice ${invId}`);
+      continue;
+    }
+
+    const email = inv.customer?.email;
+    if (!email) {
+      skipped += 1;
+      log(`[ghl] no email for invoice ${invId} — skipping`);
+      continue;
+    }
+
     try {
       const found = await findContactByEmail(email);
-      // findContactByEmail falls back to a fuzzy first hit, so only treat an
-      // EXACT email match as a real match — otherwise create the contact with
-      // the correct email so the opportunity attaches to the right person.
+      // findContactByEmail falls back to a fuzzy first hit, so only an EXACT
+      // email match counts; otherwise create the contact with the right email.
       const exact =
         found && (found.email ?? "").toLowerCase() === email.toLowerCase();
 
       let contactId: string;
       if (exact) {
-        contactsMatched += 1;
         contactId = found!.id;
       } else {
-        // Option 3: log the mismatch so the pattern is visible (and the closest
-        // fuzzy hit, if any, to spot near-misses like jake@gmail vs jake@work).
         const near = found ? ` (closest GHL email: ${found.email ?? "n/a"})` : " (no GHL match)";
         log(`[ghl] email not matched in GHL for invoice ${invId} email ${email}${near}`);
-        // Option 1: auto-create the contact, then attach the opportunity.
-        const created = await createContact({
+        const createdContact = await createContact({
           email,
           name: inv.customer?.name ?? inv.customer?.companyName ?? inv.clientName ?? null,
           phone: inv.customer?.phone ?? null,
         });
         contactsCreated += 1;
-        contactId = created.id;
+        contactId = createdContact.id;
       }
 
       const opps = await searchOpportunities(contactId, refs.pipelineId);
       const match = opps.find((o) => matchesInvoice(o, inv));
 
       if (match) {
-        if (match.pipelineStageId !== refs.overdueStageId) {
-          await moveOpportunityToStage(match.id, refs.overdueStageId);
-          oppsMoved += 1;
+        if (match.pipelineStageId !== stageId) {
+          await moveOpportunityToStage(match.id, stageId);
+          moved += 1;
         }
       } else {
         await createOpportunity({
           pipelineId: refs.pipelineId,
-          pipelineStageId: refs.overdueStageId,
+          pipelineStageId: stageId,
           contactId,
           name: opportunityName(inv),
           monetaryValue: inv.amountDue || inv.total || 0,
         });
-        oppsCreated += 1;
+        created += 1;
       }
-      synced += 1;
+      processed += 1;
     } catch (err: any) {
       // One bad invoice/contact shouldn't abort the rest.
+      skipped += 1;
       logError(
-        `[sync] ghlInvoiceSync: invoice ${inv.invoiceNumber ?? inv.id} failed (continuing):`,
+        `[sync] ghlInvoicePipeline: invoice ${inv.invoiceNumber ?? inv.id} failed (continuing):`,
         err?.message ?? err
       );
     }
   }
 
   log(
-    `[ghl] invoice overdue sync summary — processed=${overdue.length} ` +
-      `contactsMatched=${contactsMatched} contactsCreated=${contactsCreated} ` +
-      `noEmail=${noEmail} oppsMoved=${oppsMoved} oppsCreated=${oppsCreated}`
+    `[ghl] invoice pipeline sync summary — processed=${processed} created=${created} ` +
+      `moved=${moved} skipped=${skipped} contactsCreated=${contactsCreated}`
   );
-  return synced;
+  return processed;
 }
 
 async function upsertTimeEntries(entries: FlatTimeEntry[]) {
