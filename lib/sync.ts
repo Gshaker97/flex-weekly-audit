@@ -461,12 +461,27 @@ async function syncGhlInvoiceOverdue(): Promise<number> {
   });
 
   let synced = 0;
+  let contactsFound = 0;
+  let contactsNotFound = 0;
+  let oppsMoved = 0;
+  let oppsCreated = 0;
   for (const inv of overdue) {
     const email = inv.customer?.email;
-    if (!email) continue;
+    const invId = inv.invoiceNumber ?? inv.jobberInvoiceId ?? inv.id;
+    // No email on the Jobber customer — can't match a GHL contact.
+    if (!email) {
+      contactsNotFound += 1;
+      log(`[ghl] no contact found for invoice ${invId} email (none)`);
+      continue;
+    }
     try {
       const contact = await findContactByEmail(email);
-      if (!contact) continue;
+      if (!contact) {
+        contactsNotFound += 1;
+        log(`[ghl] no contact found for invoice ${invId} email ${email}`);
+        continue;
+      }
+      contactsFound += 1;
 
       const opps = await searchOpportunities(contact.id, refs.pipelineId);
       const match = opps.find((o) => matchesInvoice(o, inv));
@@ -474,6 +489,7 @@ async function syncGhlInvoiceOverdue(): Promise<number> {
       if (match) {
         if (match.pipelineStageId !== refs.overdueStageId) {
           await moveOpportunityToStage(match.id, refs.overdueStageId);
+          oppsMoved += 1;
         }
       } else {
         await createOpportunity({
@@ -483,6 +499,7 @@ async function syncGhlInvoiceOverdue(): Promise<number> {
           name: opportunityName(inv),
           monetaryValue: inv.amountDue || inv.total || 0,
         });
+        oppsCreated += 1;
       }
       synced += 1;
     } catch (err: any) {
@@ -493,6 +510,12 @@ async function syncGhlInvoiceOverdue(): Promise<number> {
       );
     }
   }
+
+  log(
+    `[ghl] invoice overdue sync summary — processed=${overdue.length} ` +
+      `contactsFound=${contactsFound} contactsNotFound=${contactsNotFound} ` +
+      `oppsMoved=${oppsMoved} oppsCreated=${oppsCreated}`
+  );
   return synced;
 }
 
