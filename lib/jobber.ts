@@ -456,6 +456,9 @@ async function paginate<T>(
   let hasNext = true;
   let page = 0;
   while (hasNext) {
+    // Per-page marker so a stall is pinpointed to an exact page (the 30s fetch
+    // timeout only covers a single hung request, not slow multi-page pulls).
+    log(`[sync] fetching ${rootKey} page ${page + 1}`);
     const data: any = await jobberGraphQL(query, { ...baseVars, after });
     const block = data?.[rootKey];
     const nodes: T[] = block?.nodes ?? [];
