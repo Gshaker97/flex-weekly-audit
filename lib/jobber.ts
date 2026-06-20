@@ -1,4 +1,5 @@
 import { prisma } from "./prisma";
+import { log, logError } from "./log";
 
 const JOBBER_API_URL = "https://api.getjobber.com/api/graphql";
 const JOBBER_TOKEN_URL = "https://api.getjobber.com/api/oauth/token";
@@ -463,7 +464,7 @@ async function paginate<T>(
     after = block?.pageInfo?.endCursor ?? null;
     page += 1;
     if (page > 500) {
-      console.warn(`paginate: stopping at 500 pages for ${rootKey}`);
+      logError(`paginate: stopping at 500 pages for ${rootKey}`);
       break;
     }
     if (hasNext) await new Promise((r) => setTimeout(r, delayMs));
@@ -495,17 +496,17 @@ async function fetchIncremental<T>(
   // Skip straight to the full pull for those.
   if (!since || !supportsSinceFilter) {
     const all = await paginate<T>(query, rootKey);
-    console.log(`[sync] ${label}: full pull (${all.length})`);
+    log(`[sync] ${label}: full pull (${all.length})`);
     return all;
   }
   try {
     const r = await paginate<T>(injectSince(query, since), rootKey);
-    console.log(`[sync] ${label}: incremental ok (${r.length} changed since ${since.toISOString()})`);
+    log(`[sync] ${label}: incremental ok (${r.length} changed since ${since.toISOString()})`);
     return r;
   } catch (e: any) {
-    console.warn(`[sync] ${label}: incremental filter rejected (${e?.message ?? e}) — falling back to full pull`);
+    logError(`[sync] ${label}: incremental filter rejected (${e?.message ?? e}) — falling back to full pull`);
     const all = await paginate<T>(query, rootKey);
-    console.log(`[sync] ${label}: full pull fallback (${all.length})`);
+    log(`[sync] ${label}: full pull fallback (${all.length})`);
     return all;
   }
 }
@@ -647,12 +648,12 @@ export async function fetchJobsInRange(
   try {
     await runWith(JOBS_BY_RANGE_QUERY);
   } catch (err) {
-    console.error("completedAt range query failed:", err);
+    logError("completedAt range query failed:", err);
   }
   try {
     await runWith(JOBS_BY_END_QUERY);
   } catch (err) {
-    console.error("endAt range query failed:", err);
+    logError("endAt range query failed:", err);
     if (collected.size === 0) throw err;
   }
   return Array.from(collected.values());

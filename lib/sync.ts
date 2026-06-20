@@ -21,6 +21,7 @@ import {
   GhlOpportunity,
   InvoicePipelineRefs,
 } from "./ghl";
+import { log, logError } from "./log";
 
 // Clients mark jobs that intentionally don't need an invoice by writing
 // "No Invoice" in the job's Notes in Jobber. Any job whose notes contain this
@@ -118,7 +119,7 @@ export async function runFullSync(
       ? null
       : new Date(new Date(lastComplete.startedAt).getTime() - 24 * 60 * 60 * 1000);
   const mode = doFull ? "full" : "incremental";
-  console.log(`[sync] mode=${mode}${since ? ` since=${since.toISOString()}` : ""}`);
+  log(`[sync] mode=${mode}${since ? ` since=${since.toISOString()}` : ""}`);
 
   const run = await prisma.syncRun.create({
     data: {
@@ -160,11 +161,11 @@ export async function runFullSync(
         data: { timeEntriesFetched: timeEntries.length },
       });
     } catch (err: any) {
-      console.error("Timesheet sync failed (continuing):", err?.message ?? err);
+      logError("Timesheet sync failed (continuing):", err?.message ?? err);
     }
 
     // Visits are best-effort too. Drives the visit-level Overdue/Uninvoiced tabs.
-    console.log("[sync] step: visits");
+    log("[sync] step: visits");
     try {
       const visits = await fetchAllJobVisits(since);
       await upsertVisits(visits);
@@ -173,19 +174,19 @@ export async function runFullSync(
         data: { visitsFetched: visits.length },
       });
     } catch (err: any) {
-      console.error("Visit sync failed (continuing):", err?.message ?? err);
+      logError("Visit sync failed (continuing):", err?.message ?? err);
     }
 
     // Stamp the "No Invoice" note flag onto visits so the Uninvoiced Revenue
     // metric excludes intentionally-uninvoiced jobs and all their visits.
-    console.log("[sync] step: reconcileVisitNoInvoiceFlags");
+    log("[sync] step: reconcileVisitNoInvoiceFlags");
     await reconcileVisitNoInvoiceFlags();
 
-    console.log("[sync] step: recomputeCustomerAggregates");
+    log("[sync] step: recomputeCustomerAggregates");
     await recomputeCustomerAggregates();
-    console.log("[sync] step: recomputeMonthlySnapshots");
+    log("[sync] step: recomputeMonthlySnapshots");
     await recomputeMonthlySnapshots();
-    console.log("[sync] step: recomputeServiceTypeRevenue");
+    log("[sync] step: recomputeServiceTypeRevenue");
     await recomputeServiceTypeRevenue();
 
     // Mirror overdue invoices into the GHL "Invoice Pipeline". Best-effort: a
@@ -197,9 +198,9 @@ export async function runFullSync(
         where: { id: run.id },
         data: { ghlOpportunitiesSynced: ghlSynced },
       });
-      console.log(`[sync] ghlInvoiceSync: ${ghlSynced} overdue invoices synced to GHL`);
+      log(`[sync] ghlInvoiceSync: ${ghlSynced} overdue invoices synced to GHL`);
     } catch (err: any) {
-      console.error("GHL invoice sync failed (continuing):", err?.message ?? err);
+      logError("GHL invoice sync failed (continuing):", err?.message ?? err);
     }
 
     return await prisma.syncRun.update({
@@ -433,7 +434,7 @@ function matchesInvoice(
 // "Invoice Overdue" stage of the "Invoice Pipeline" — moving an existing card
 // or creating a new one. Returns the number of invoices processed.
 async function syncGhlInvoiceOverdue(): Promise<number> {
-  console.log('[ghl] starting invoice overdue sync');
+  log('[ghl] starting invoice overdue sync');
 
   // Resolving the pipeline/stage ids is the most likely thing to hang or fail
   // (network + config). Isolate it so a failure logs and skips rather than
@@ -442,10 +443,10 @@ async function syncGhlInvoiceOverdue(): Promise<number> {
   try {
     refs = await getInvoicePipelineRefs();
   } catch (err: any) {
-    console.error('[ghl] failed to resolve pipeline refs (skipping):', err?.message ?? err);
+    logError('[ghl] failed to resolve pipeline refs (skipping):', err?.message ?? err);
     return 0;
   }
-  console.log('[ghl] pipeline refs resolved', refs.pipelineId, refs.overdueStageId);
+  log('[ghl] pipeline refs resolved', refs.pipelineId, refs.overdueStageId);
 
   // Overdue = due date in the past. Status filtering is done in JS so casing
   // variations of "paid"/"void" are all excluded reliably.
@@ -453,7 +454,7 @@ async function syncGhlInvoiceOverdue(): Promise<number> {
     where: { dueAt: { not: null, lt: new Date() } },
     include: { customer: true },
   });
-  console.log('[ghl] past-due invoices found', candidates.length);
+  log('[ghl] past-due invoices found', candidates.length);
   const overdue = candidates.filter((inv) => {
     const s = (inv.invoiceStatus ?? "").toLowerCase();
     return s !== "paid" && s !== "void";
@@ -486,7 +487,7 @@ async function syncGhlInvoiceOverdue(): Promise<number> {
       synced += 1;
     } catch (err: any) {
       // One bad invoice/contact shouldn't abort the rest.
-      console.error(
+      logError(
         `[sync] ghlInvoiceSync: invoice ${inv.invoiceNumber ?? inv.id} failed (continuing):`,
         err?.message ?? err
       );

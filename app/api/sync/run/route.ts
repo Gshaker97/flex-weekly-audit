@@ -1,7 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { runFullSync } from "@/lib/sync";
+import { logError } from "@/lib/log";
 
+// Pin the Node.js runtime explicitly. The sync needs Node APIs (Prisma, direct
+// process.stdout logging) and must not be moved to the Edge runtime, where that
+// output would be suppressed. This is already the App Router default, but we
+// make it explicit so a future global default can't silently change it.
+export const runtime = "nodejs";
 export const maxDuration = 800;
 export const dynamic = "force-dynamic";
 
@@ -43,7 +49,7 @@ async function handle(req: NextRequest) {
     triggeredBy: isCron ? "cron" : "manual",
     full: forceFull,
   }).catch((err) =>
-    console.error("[sync] background run failed:", err?.message ?? err)
+    logError("[sync] background run failed:", err?.message ?? err)
   );
 
   return NextResponse.json({ ok: true, started: true }, { status: 202 });
