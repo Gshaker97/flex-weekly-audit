@@ -438,26 +438,21 @@ function matchesInvoice(
 // pipeline's stages resolved at runtime).
 const GHL_STAGE_SENT = "Invoice Sent";
 const GHL_STAGE_OVERDUE = "Invoice Overdue";
-const GHL_STAGE_PAID = "Invoice Paid";
-const GHL_STAGE_CANCELED = "Invoice Canceled";
 
 // Map a Jobber invoice to the GHL stage it belongs in (null = skip).
-// Jobber's own statuses already distinguish sent (awaiting_payment) vs overdue
-// (past_due); we also honour the dueAt fallback the spec describes.
+// Only OPEN invoices (awaiting_payment → Sent, past_due → Overdue) are synced.
+// paid / void / bad_debt / draft are intentionally skipped so settled and
+// non-actionable invoices don't flood the GHL pipeline.
 function ghlStageForInvoice(
   inv: { invoiceStatus: string | null; dueAt: Date | null },
   now: Date
 ): string | null {
   const status = (inv.invoiceStatus ?? "").toLowerCase();
-  if (!status || status === "draft") return null; // skip drafts
-  if (status === "paid") return GHL_STAGE_PAID;
-  if (status === "void" || status === "bad_debt") return GHL_STAGE_CANCELED;
   if (status === "past_due") return GHL_STAGE_OVERDUE;
   if (status === "awaiting_payment") {
     return inv.dueAt && inv.dueAt < now ? GHL_STAGE_OVERDUE : GHL_STAGE_SENT;
   }
-  // Unknown status — fall back to the due date so nothing silently vanishes.
-  if (inv.dueAt) return inv.dueAt < now ? GHL_STAGE_OVERDUE : GHL_STAGE_SENT;
+  // paid, void, bad_debt, draft, and any other status → skip.
   return null;
 }
 
