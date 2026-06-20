@@ -107,6 +107,10 @@ export async function getValidAccessToken(): Promise<string> {
   return updated.accessToken;
 }
 
+// Hard per-request timeout. Without it a stalled Jobber socket (seen mid-visits
+// pagination) hangs the whole sync indefinitely instead of failing.
+const JOBBER_FETCH_TIMEOUT_MS = 30_000;
+
 export async function jobberGraphQL<T = any>(
   query: string,
   variables: Record<string, any> = {}
@@ -115,15 +119,32 @@ export async function jobberGraphQL<T = any>(
   let attempt = 0;
   const maxAttempts = 4;
   while (attempt < maxAttempts) {
-    const res = await fetch(JOBBER_API_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
-        "X-JOBBER-GRAPHQL-VERSION": JOBBER_API_VERSION,
-      },
-      body: JSON.stringify({ query, variables }),
-    });
+    // Abort each attempt after JOBBER_FETCH_TIMEOUT_MS so a hung socket surfaces
+    // as a fast, catchable error instead of stalling the sync forever.
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), JOBBER_FETCH_TIMEOUT_MS);
+    let res: Response;
+    try {
+      res = await fetch(JOBBER_API_URL, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+          "X-JOBBER-GRAPHQL-VERSION": JOBBER_API_VERSION,
+        },
+        body: JSON.stringify({ query, variables }),
+        signal: controller.signal,
+      });
+    } catch (err: any) {
+      if (err?.name === "AbortError") {
+        throw new Error(
+          `Jobber API timeout after ${JOBBER_FETCH_TIMEOUT_MS}ms`
+        );
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
     if (res.status === 429) {
       const waitMs = 5000 * (attempt + 1);
       await new Promise((r) => setTimeout(r, waitMs));

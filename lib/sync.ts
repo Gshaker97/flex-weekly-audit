@@ -164,6 +164,7 @@ export async function runFullSync(
     }
 
     // Visits are best-effort too. Drives the visit-level Overdue/Uninvoiced tabs.
+    console.log("[sync] step: visits");
     try {
       const visits = await fetchAllJobVisits(since);
       await upsertVisits(visits);
@@ -177,10 +178,14 @@ export async function runFullSync(
 
     // Stamp the "No Invoice" note flag onto visits so the Uninvoiced Revenue
     // metric excludes intentionally-uninvoiced jobs and all their visits.
+    console.log("[sync] step: reconcileVisitNoInvoiceFlags");
     await reconcileVisitNoInvoiceFlags();
 
+    console.log("[sync] step: recomputeCustomerAggregates");
     await recomputeCustomerAggregates();
+    console.log("[sync] step: recomputeMonthlySnapshots");
     await recomputeMonthlySnapshots();
+    console.log("[sync] step: recomputeServiceTypeRevenue");
     await recomputeServiceTypeRevenue();
 
     // Mirror overdue invoices into the GHL "Invoice Pipeline". Best-effort: a
