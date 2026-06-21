@@ -50,6 +50,19 @@ export default async function DashboardPage({
   const range = resolveDateRange(searchParams);
   const kpis = await computeDashboardKPIs(range);
 
+  // Overdue invoices (unpaid + past their due date) — a current-state worklist,
+  // independent of the selected date range.
+  const overdueInvoiceRows = await prisma.invoiceRecord.findMany({
+    where: { amountDue: { gt: 0 }, dueAt: { lt: new Date() } },
+    select: { amountDue: true, invoiceStatus: true },
+  });
+  const overdueUnpaid = overdueInvoiceRows.filter((i) => {
+    const s = (i.invoiceStatus ?? "").toLowerCase();
+    return s !== "paid" && s !== "void" && s !== "bad_debt" && s !== "draft";
+  });
+  const overdueInvoiceTotal = overdueUnpaid.reduce((a, i) => a + (i.amountDue || 0), 0);
+  const overdueInvoiceCount = overdueUnpaid.length;
+
   // Carry the active range into detail-page links so the number you click
   // matches the list you land on. Default to YTD when nothing is set.
   const qs = rangeQueryString({
@@ -126,11 +139,19 @@ export default async function DashboardPage({
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
           <ClickableStatCard
             href={`/risk/overdue${qs}`}
-            label="Overdue Revenue"
+            label="Jobs not marked as completed"
             value={formatCurrency(kpis.overdueRevenue)}
-            sublabel={`${kpis.overdueJobCount} visits past their date, not completed`}
+            sublabel={`${kpis.overdueJobCount} past their date, not completed`}
             accent={kpis.overdueRevenue > 0 ? "danger" : "success"}
             icon={<AlertCircle size={18} />}
+          />
+          <ClickableStatCard
+            href="/risk/overdue-invoices"
+            label="Overdue Invoices"
+            value={formatCurrency(overdueInvoiceTotal)}
+            sublabel={`${overdueInvoiceCount} unpaid invoices past due`}
+            accent={overdueInvoiceTotal > 0 ? "danger" : "success"}
+            icon={<Receipt size={18} />}
           />
           <ClickableStatCard
             href={`/risk/uninvoiced${qs}`}
