@@ -485,6 +485,13 @@ function injectSince(query: string, since: Date | null): string {
   return query.replace("after: $after)", `after: $after${clause})`);
 }
 
+// Scope an invoices pull to those issued on/after a date. Jobber's
+// InvoiceFilterAttributes uses `issuedDate` (NOT `issuedAt` — verified live).
+function injectIssuedAfter(query: string, after: Date): string {
+  const clause = `, filter: { issuedDate: { after: "${after.toISOString()}" } }`;
+  return query.replace("after: $after)", `after: $after${clause})`);
+}
+
 // Try an incremental (filtered) pull; on ANY error fall back to the full pull
 // for that entity, so a bad/unsupported filter can never break the sync.
 async function fetchIncremental<T>(
@@ -582,7 +589,29 @@ export async function fetchAllJobVisits(since: Date | null = null): Promise<Flat
 
 
 
-export async function fetchAllInvoices(since: Date | null = null): Promise<JobberInvoiceNode[]> {
+export async function fetchAllInvoices(
+  since: Date | null = null,
+  issuedAfter: Date | null = null
+): Promise<JobberInvoiceNode[]> {
+  // Backfill mode: a FULL pull scoped to invoices issued on/after a date. This
+  // replaces the incremental updatedAt filter — we want every invoice issued
+  // since the date, not only recently-modified ones. Falls back to a full pull
+  // if Jobber ever rejects the filter.
+  if (issuedAfter) {
+    try {
+      const r = await paginate<JobberInvoiceNode>(
+        injectIssuedAfter(INVOICES_QUERY, issuedAfter),
+        "invoices"
+      );
+      log(`[sync] invoices: issued-after ${issuedAfter.toISOString().slice(0, 10)} pull (${r.length})`);
+      return r;
+    } catch (e: any) {
+      logError(`[sync] invoices: issuedDate filter rejected (${e?.message ?? e}) — full pull`);
+      const all = await paginate<JobberInvoiceNode>(INVOICES_QUERY, "invoices");
+      log(`[sync] invoices: full pull fallback (${all.length})`);
+      return all;
+    }
+  }
   return fetchIncremental<JobberInvoiceNode>(INVOICES_QUERY, "invoices", since, "invoices");
 }
 

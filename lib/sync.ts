@@ -24,6 +24,11 @@ import {
 } from "./ghl";
 import { log, logError } from "./log";
 
+// Backfill scope: invoices are pulled in full but limited to those issued on or
+// after this date (instead of the incremental updatedAt filter). Set to null to
+// restore normal incremental invoice syncing.
+const INVOICE_ISSUED_AFTER: Date | null = new Date("2026-01-01T00:00:00Z");
+
 // Clients mark jobs that intentionally don't need an invoice by writing
 // "No Invoice" in the job's Notes in Jobber. Any job whose notes contain this
 // phrase (case-insensitive substring) is excluded from Uninvoiced Revenue,
@@ -145,7 +150,10 @@ export async function runFullSync(
       data: { jobsFetched: jobNodes.length },
     });
 
-    const invoiceNodes = await fetchAllInvoices(since);
+    // Backfill: full invoice pull scoped to invoices issued on/after 2026-01-01,
+    // replacing the incremental updatedAt filter for invoices. (Temporary — revert
+    // INVOICE_ISSUED_AFTER to resume normal incremental invoice syncing.)
+    const invoiceNodes = await fetchAllInvoices(since, INVOICE_ISSUED_AFTER);
     await upsertInvoices(invoiceNodes);
     await prisma.syncRun.update({
       where: { id: run.id },
