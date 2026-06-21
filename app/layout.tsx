@@ -84,6 +84,12 @@ function Header() {
             Timesheets
           </a>
           <a
+            href="/risk/late-invoices"
+            className="rounded-md px-3 py-1.5 font-medium text-white/70 hover:bg-white/10 hover:text-white"
+          >
+            Collections
+          </a>
+          <a
             href="/settings"
             className="rounded-md px-3 py-1.5 font-medium text-white/70 hover:bg-white/10 hover:text-white"
           >

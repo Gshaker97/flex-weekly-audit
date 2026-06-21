@@ -270,3 +270,57 @@ export async function createOpportunity(opts: {
     throw err;
   }
 }
+
+// --- Conversations / messages (collection reminder tracking) ----------------
+
+export interface GhlOutboundSms {
+  dateAdded: Date;
+  body: string;
+}
+
+interface GhlConversation {
+  id: string;
+}
+
+interface GhlMessage {
+  direction?: string;
+  messageType?: string;
+  dateAdded?: string;
+  body?: string;
+}
+
+// Every outbound SMS sent to a contact across all of their conversations,
+// newest first. Used to check whether a dunning reminder text went out near an
+// expected date. (direction "outbound" + messageType "TYPE_SMS", verified live.)
+export async function getOutboundSms(contactId: string): Promise<GhlOutboundSms[]> {
+  const loc = encodeURIComponent(ghlLocationId());
+  const conv = await ghlFetch<{ conversations: GhlConversation[] }>(
+    `/conversations/search?locationId=${loc}&contactId=${encodeURIComponent(contactId)}`
+  );
+
+  const out: GhlOutboundSms[] = [];
+  for (const c of conv.conversations ?? []) {
+    let lastMessageId: string | undefined;
+    let page = 0;
+    while (page < 10) {
+      const qs = lastMessageId
+        ? `?lastMessageId=${encodeURIComponent(lastMessageId)}`
+        : "";
+      const data = await ghlFetch<{
+        messages: { messages: GhlMessage[]; nextPage?: boolean; lastMessageId?: string };
+      }>(`/conversations/${encodeURIComponent(c.id)}/messages${qs}`);
+      const block = data.messages;
+      for (const m of block?.messages ?? []) {
+        if (m.direction === "outbound" && m.messageType === "TYPE_SMS" && m.dateAdded) {
+          const d = new Date(m.dateAdded);
+          if (!isNaN(d.getTime())) out.push({ dateAdded: d, body: m.body ?? "" });
+        }
+      }
+      if (!block?.nextPage || !block?.lastMessageId) break;
+      lastMessageId = block.lastMessageId;
+      page += 1;
+    }
+  }
+  out.sort((a, b) => b.dateAdded.getTime() - a.dateAdded.getTime());
+  return out;
+}

@@ -7,6 +7,17 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+// Tracks the manual "Sarah called" step (the ~21-day phone call) for a past-due
+// invoice, so it persists across collection-dashboard views. invoiceId is the
+// InvoiceRecord id.
+model LateInvoiceCall {
+  id        String    @id @default(cuid())
+  invoiceId String    @unique
+  calledAt  DateTime?
+  calledBy  String?
+  updatedAt DateTime  @updatedAt
+}
+
 model JobberAuth {
   id            String   @id @default(cuid())
   accessToken   String   @db.Text
