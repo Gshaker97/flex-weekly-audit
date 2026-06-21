@@ -16,8 +16,7 @@ async function main() {
   const startedAt = Date.now();
   console.log(`[cron] sync starting at ${new Date(startedAt).toISOString()}`);
 
-  // Force a full pull (invoices are scoped to issued >= 2026-01-01 in runFullSync).
-  const run = await runFullSync({ triggeredBy: "cron", full: true });
+  const run = await runFullSync({ triggeredBy: "cron" });
 
   console.log(
     `[cron] sync finished: status=${run.status} id=${run.id} ` +

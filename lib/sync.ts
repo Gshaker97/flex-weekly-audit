@@ -24,10 +24,10 @@ import {
 } from "./ghl";
 import { log, logError } from "./log";
 
-// Backfill scope: invoices are pulled in full but limited to those issued on or
-// after this date (instead of the incremental updatedAt filter). Set to null to
-// restore normal incremental invoice syncing.
-const INVOICE_ISSUED_AFTER: Date | null = new Date("2026-01-01T00:00:00Z");
+// Backfill scope: when set to a Date, invoices are pulled in full but limited to
+// those issued on/after it (instead of the incremental updatedAt filter). null =
+// normal incremental invoice syncing.
+const INVOICE_ISSUED_AFTER: Date | null = null;
 
 // Clients mark jobs that intentionally don't need an invoice by writing
 // "No Invoice" in the job's Notes in Jobber. Any job whose notes contain this
