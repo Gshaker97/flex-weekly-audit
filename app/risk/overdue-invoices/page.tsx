@@ -9,6 +9,8 @@ import {
 } from "@/components/ui/Card";
 import { Badge } from "@/components/ui/Badge";
 import { StatCard } from "@/components/ui/StatCard";
+import DateRangeFilter from "@/components/ui/DateRangeFilter";
+import { resolveDateRange, getDateRange } from "@/lib/dateRange";
 import { formatCurrency, formatCurrencyDetailed, formatDate } from "@/lib/utils";
 import { Receipt, PiggyBank, Users } from "lucide-react";
 
@@ -17,12 +19,23 @@ export const dynamic = "force-dynamic";
 const DAY_MS = 24 * 60 * 60 * 1000;
 const SETTLED = new Set(["paid", "void", "bad_debt", "draft"]);
 
-export default async function OverdueInvoicesPage() {
+export default async function OverdueInvoicesPage({
+  searchParams,
+}: {
+  searchParams: { range?: string; start?: string; end?: string };
+}) {
   const now = new Date();
+  const hasFilter =
+    !!searchParams.range || !!searchParams.start || !!searchParams.end;
+  const range = hasFilter ? resolveDateRange(searchParams) : getDateRange("allTime");
 
-  // All unpaid invoices past their due date (current-state worklist, no range).
+  // Unpaid invoices past their due date, issued within the selected range.
   const all = await prisma.invoiceRecord.findMany({
-    where: { amountDue: { gt: 0 }, dueAt: { not: null, lt: now } },
+    where: {
+      amountDue: { gt: 0 },
+      dueAt: { not: null, lt: now },
+      issuedAt: { gte: range.start, lte: range.end },
+    },
     include: { customer: true },
     orderBy: { dueAt: "asc" },
   });
@@ -61,11 +74,16 @@ export default async function OverdueInvoicesPage() {
         <Link href="/" className="text-sm text-muted-foreground hover:text-foreground">
           ← Back to dashboard
         </Link>
-        <div className="mt-2">
-          <h2 className="text-2xl font-semibold tracking-tight">Overdue Invoices</h2>
-          <p className="mt-1 text-sm text-muted-foreground">
-            Every unpaid invoice past its due date, with the job date and how late it is.
-          </p>
+        <div className="mt-2 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+          <div>
+            <h2 className="text-2xl font-semibold tracking-tight">Overdue Invoices</h2>
+            <p className="mt-1 text-sm text-muted-foreground">
+              Every unpaid invoice past its due date, with the job date and how late it is.
+              Issued{" "}
+              <span className="font-medium text-foreground">{range.label}</span>.
+            </p>
+          </div>
+          <DateRangeFilter />
         </div>
       </div>
 

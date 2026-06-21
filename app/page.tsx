@@ -50,10 +50,14 @@ export default async function DashboardPage({
   const range = resolveDateRange(searchParams);
   const kpis = await computeDashboardKPIs(range);
 
-  // Overdue invoices (unpaid + past their due date) — a current-state worklist,
-  // independent of the selected date range.
+  // Overdue invoices (unpaid + past their due date), scoped to the selected date
+  // range by issue date (matches the Outstanding Receivables card).
   const overdueInvoiceRows = await prisma.invoiceRecord.findMany({
-    where: { amountDue: { gt: 0 }, dueAt: { lt: new Date() } },
+    where: {
+      amountDue: { gt: 0 },
+      dueAt: { lt: new Date() },
+      issuedAt: { gte: range.start, lte: range.end },
+    },
     select: { amountDue: true, invoiceStatus: true },
   });
   const overdueUnpaid = overdueInvoiceRows.filter((i) => {
@@ -146,7 +150,7 @@ export default async function DashboardPage({
             icon={<AlertCircle size={18} />}
           />
           <ClickableStatCard
-            href="/risk/overdue-invoices"
+            href={`/risk/overdue-invoices${qs}`}
             label="Overdue Invoices"
             value={formatCurrency(overdueInvoiceTotal)}
             sublabel={`${overdueInvoiceCount} unpaid invoices past due`}
