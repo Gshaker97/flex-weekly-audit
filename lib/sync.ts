@@ -481,23 +481,120 @@ async function syncGhlInvoicePipeline(): Promise<number> {
   }
   log('[ghl] pipeline resolved', refs.pipelineId, '| stages:', Object.keys(refs.stageIdByName).join(', '));
 
-  const now = new Date();
-  // Every invoice in the DB — the stage is derived from status, not the query.
-  const invoices = await prisma.invoiceRecord.findMany({
-    include: { customer: true },
-  });
-  log('[ghl] invoices in DB', invoices.length);
+  const overdueStageId = refs.stageIdByName[GHL_STAGE_OVERDUE.toLowerCase()];
+  if (!overdueStageId) {
+    logError(`[ghl] stage "${GHL_STAGE_OVERDUE}" not found in pipeline — aborting`);
+    return 0;
+  }
 
-  let processed = 0;
+  const now = new Date();
   let created = 0;
   let moved = 0;
   let skipped = 0;
   let contactsCreated = 0;
+  let customersProcessed = 0;
+  let invoicesProcessed = 0;
 
-  for (const inv of invoices) {
+  // Resolve a contact by email, creating it if there's no exact match.
+  const resolveContact = async (
+    email: string,
+    name: string | null,
+    phone: string | null
+  ): Promise<string> => {
+    const found = await findContactByEmail(email);
+    if (found && (found.email ?? "").toLowerCase() === email.toLowerCase()) {
+      return found.id;
+    }
+    const c = await createContact({ email, name, phone });
+    contactsCreated += 1;
+    return c.id;
+  };
+
+  // --- Phase A: past_due — ONE opportunity per CUSTOMER (aggregated) ---------
+  // GHL keeps a single open opp per contact, so a customer with many overdue
+  // invoices collapses to one card. Aggregate their total overdue onto it.
+  const pastDue = await prisma.invoiceRecord.findMany({
+    where: { invoiceStatus: "past_due" },
+    include: { customer: true },
+  });
+
+  interface OverdueGroup {
+    email: string;
+    name: string | null;
+    phone: string | null;
+    total: number;
+    count: number;
+  }
+  const groups = new Map<string, OverdueGroup>();
+  for (const inv of pastDue) {
+    const email = inv.customer?.email?.trim().toLowerCase();
+    if (!email) {
+      skipped += 1; // no email → can't map or create a GHL contact
+      continue;
+    }
+    let g = groups.get(email);
+    if (!g) {
+      g = {
+        email,
+        name: inv.customer?.name ?? inv.customer?.companyName ?? inv.clientName ?? null,
+        phone: inv.customer?.phone ?? null,
+        total: 0,
+        count: 0,
+      };
+      groups.set(email, g);
+    }
+    g.total += inv.amountDue || 0;
+    g.count += 1;
+  }
+  log(`[ghl] past_due: ${pastDue.length} invoices across ${groups.size} customers`);
+
+  for (const g of Array.from(groups.values())) {
+    try {
+      const contactId = await resolveContact(g.email, g.name, g.phone);
+      const opps = await searchOpportunities(contactId, refs.pipelineId);
+      if (opps.length > 0) {
+        // Update the customer's existing card: move to Overdue, set the total,
+        // and force it back to "open" (also un-hides won/lost cards).
+        await moveOpportunityToStage(opps[0].id, overdueStageId, g.total);
+        moved += 1;
+      } else {
+        await createOpportunity({
+          pipelineId: refs.pipelineId,
+          pipelineStageId: overdueStageId,
+          contactId,
+          name: `${g.name ?? g.email} — ${g.count} overdue invoice${g.count === 1 ? "" : "s"}`,
+          monetaryValue: g.total,
+        });
+        created += 1;
+      }
+      customersProcessed += 1;
+      invoicesProcessed += g.count;
+    } catch (err: any) {
+      skipped += g.count;
+      logError(
+        `[sync] ghlInvoicePipeline: customer ${g.email} failed (continuing):`,
+        err?.message ?? err
+      );
+    }
+  }
+
+  // --- Phase B: awaiting_payment — per invoice (these aren't collapsed) ------
+  const awaiting = await prisma.invoiceRecord.findMany({
+    where: { invoiceStatus: "awaiting_payment" },
+    include: { customer: true },
+  });
+  for (const inv of awaiting) {
     const invId = inv.invoiceNumber ?? inv.jobberInvoiceId ?? inv.id;
+    const email = inv.customer?.email?.trim().toLowerCase();
+    if (!email) {
+      skipped += 1;
+      log(`[ghl] no email for invoice ${invId} — skipping`);
+      continue;
+    }
+    // A customer already handled as overdue in Phase A owns their single card;
+    // don't let a per-invoice awaiting card move it out of "Invoice Overdue".
+    if (groups.has(email)) continue;
 
-    // Drafts (and unknown/dateless statuses) are skipped entirely.
     const stageName = ghlStageForInvoice(inv, now);
     if (!stageName) {
       skipped += 1;
@@ -509,39 +606,14 @@ async function syncGhlInvoicePipeline(): Promise<number> {
       log(`[ghl] stage "${stageName}" not found in pipeline — skipping invoice ${invId}`);
       continue;
     }
-
-    const email = inv.customer?.email;
-    if (!email) {
-      skipped += 1;
-      log(`[ghl] no email for invoice ${invId} — skipping`);
-      continue;
-    }
-
     try {
-      const found = await findContactByEmail(email);
-      // findContactByEmail falls back to a fuzzy first hit, so only an EXACT
-      // email match counts; otherwise create the contact with the right email.
-      const exact =
-        found && (found.email ?? "").toLowerCase() === email.toLowerCase();
-
-      let contactId: string;
-      if (exact) {
-        contactId = found!.id;
-      } else {
-        const near = found ? ` (closest GHL email: ${found.email ?? "n/a"})` : " (no GHL match)";
-        log(`[ghl] email not matched in GHL for invoice ${invId} email ${email}${near}`);
-        const createdContact = await createContact({
-          email,
-          name: inv.customer?.name ?? inv.customer?.companyName ?? inv.clientName ?? null,
-          phone: inv.customer?.phone ?? null,
-        });
-        contactsCreated += 1;
-        contactId = createdContact.id;
-      }
-
+      const contactId = await resolveContact(
+        email,
+        inv.customer?.name ?? inv.customer?.companyName ?? inv.clientName ?? null,
+        inv.customer?.phone ?? null
+      );
       const opps = await searchOpportunities(contactId, refs.pipelineId);
       const match = opps.find((o) => matchesInvoice(o, inv));
-
       if (match) {
         if (match.pipelineStageId !== stageId) {
           await moveOpportunityToStage(match.id, stageId);
@@ -557,9 +629,8 @@ async function syncGhlInvoicePipeline(): Promise<number> {
         });
         created += 1;
       }
-      processed += 1;
+      invoicesProcessed += 1;
     } catch (err: any) {
-      // One bad invoice/contact shouldn't abort the rest.
       skipped += 1;
       logError(
         `[sync] ghlInvoicePipeline: invoice ${inv.invoiceNumber ?? inv.id} failed (continuing):`,
@@ -569,10 +640,10 @@ async function syncGhlInvoicePipeline(): Promise<number> {
   }
 
   log(
-    `[ghl] invoice pipeline sync summary — processed=${processed} created=${created} ` +
-      `moved=${moved} skipped=${skipped} contactsCreated=${contactsCreated}`
+    `[ghl] invoice pipeline sync summary — processed=${customersProcessed} customers ` +
+      `(${invoicesProcessed} invoices) created=${created} moved=${moved} skipped=${skipped}`
   );
-  return processed;
+  return customersProcessed;
 }
 
 async function upsertTimeEntries(entries: FlatTimeEntry[]) {

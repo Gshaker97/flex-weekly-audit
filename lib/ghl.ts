@@ -219,11 +219,17 @@ export async function searchOpportunities(
 
 export async function moveOpportunityToStage(
   opportunityId: string,
-  pipelineStageId: string
+  pipelineStageId: string,
+  monetaryValue?: number
 ): Promise<void> {
+  // Always force status "open" so won/lost cards become visible again when
+  // they're moved (e.g. back into "Invoice Overdue"). Optionally refresh the
+  // monetary value in the same PUT.
+  const body: Record<string, any> = { pipelineStageId, status: "open" };
+  if (monetaryValue != null) body.monetaryValue = monetaryValue;
   await ghlFetch(`/opportunities/${opportunityId}`, {
     method: "PUT",
-    body: JSON.stringify({ pipelineStageId }),
+    body: JSON.stringify(body),
   });
 }
 
