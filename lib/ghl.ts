@@ -217,6 +217,41 @@ export async function searchOpportunities(
   return data.opportunities ?? [];
 }
 
+// Every opportunity in a pipeline (paginated) — used to sweep the Overdue stage
+// for stale/duplicate cards.
+export async function listPipelineOpportunities(
+  pipelineId: string
+): Promise<GhlOpportunity[]> {
+  const loc = encodeURIComponent(ghlLocationId());
+  const pid = encodeURIComponent(pipelineId);
+  const out: GhlOpportunity[] = [];
+  let path: string | null = `/opportunities/search?location_id=${loc}&pipeline_id=${pid}&limit=100`;
+  let page = 0;
+  while (path) {
+    const data: any = await ghlFetch(path);
+    for (const o of data.opportunities ?? []) {
+      out.push({
+        id: o.id,
+        name: o.name ?? null,
+        pipelineId: o.pipelineId ?? null,
+        pipelineStageId: o.pipelineStageId ?? null,
+        contactId: o.contactId ?? null,
+      });
+    }
+    const m = data.meta ?? {};
+    if (m.startAfterId && m.startAfter && (data.opportunities?.length ?? 0) > 0) {
+      path =
+        `/opportunities/search?location_id=${loc}&pipeline_id=${pid}&limit=100` +
+        `&startAfter=${encodeURIComponent(m.startAfter)}` +
+        `&startAfterId=${encodeURIComponent(m.startAfterId)}`;
+    } else {
+      path = null;
+    }
+    if (++page > 50) break;
+  }
+  return out;
+}
+
 export async function moveOpportunityToStage(
   opportunityId: string,
   pipelineStageId: string,

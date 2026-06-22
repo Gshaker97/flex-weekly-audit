@@ -17,6 +17,7 @@ import {
   findContactByEmail,
   createContact,
   searchOpportunities,
+  listPipelineOpportunities,
   moveOpportunityToStage,
   createOpportunity,
   GhlOpportunity,
@@ -446,6 +447,7 @@ function matchesInvoice(
 // pipeline's stages resolved at runtime).
 const GHL_STAGE_SENT = "Invoice Sent";
 const GHL_STAGE_OVERDUE = "Invoice Overdue";
+const GHL_STAGE_PAID = "Invoice Paid";
 
 // Map a Jobber invoice to the GHL stage it belongs in (null = skip).
 // Only OPEN invoices (awaiting_payment → Sent, past_due → Overdue) are synced.
@@ -467,7 +469,7 @@ function ghlStageForInvoice(
 // Full GHL "Invoice Pipeline" sync: route every invoice to the stage matching
 // its status (Sent / Overdue / Paid / Canceled), creating the GHL contact and
 // opportunity when missing. Returns the number of invoices processed.
-async function syncGhlInvoicePipeline(): Promise<number> {
+export async function syncGhlInvoicePipeline(): Promise<number> {
   log('[ghl] starting invoice pipeline sync');
 
   // Resolving the pipeline + its stages is the most likely thing to fail
@@ -494,6 +496,10 @@ async function syncGhlInvoicePipeline(): Promise<number> {
   let contactsCreated = 0;
   let customersProcessed = 0;
   let invoicesProcessed = 0;
+  let cleared = 0;
+  const overdueContactIds = new Set<string>(); // contacts that belong in Overdue
+  const awaitingContactIds = new Set<string>(); // contacts moved to Sent in Phase B
+  const keptOppByContact = new Map<string, string>(); // the one card kept per overdue contact
 
   // Resolve a contact by email, creating it if there's no exact match.
   const resolveContact = async (
@@ -551,20 +557,23 @@ async function syncGhlInvoicePipeline(): Promise<number> {
   for (const g of Array.from(groups.values())) {
     try {
       const contactId = await resolveContact(g.email, g.name, g.phone);
+      overdueContactIds.add(contactId);
       const opps = await searchOpportunities(contactId, refs.pipelineId);
       if (opps.length > 0) {
         // Update the customer's existing card: move to Overdue, set the total,
         // and force it back to "open" (also un-hides won/lost cards).
         await moveOpportunityToStage(opps[0].id, overdueStageId, g.total);
+        keptOppByContact.set(contactId, opps[0].id);
         moved += 1;
       } else {
-        await createOpportunity({
+        const opp = await createOpportunity({
           pipelineId: refs.pipelineId,
           pipelineStageId: overdueStageId,
           contactId,
           name: `${g.name ?? g.email} — ${g.count} overdue invoice${g.count === 1 ? "" : "s"}`,
           monetaryValue: g.total,
         });
+        keptOppByContact.set(contactId, opp.id);
         created += 1;
       }
       customersProcessed += 1;
@@ -612,6 +621,7 @@ async function syncGhlInvoicePipeline(): Promise<number> {
         inv.customer?.name ?? inv.customer?.companyName ?? inv.clientName ?? null,
         inv.customer?.phone ?? null
       );
+      awaitingContactIds.add(contactId);
       const opps = await searchOpportunities(contactId, refs.pipelineId);
       const match = opps.find((o) => matchesInvoice(o, inv));
       if (match) {
@@ -639,9 +649,37 @@ async function syncGhlInvoicePipeline(): Promise<number> {
     }
   }
 
+  // --- Phase C: clean up the Overdue stage ----------------------------------
+  // Demote any card in "Invoice Overdue" that no longer belongs: a contact who
+  // isn't currently overdue (paid off, or only awaiting), or a duplicate card
+  // for an overdue contact (we keep the single aggregate card per contact).
+  const paidStageId = refs.stageIdByName[GHL_STAGE_PAID.toLowerCase()];
+  const sentStageId = refs.stageIdByName[GHL_STAGE_SENT.toLowerCase()];
+  try {
+    const pipelineOpps = await listPipelineOpportunities(refs.pipelineId);
+    for (const o of pipelineOpps) {
+      if (o.pipelineStageId !== overdueStageId) continue;
+      const cid = o.contactId ?? "";
+      // Keep the single aggregate card for a currently-overdue contact.
+      if (cid && overdueContactIds.has(cid) && keptOppByContact.get(cid) === o.id) {
+        continue;
+      }
+      // Stale or duplicate → move it out: awaiting-only → Sent, otherwise Paid.
+      const target =
+        cid && !overdueContactIds.has(cid) && awaitingContactIds.has(cid)
+          ? sentStageId
+          : paidStageId;
+      if (!target) continue;
+      await moveOpportunityToStage(o.id, target);
+      cleared += 1;
+    }
+  } catch (err: any) {
+    logError("[ghl] overdue cleanup failed (continuing):", err?.message ?? err);
+  }
+
   log(
     `[ghl] invoice pipeline sync summary — processed=${customersProcessed} customers ` +
-      `(${invoicesProcessed} invoices) created=${created} moved=${moved} skipped=${skipped}`
+      `(${invoicesProcessed} invoices) created=${created} moved=${moved} skipped=${skipped} cleared=${cleared}`
   );
   return customersProcessed;
 }
