@@ -1,5 +1,6 @@
 import { prisma } from "@/lib/prisma";
 import { computeDashboardKPIs } from "@/lib/kpis";
+import { COLLECTIONS_SINCE } from "@/lib/lateInvoices";
 import { resolveDateRange, rangeQueryString } from "@/lib/dateRange";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
@@ -50,19 +51,18 @@ export default async function DashboardPage({
   const range = resolveDateRange(searchParams);
   const kpis = await computeDashboardKPIs(range);
 
-  // Overdue invoices (unpaid + past their due date), scoped to the selected date
-  // range by issue date (matches the Outstanding Receivables card).
-  const overdueInvoiceRows = await prisma.invoiceRecord.findMany({
+  // Overdue invoices: use the same definition as the Collections tab — Jobber's
+  // exact "past_due" status, issued on/after the COLLECTIONS_SINCE cutoff — so
+  // this stat, its detail page, and Collections all report the same count.
+  // The selected range is intersected with the cutoff (never reaches earlier).
+  const overdueFrom =
+    range.start > COLLECTIONS_SINCE ? range.start : COLLECTIONS_SINCE;
+  const overdueUnpaid = await prisma.invoiceRecord.findMany({
     where: {
-      amountDue: { gt: 0 },
-      dueAt: { lt: new Date() },
-      issuedAt: { gte: range.start, lte: range.end },
+      invoiceStatus: "past_due",
+      issuedAt: { gte: overdueFrom, lte: range.end },
     },
-    select: { amountDue: true, invoiceStatus: true },
-  });
-  const overdueUnpaid = overdueInvoiceRows.filter((i) => {
-    const s = (i.invoiceStatus ?? "").toLowerCase();
-    return s !== "paid" && s !== "void" && s !== "bad_debt" && s !== "draft";
+    select: { amountDue: true },
   });
   const overdueInvoiceTotal = overdueUnpaid.reduce((a, i) => a + (i.amountDue || 0), 0);
   const overdueInvoiceCount = overdueUnpaid.length;

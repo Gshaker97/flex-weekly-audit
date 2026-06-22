@@ -11,13 +11,13 @@ import { Badge } from "@/components/ui/Badge";
 import { StatCard } from "@/components/ui/StatCard";
 import DateRangeFilter from "@/components/ui/DateRangeFilter";
 import { resolveDateRange, getDateRange } from "@/lib/dateRange";
+import { COLLECTIONS_SINCE } from "@/lib/lateInvoices";
 import { formatCurrency, formatCurrencyDetailed, formatDate } from "@/lib/utils";
 import { Receipt, PiggyBank, Users } from "lucide-react";
 
 export const dynamic = "force-dynamic";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
-const SETTLED = new Set(["paid", "void", "bad_debt", "draft"]);
 
 export default async function OverdueInvoicesPage({
   searchParams,
@@ -29,19 +29,20 @@ export default async function OverdueInvoicesPage({
     !!searchParams.range || !!searchParams.start || !!searchParams.end;
   const range = hasFilter ? resolveDateRange(searchParams) : getDateRange("allTime");
 
-  // Unpaid invoices past their due date, issued within the selected range.
-  const all = await prisma.invoiceRecord.findMany({
+  // Past-due invoices — same definition as the Collections tab: Jobber's exact
+  // "past_due" status, issued on/after the COLLECTIONS_SINCE cutoff. The
+  // selected range is intersected with the cutoff so the count here matches the
+  // Collections tab and the dashboard "Overdue Invoices" stat.
+  const overdueFrom =
+    range.start > COLLECTIONS_SINCE ? range.start : COLLECTIONS_SINCE;
+  const invoices = await prisma.invoiceRecord.findMany({
     where: {
-      amountDue: { gt: 0 },
-      dueAt: { not: null, lt: now },
-      issuedAt: { gte: range.start, lte: range.end },
+      invoiceStatus: "past_due",
+      issuedAt: { gte: overdueFrom, lte: range.end },
     },
     include: { customer: true },
     orderBy: { dueAt: "asc" },
   });
-  const invoices = all.filter(
-    (i) => !SETTLED.has((i.invoiceStatus ?? "").toLowerCase())
-  );
 
   // Job date per invoice: match InvoiceRecord.invoiceNumber -> JobRecord.invoiceNumber
   // and use the job's completion (or scheduled end) date.
@@ -78,7 +79,7 @@ export default async function OverdueInvoicesPage({
           <div>
             <h2 className="text-2xl font-semibold tracking-tight">Overdue Invoices</h2>
             <p className="mt-1 text-sm text-muted-foreground">
-              Every unpaid invoice past its due date, with the job date and how late it is.
+              Every invoice Jobber marks past due, with the job date and how late it is.
               Issued{" "}
               <span className="font-medium text-foreground">{range.label}</span>.
             </p>

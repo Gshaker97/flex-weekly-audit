@@ -8,7 +8,9 @@ export const REMINDER_THRESHOLDS = [10, 15, 20, 25, 30];
 // of the expected send date (no exact text match required).
 const WINDOW_DAYS = 3;
 // Only collect on invoices issued from this date onward (ignore older past-dues).
-const COLLECTIONS_SINCE = new Date("2026-01-01T00:00:00Z");
+// Exported so the dashboard's "Overdue Invoices" stat and detail page apply the
+// same cutoff and report the same count as the Collections tab.
+export const COLLECTIONS_SINCE = new Date("2026-01-01T00:00:00Z");
 
 export type ReminderStatus = "sent" | "pending" | "overdue";
 
