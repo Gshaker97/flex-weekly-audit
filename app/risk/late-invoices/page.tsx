@@ -7,7 +7,7 @@ import {
   CardContent,
 } from "@/components/ui/Card";
 import { StatCard } from "@/components/ui/StatCard";
-import { formatCurrency, formatCurrencyDetailed } from "@/lib/utils";
+import { formatCurrency, formatCurrencyDetailed, formatDate } from "@/lib/utils";
 import {
   getLateInvoiceCollections,
   REMINDER_THRESHOLDS,
@@ -114,6 +114,7 @@ export default async function LateInvoicesPage() {
                   <tr className="text-left text-xs uppercase tracking-wide text-muted-foreground">
                     <th className="px-4 py-2.5 font-medium">Customer</th>
                     <th className="px-4 py-2.5 font-medium">Invoice</th>
+                    <th className="px-4 py-2.5 font-medium">Service Date</th>
                     <th className="px-4 py-2.5 text-center font-medium">Days Past Due</th>
                     {REMINDER_THRESHOLDS.map((t) => (
                       <th key={t} className="px-3 py-2.5 text-center font-medium">
@@ -141,6 +142,9 @@ export default async function LateInvoicesPage() {
                         <div className="text-xs text-muted-foreground">
                           {formatCurrencyDetailed(r.amountDue)}
                         </div>
+                      </td>
+                      <td className="px-4 py-3 text-muted-foreground">
+                        {r.serviceDate ? formatDate(r.serviceDate) : "—"}
                       </td>
                       <td className="px-4 py-3 text-center font-semibold">{r.daysPastDue}</td>
                       {r.reminders.map((cell) => (

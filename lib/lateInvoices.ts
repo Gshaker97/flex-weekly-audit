@@ -7,6 +7,8 @@ export const REMINDER_THRESHOLDS = [10, 15, 20, 25, 30];
 // A reminder counts as "sent" if an outbound SMS exists within ±this many days
 // of the expected send date (no exact text match required).
 const WINDOW_DAYS = 3;
+// Only collect on invoices issued from this date onward (ignore older past-dues).
+const COLLECTIONS_SINCE = new Date("2026-01-01T00:00:00Z");
 
 export type ReminderStatus = "sent" | "pending" | "overdue";
 
@@ -25,6 +27,7 @@ export interface LateInvoiceRow {
   amountDue: number;
   daysPastDue: number;
   dueAt: Date | null;
+  serviceDate: Date | null; // job completion/scheduled date for this invoice
   reminders: ReminderCell[];
   called: boolean;
   calledAt: Date | null;
@@ -48,10 +51,29 @@ export async function getLateInvoiceCollections(): Promise<LateInvoiceRow[]> {
   const now = new Date();
 
   const invoices = await prisma.invoiceRecord.findMany({
-    where: { invoiceStatus: "past_due" },
+    where: { invoiceStatus: "past_due", issuedAt: { gte: COLLECTIONS_SINCE } },
     include: { customer: true },
-    orderBy: { dueAt: "asc" },
   });
+
+  // Service date per invoice: match InvoiceRecord.invoiceNumber -> JobRecord and
+  // use the job's completion (or scheduled end) date.
+  const invoiceNumbers = invoices
+    .map((i) => i.invoiceNumber)
+    .filter((n): n is string => !!n);
+  const jobs = invoiceNumbers.length
+    ? await prisma.jobRecord.findMany({
+        where: { invoiceNumber: { in: invoiceNumbers } },
+        select: { invoiceNumber: true, completedAt: true, endAt: true },
+      })
+    : [];
+  const serviceDateByInvoice = new Map<string, Date>();
+  for (const j of jobs) {
+    if (!j.invoiceNumber) continue;
+    const d = j.completedAt ?? j.endAt;
+    if (!d) continue;
+    const existing = serviceDateByInvoice.get(j.invoiceNumber);
+    if (!existing || d > existing) serviceDateByInvoice.set(j.invoiceNumber, d);
+  }
 
   const calls = await prisma.lateInvoiceCall.findMany();
   const callByInvoice = new Map(calls.map((c) => [c.invoiceId, c]));
@@ -81,7 +103,7 @@ export async function getLateInvoiceCollections(): Promise<LateInvoiceRow[]> {
     }
   });
 
-  return invoices.map((inv) => {
+  const rows = invoices.map((inv) => {
     const email = inv.customer?.email?.trim().toLowerCase() || null;
     const lookup = email ? smsByEmail.get(email) : [];
     const ghlError = lookup === null;
@@ -91,6 +113,15 @@ export async function getLateInvoiceCollections(): Promise<LateInvoiceRow[]> {
     const daysPastDue = dueAt
       ? Math.floor((now.getTime() - dueAt.getTime()) / DAY_MS)
       : 0;
+
+    // Service date: the matched job's date when it's a real (past) completion;
+    // recurring jobs have a future schedule end, so fall back to the invoice's
+    // issue date (a sane "when serviced/billed" proxy) rather than a future date.
+    const jobDate = inv.invoiceNumber
+      ? serviceDateByInvoice.get(inv.invoiceNumber) ?? null
+      : null;
+    const serviceDate =
+      jobDate && jobDate <= now ? jobDate : inv.issuedAt ?? null;
 
     const reminders: ReminderCell[] = REMINDER_THRESHOLDS.map((threshold) => {
       if (!dueAt) return { threshold, status: "pending" };
@@ -120,6 +151,7 @@ export async function getLateInvoiceCollections(): Promise<LateInvoiceRow[]> {
       amountDue: inv.amountDue || 0,
       daysPastDue,
       dueAt,
+      serviceDate,
       reminders,
       called: !!call?.calledAt,
       calledAt: call?.calledAt ?? null,
@@ -127,4 +159,13 @@ export async function getLateInvoiceCollections(): Promise<LateInvoiceRow[]> {
       ghlError,
     };
   });
+
+  // Newest at the top, oldest at the bottom — by service date, falling back to
+  // the due date when an invoice has no matching job.
+  rows.sort((a, b) => {
+    const ad = (a.serviceDate ?? a.dueAt)?.getTime() ?? 0;
+    const bd = (b.serviceDate ?? b.dueAt)?.getTime() ?? 0;
+    return bd - ad;
+  });
+  return rows;
 }
