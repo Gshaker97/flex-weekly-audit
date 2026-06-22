@@ -255,13 +255,15 @@ export async function listPipelineOpportunities(
 export async function moveOpportunityToStage(
   opportunityId: string,
   pipelineStageId: string,
-  monetaryValue?: number
+  monetaryValue?: number,
+  name?: string
 ): Promise<void> {
   // Always force status "open" so won/lost cards become visible again when
   // they're moved (e.g. back into "Invoice Overdue"). Optionally refresh the
-  // monetary value in the same PUT.
+  // monetary value and/or rename the card in the same PUT.
   const body: Record<string, any> = { pipelineStageId, status: "open" };
   if (monetaryValue != null) body.monetaryValue = monetaryValue;
+  if (name != null) body.name = name;
   await ghlFetch(`/opportunities/${opportunityId}`, {
     method: "PUT",
     body: JSON.stringify(body),

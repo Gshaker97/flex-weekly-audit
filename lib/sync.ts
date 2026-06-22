@@ -527,6 +527,7 @@ export async function syncGhlInvoicePipeline(): Promise<number> {
   interface OverdueGroup {
     email: string;
     name: string | null;
+    clientName: string | null;
     phone: string | null;
     total: number;
     count: number;
@@ -543,6 +544,10 @@ export async function syncGhlInvoicePipeline(): Promise<number> {
       g = {
         email,
         name: inv.customer?.name ?? inv.customer?.companyName ?? inv.clientName ?? null,
+        // clientName is the dashboard/Jobber label (property/company name). We
+        // use it for the GHL card title so the board reads the same as the
+        // Collections list (e.g. "Opperman Residence", not "John Bradford").
+        clientName: inv.clientName ?? inv.customer?.companyName ?? inv.customer?.name ?? null,
         phone: inv.customer?.phone ?? null,
         total: 0,
         count: 0,
@@ -558,11 +563,15 @@ export async function syncGhlInvoicePipeline(): Promise<number> {
     try {
       const contactId = await resolveContact(g.email, g.name, g.phone);
       overdueContactIds.add(contactId);
+      // Card title matches the dashboard/Jobber clientName so the board reads
+      // the same as the Collections list.
+      const cardName = `${g.clientName ?? g.name ?? g.email} — ${g.count} overdue invoice${g.count === 1 ? "" : "s"}`;
       const opps = await searchOpportunities(contactId, refs.pipelineId);
       if (opps.length > 0) {
         // Update the customer's existing card: move to Overdue, set the total,
-        // and force it back to "open" (also un-hides won/lost cards).
-        await moveOpportunityToStage(opps[0].id, overdueStageId, g.total);
+        // rename to the dashboard label, and force it back to "open" (also
+        // un-hides won/lost cards).
+        await moveOpportunityToStage(opps[0].id, overdueStageId, g.total, cardName);
         keptOppByContact.set(contactId, opps[0].id);
         moved += 1;
       } else {
@@ -570,7 +579,7 @@ export async function syncGhlInvoicePipeline(): Promise<number> {
           pipelineId: refs.pipelineId,
           pipelineStageId: overdueStageId,
           contactId,
-          name: `${g.name ?? g.email} — ${g.count} overdue invoice${g.count === 1 ? "" : "s"}`,
+          name: cardName,
           monetaryValue: g.total,
         });
         keptOppByContact.set(contactId, opp.id);
