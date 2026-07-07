@@ -20,6 +20,7 @@ import {
   listPipelineOpportunities,
   moveOpportunityToStage,
   createOpportunity,
+  deleteOpportunity,
   GhlOpportunity,
   InvoicePipelineRefs,
 } from "./ghl";
@@ -429,14 +430,20 @@ function opportunityName(inv: {
 }
 
 // Match an existing GHL opportunity to an invoice on invoice number or title.
+// The number must appear as a bounded "#<num>" token — NOT a bare substring —
+// so #12 doesn't match "#123" or an aggregated card like "… — 12 overdue
+// invoices", and #1 doesn't match every "… — 1 overdue invoice" card.
 function matchesInvoice(
   opp: GhlOpportunity,
   inv: { invoiceNumber: string | null; clientName: string | null }
 ): boolean {
   const name = (opp.name ?? "").toLowerCase();
   if (!name) return false;
-  const num = (inv.invoiceNumber ?? "").toLowerCase();
-  if (num && name.includes(num)) return true;
+  const num = (inv.invoiceNumber ?? "").trim().toLowerCase();
+  // #<num> anchored on the left by "#" and on the right by a non-digit boundary.
+  if (num && new RegExp(`#${num.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?!\\d)`).test(name)) {
+    return true;
+  }
   return name === opportunityName(inv).toLowerCase();
 }
 
@@ -466,6 +473,24 @@ function ghlStageForInvoice(
   return null;
 }
 
+// Invoices issued before this cutoff, or with no amount owed, are not synced to
+// GHL going forward (and are removed by the CLEANUP_INVALID_OPPS pass).
+const GHL_SYNC_SINCE = new Date("2026-01-01T00:00:00Z");
+
+// True when an invoice shouldn't have a GHL opportunity: it's too old (issued —
+// or, if there's no issue date, created — before the cutoff) or has a $0/null
+// total. Keyed on total (not amountDue) so a fully-paid invoice with a real
+// total isn't treated as a zero-dollar invoice.
+function isOldOrZeroInvoice(inv: {
+  issuedAt: Date | null;
+  createdAtJobber: Date | null;
+  total: number | null;
+}): boolean {
+  const issued = inv.issuedAt ?? inv.createdAtJobber;
+  if (!issued || issued < GHL_SYNC_SINCE) return true;
+  return !(inv.total ?? 0);
+}
+
 // Full GHL "Invoice Pipeline" sync: route every invoice to the stage matching
 // its status (Sent / Overdue / Paid / Canceled), creating the GHL contact and
 // opportunity when missing. Returns the number of invoices processed.
@@ -493,6 +518,7 @@ export async function syncGhlInvoicePipeline(): Promise<number> {
   let created = 0;
   let moved = 0;
   let skipped = 0;
+  let skippedOldOrZero = 0;
   let contactsCreated = 0;
   let customersProcessed = 0;
   let invoicesProcessed = 0;
@@ -534,6 +560,12 @@ export async function syncGhlInvoicePipeline(): Promise<number> {
   }
   const groups = new Map<string, OverdueGroup>();
   for (const inv of pastDue) {
+    // Skip invoices that are too old or carry no balance — don't let them
+    // create a card or inflate a customer's aggregated total.
+    if (isOldOrZeroInvoice(inv)) {
+      skippedOldOrZero += 1;
+      continue;
+    }
     const email = inv.customer?.email?.trim().toLowerCase();
     if (!email) {
       skipped += 1; // no email → can't map or create a GHL contact
@@ -603,6 +635,11 @@ export async function syncGhlInvoicePipeline(): Promise<number> {
   });
   for (const inv of awaiting) {
     const invId = inv.invoiceNumber ?? inv.jobberInvoiceId ?? inv.id;
+    // Skip invoices that are too old or carry no balance before any create/move.
+    if (isOldOrZeroInvoice(inv)) {
+      skippedOldOrZero += 1;
+      continue;
+    }
     const email = inv.customer?.email?.trim().toLowerCase();
     if (!email) {
       skipped += 1;
@@ -688,9 +725,72 @@ export async function syncGhlInvoicePipeline(): Promise<number> {
 
   log(
     `[ghl] invoice pipeline sync summary — processed=${customersProcessed} customers ` +
-      `(${invoicesProcessed} invoices) created=${created} moved=${moved} skipped=${skipped} cleared=${cleared}`
+      `(${invoicesProcessed} invoices) created=${created} moved=${moved} skipped=${skipped} ` +
+      `skippedOldOrZero=${skippedOldOrZero} cleared=${cleared}`
   );
+
+  // --- One-time cleanup: delete opportunities for invalid invoices -----------
+  // Gated behind CLEANUP_INVALID_OPPS=true. Deletes any Invoice-Pipeline
+  // opportunity that matches an invoice which is too old (pre-cutoff) or carries
+  // no balance. Deletes the opportunity only — never the contact.
+  if (process.env.CLEANUP_INVALID_OPPS === "true") {
+    await cleanupInvalidOpportunities(refs.pipelineId);
+  }
+
   return customersProcessed;
+}
+
+// Delete GHL opportunities that were created for invalid invoices (issued before
+// the cutoff, or $0/null total). Matches with the same invoice-number/title
+// logic used elsewhere and removes only the opportunity, not the contact.
+// One-time maintenance pass, gated by the CLEANUP_INVALID_OPPS env flag.
+async function cleanupInvalidOpportunities(pipelineId: string): Promise<void> {
+  let checked = 0;
+  let deleted = 0;
+  let notFound = 0;
+  let errors = 0;
+  try {
+    // Superset query, then filter with the exact same predicate as the sync.
+    const candidates = (
+      await prisma.invoiceRecord.findMany({
+        where: {
+          OR: [
+            { issuedAt: { lt: GHL_SYNC_SINCE } },
+            { issuedAt: null },
+            { total: { lte: 0 } },
+          ],
+        },
+      })
+    ).filter((inv) => isOldOrZeroInvoice(inv));
+
+    // One pass over the pipeline; match invalid invoices against it in memory.
+    const pipelineOpps = await listPipelineOpportunities(pipelineId);
+    for (const inv of candidates) {
+      checked += 1;
+      const matches = pipelineOpps.filter((o) => matchesInvoice(o, inv));
+      if (matches.length === 0) {
+        notFound += 1;
+        continue;
+      }
+      for (const o of matches) {
+        try {
+          await deleteOpportunity(o.id);
+          deleted += 1;
+        } catch (err: any) {
+          errors += 1;
+          logError(
+            `[ghl] cleanup: failed to delete opportunity ${o.id} for invoice ${inv.invoiceNumber ?? inv.id}:`,
+            err?.message ?? err
+          );
+        }
+      }
+    }
+  } catch (err: any) {
+    logError("[ghl] cleanup pass failed (continuing):", err?.message ?? err);
+  }
+  log(
+    `[ghl] cleanup summary — checked=${checked} deleted=${deleted} notFound=${notFound} errors=${errors}`
+  );
 }
 
 async function upsertTimeEntries(entries: FlatTimeEntry[]) {

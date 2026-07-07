@@ -314,6 +314,12 @@ export async function createOpportunity(opts: {
   }
 }
 
+// Permanently delete an opportunity (the card only — the contact is untouched).
+// Used by the one-time invalid-opportunity cleanup.
+export async function deleteOpportunity(opportunityId: string): Promise<void> {
+  await ghlFetch(`/opportunities/${opportunityId}`, { method: "DELETE" });
+}
+
 // --- Conversations / messages (collection reminder tracking) ----------------
 
 export interface GhlOutboundSms {
