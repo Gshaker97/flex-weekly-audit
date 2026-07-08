@@ -491,6 +491,20 @@ function isOldOrZeroInvoice(inv: {
   return !(inv.total ?? 0);
 }
 
+// Whether to skip an invoice when syncing to GHL going forward. On top of the
+// old/zero-total rule, we also skip invoices with nothing owed (amountDue <= 0)
+// — e.g. a past_due invoice already paid but not re-flagged in Jobber — so they
+// don't create $0 cards. The cleanup pass intentionally stays keyed on total
+// only (see isOldOrZeroInvoice), so this extra rule is sync-only.
+function skipForSync(inv: {
+  issuedAt: Date | null;
+  createdAtJobber: Date | null;
+  total: number | null;
+  amountDue: number | null;
+}): boolean {
+  return isOldOrZeroInvoice(inv) || (inv.amountDue ?? 0) <= 0;
+}
+
 // Full GHL "Invoice Pipeline" sync: route every invoice to the stage matching
 // its status (Sent / Overdue / Paid / Canceled), creating the GHL contact and
 // opportunity when missing. Returns the number of invoices processed.
@@ -560,9 +574,9 @@ export async function syncGhlInvoicePipeline(): Promise<number> {
   }
   const groups = new Map<string, OverdueGroup>();
   for (const inv of pastDue) {
-    // Skip invoices that are too old or carry no balance — don't let them
-    // create a card or inflate a customer's aggregated total.
-    if (isOldOrZeroInvoice(inv)) {
+    // Skip invoices that are too old or carry no balance (nothing owed) — don't
+    // let them create a card or inflate a customer's aggregated total.
+    if (skipForSync(inv)) {
       skippedOldOrZero += 1;
       continue;
     }
@@ -635,8 +649,9 @@ export async function syncGhlInvoicePipeline(): Promise<number> {
   });
   for (const inv of awaiting) {
     const invId = inv.invoiceNumber ?? inv.jobberInvoiceId ?? inv.id;
-    // Skip invoices that are too old or carry no balance before any create/move.
-    if (isOldOrZeroInvoice(inv)) {
+    // Skip invoices that are too old or carry no balance (nothing owed) before
+    // any create/move.
+    if (skipForSync(inv)) {
       skippedOldOrZero += 1;
       continue;
     }
