@@ -342,6 +342,34 @@ const TIMESHEETS_QUERY = `
   }
 `;
 
+// Same query plus the fields that let us split time by crew type and cost it:
+// `label` is Jobber's own Track Time category on the entry, `labourRate` is the
+// entry's rate. Both sit behind Jobber's higher plans, so this query is tried
+// first and falls back to TIMESHEETS_QUERY if the account can't select them —
+// losing the breakdown is acceptable, losing every timesheet is not.
+const TIMESHEETS_QUERY_LABELLED = `
+  query GetTimeEntries($after: String) {
+    timeSheetEntries(first: 100, after: $after) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        id
+        finalDuration
+        approved
+        ticking
+        note
+        label
+        labourRate
+        startAt
+        endAt
+        user { id name { full } }
+        job { id jobNumber title }
+        visit { id }
+        client { id name companyName }
+      }
+    }
+  }
+`;
+
 // Top-level (flat) visits query — same throttle fix as timesheets.
 const VISITS_QUERY = `
   query GetVisits($after: String) {
@@ -621,6 +649,10 @@ export interface FlatTimeEntry {
   jobNumber: string | null;
   jobTitle: string | null;
   clientName: string | null;
+  clientCompanyName: string | null;
+  label: string | null;
+  labourRate: number | null;
+  visitId: string | null;
   employeeId: string | null;
   employeeName: string | null;
   durationSeconds: number;
@@ -636,21 +668,54 @@ interface FlatTimeEntryNode {
   approved: boolean | null;
   ticking: boolean | null;
   note: string | null;
+  label?: string | null;
+  labourRate?: number | null;
   startAt: string | null;
   endAt: string | null;
   user: { id: string; name?: { full?: string | null } | null } | null;
   job: { id: string; jobNumber: string | number | null; title: string | null } | null;
+  visit?: { id: string } | null;
   client: { id: string; name?: string | null; companyName?: string | null } | null;
 }
 
 export async function fetchAllJobTimesheets(since: Date | null = null): Promise<FlatTimeEntry[]> {
-  const entries = await fetchIncremental<FlatTimeEntryNode>(TIMESHEETS_QUERY, "timeSheetEntries", since, "timesheets");
+  // Prefer the labelled query; drop back to the plain one if this Jobber
+  // account can't select `label`/`labourRate`, so the sync still gets hours.
+  let entries: FlatTimeEntryNode[];
+  try {
+    entries = await fetchIncremental<FlatTimeEntryNode>(
+      TIMESHEETS_QUERY_LABELLED,
+      "timeSheetEntries",
+      since,
+      "timesheets"
+    );
+  } catch (err: any) {
+    logError(
+      `[sync] timesheets: labelled query rejected (${err?.message ?? err}) — retrying without label/labourRate`
+    );
+    entries = await fetchIncremental<FlatTimeEntryNode>(
+      TIMESHEETS_QUERY,
+      "timeSheetEntries",
+      since,
+      "timesheets"
+    );
+  }
+
+  const labelled = entries.filter((e) => e.label).length;
+  log(
+    `[sync] timesheets: ${entries.length} entries, ${labelled} carry a Jobber label`
+  );
+
   return entries.map((e) => ({
     jobberEntryId: e.id,
     jobberJobId: e.job?.id ?? null,
     jobNumber: e.job?.jobNumber != null ? String(e.job.jobNumber) : null,
     jobTitle: e.job?.title ?? null,
     clientName: e.client?.companyName || e.client?.name || null,
+    clientCompanyName: e.client?.companyName ?? null,
+    label: e.label ?? null,
+    labourRate: e.labourRate != null ? Number(e.labourRate) : null,
+    visitId: e.visit?.id ?? null,
     employeeId: e.user?.id ?? null,
     employeeName: e.user?.name?.full ?? null,
     durationSeconds: e.finalDuration != null ? Number(e.finalDuration) : 0,

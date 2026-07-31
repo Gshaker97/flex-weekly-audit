@@ -2,6 +2,7 @@ import { prisma } from "./prisma";
 import { DateRange } from "./dateRange";
 import { computeDashboardKPIs } from "./kpis";
 import { COLLECTIONS_SINCE } from "./lateInvoices";
+import { classifyEntry, SEGMENT_LABELS } from "./crewSegments";
 import {
   formatCurrency,
   formatCurrencyDetailed,
@@ -570,28 +571,74 @@ export async function buildReport(range: DateRange): Promise<ReportData> {
     ]),
   });
 
-  // Timesheets: per-employee rollup, then the underlying entries.
-  const byEmployee = new Map<string, { hours: number; entries: number }>();
-  for (const t of timeEntries) {
+  // Timesheets. Each entry is split into residential vs commercial crew work
+  // the same way the Time Tracking page does it, so the two always agree.
+  const entryJobIds = Array.from(
+    new Set(timeEntries.map((t) => t.jobberJobId).filter(Boolean))
+  ) as string[];
+  const entryJobs = entryJobIds.length
+    ? await prisma.jobRecord.findMany({
+        where: { jobberJobId: { in: entryJobIds } },
+        select: { jobberJobId: true, customerId: true },
+      })
+    : [];
+  const entryJobById = new Map(entryJobs.map((j) => [j.jobberJobId, j]));
+  const entryCustomerIds = Array.from(
+    new Set(entryJobs.map((j) => j.customerId).filter(Boolean))
+  ) as string[];
+  const entryCustomers = entryCustomerIds.length
+    ? await prisma.customer.findMany({
+        where: { id: { in: entryCustomerIds } },
+        select: { id: true, companyName: true },
+      })
+    : [];
+  const entryCustomerById = new Map(entryCustomers.map((c) => [c.id, c]));
+
+  const classifiedEntries = timeEntries.map((t) => {
+    const job = t.jobberJobId ? entryJobById.get(t.jobberJobId) : null;
+    const customer = job?.customerId ? entryCustomerById.get(job.customerId) : null;
+    return {
+      entry: t,
+      ...classifyEntry({
+        label: t.label,
+        clientCompanyName: t.clientCompanyName ?? customer?.companyName ?? null,
+      }),
+    };
+  });
+
+  const byEmployee = new Map<
+    string,
+    { hours: number; residential: number; commercial: number; entries: number }
+  >();
+  for (const { entry: t, segment } of classifiedEntries) {
     const key = t.employeeName || "Unassigned";
-    const ex = byEmployee.get(key) ?? { hours: 0, entries: 0 };
-    ex.hours += hours(t.durationSeconds);
+    const ex =
+      byEmployee.get(key) ?? { hours: 0, residential: 0, commercial: 0, entries: 0 };
+    const h = hours(t.durationSeconds);
+    ex.hours += h;
+    if (segment === "residential") ex.residential += h;
+    else ex.commercial += h;
     ex.entries += 1;
     byEmployee.set(key, ex);
   }
   sections.push({
     key: "timesheets-summary",
-    title: "Hours by Employee",
-    description: "Time entries in range, rolled up per employee.",
+    title: "Hours by Crew Member",
+    description:
+      "Time entries in range, rolled up per crew member and split by crew type.",
     columns: [
-      { header: "Employee", type: "text" },
-      { header: "Hours", type: "number" },
+      { header: "Crew Member", type: "text" },
+      { header: "Residential Hours", type: "number" },
+      { header: "Commercial Hours", type: "number" },
+      { header: "Total Hours", type: "number" },
       { header: "Entries", type: "int" },
     ],
     rows: Array.from(byEmployee.entries())
       .sort((a, b) => b[1].hours - a[1].hours)
       .map(([name, agg]) => [
         name,
+        Math.round(agg.residential * 100) / 100,
+        Math.round(agg.commercial * 100) / 100,
         Math.round(agg.hours * 100) / 100,
         agg.entries,
       ]),
@@ -600,19 +647,24 @@ export async function buildReport(range: DateRange): Promise<ReportData> {
   sections.push({
     key: "time-entries",
     title: "Time Entries",
-    description: "Every time entry logged in range, newest first.",
+    description:
+      "Every time entry logged in range, newest first. Crew type comes from the Jobber time label where one was picked, otherwise from the client type.",
     columns: [
       { header: "Date", type: "date" },
-      { header: "Employee", type: "text" },
+      { header: "Crew Member", type: "text" },
+      { header: "Crew Type", type: "text" },
+      { header: "Jobber Label", type: "text" },
       { header: "Customer", type: "text" },
       { header: "Job #", type: "text" },
       { header: "Job Title", type: "text" },
       { header: "Hours", type: "number" },
       { header: "Approved", type: "bool" },
     ],
-    rows: timeEntries.map((t) => [
+    rows: classifiedEntries.map(({ entry: t, segment }) => [
       t.occurredAt,
       t.employeeName ?? null,
+      SEGMENT_LABELS[segment],
+      t.label ?? null,
       nameOf(t.clientName),
       t.jobNumber ?? null,
       t.jobTitle ?? null,
