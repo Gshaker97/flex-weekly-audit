@@ -1,18 +1,22 @@
 // Splitting tracked time into residential vs commercial crew work.
 //
-// The authoritative signal is Jobber's own timesheet label (the Track Time
-// category the crew picks when they clock in), which the sync now carries
-// through on TimeEntry.label. Entries that arrived before that field was synced
-// — or that the crew logged without picking a category — fall back to the
-// client record: a Jobber client with a company name is commercial work, an
-// individual is residential.
+// Flexx runs the split through Jobber itself: alongside the individual team
+// members, the Timesheets view has two crew accounts — "Residential
+// Maintenance" and "Commercial Maintenance" — and the crews clock in under
+// those. So the team member a time entry belongs to IS the crew type, and that
+// is the primary signal.
 //
-// Every entry therefore lands in a segment, and the UI reports how many were
-// classified by label vs by fallback so the split is never a black box.
+// Two fallbacks cover time logged under an individual's own account:
+//   2. the Jobber time label on the entry, if the crew picked a category
+//   3. the client record — a client with a company name is commercial work,
+//      an individual is residential
+//
+// Every entry therefore lands in a segment, and the UI reports how many came
+// from each signal so the split is never a black box.
 
 export type Segment = "residential" | "commercial";
 export type SegmentFilter = Segment | "all";
-export type SegmentSource = "label" | "client";
+export type SegmentSource = "crew" | "label" | "client";
 
 export const SEGMENT_LABELS: Record<Segment, string> = {
   residential: "Residential",
@@ -34,6 +38,23 @@ export function parseSegmentFilter(value: string | null | undefined): SegmentFil
   return "all";
 }
 
+/**
+ * Segment for a Jobber team member. Deliberately stricter than the label
+ * matching below — it only fires on the whole words "residential" and
+ * "commercial", so the crew accounts match while a real person's name never
+ * does by accident.
+ */
+export function segmentFromCrewName(
+  employeeName: string | null | undefined
+): Segment | null {
+  if (!employeeName) return null;
+  const text = employeeName.trim();
+  if (!text) return null;
+  if (/\bcommercial\b/i.test(text)) return "commercial";
+  if (/\bresidential\b/i.test(text)) return "residential";
+  return null;
+}
+
 /** Segment implied by a Jobber timesheet label, or null if it says neither. */
 export function segmentFromLabel(
   label: string | null | undefined
@@ -48,6 +69,7 @@ export function segmentFromLabel(
 }
 
 export interface ClassifiableEntry {
+  employeeName: string | null;
   label: string | null;
   clientCompanyName: string | null;
 }
@@ -58,13 +80,22 @@ export interface Classification {
 }
 
 export function classifyEntry(entry: ClassifiableEntry): Classification {
+  const fromCrew = segmentFromCrewName(entry.employeeName);
+  if (fromCrew) return { segment: fromCrew, source: "crew" };
+
   const fromLabel = segmentFromLabel(entry.label);
   if (fromLabel) return { segment: fromLabel, source: "label" };
+
   const hasCompany = !!entry.clientCompanyName?.trim();
   return {
     segment: hasCompany ? "commercial" : "residential",
     source: "client",
   };
+}
+
+/** Is this team member one of the dedicated crew accounts? */
+export function isCrewAccount(employeeName: string | null | undefined): boolean {
+  return segmentFromCrewName(employeeName) != null;
 }
 
 export function matchesFilter(segment: Segment, filter: SegmentFilter): boolean {

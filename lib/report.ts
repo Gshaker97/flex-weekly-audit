@@ -600,6 +600,7 @@ export async function buildReport(range: DateRange): Promise<ReportData> {
     return {
       entry: t,
       ...classifyEntry({
+        employeeName: t.employeeName,
         label: t.label,
         clientCompanyName: t.clientCompanyName ?? customer?.companyName ?? null,
       }),
@@ -648,7 +649,7 @@ export async function buildReport(range: DateRange): Promise<ReportData> {
     key: "time-entries",
     title: "Time Entries",
     description:
-      "Every time entry logged in range, newest first. Crew type comes from the Jobber time label where one was picked, otherwise from the client type.",
+      "Every time entry logged in range, newest first. Crew type comes from the Jobber crew account the time was logged under, falling back to the entry's time label and then the client type.",
     columns: [
       { header: "Date", type: "date" },
       { header: "Crew Member", type: "text" },

@@ -8,6 +8,7 @@ import LabourRateInput from "@/components/ui/LabourRateInput";
 import { resolveDateRange, getDateRange } from "@/lib/dateRange";
 import {
   classifyEntry,
+  isCrewAccount,
   matchesFilter,
   parseSegmentFilter,
   SEGMENT_LABELS,
@@ -99,12 +100,28 @@ export default async function TimesheetsPage({
   const classified = allEntries.map((entry) => ({
     entry,
     ...classifyEntry({
+      employeeName: entry.employeeName,
       label: entry.label,
       clientCompanyName: companyNameFor(entry),
     }),
   }));
 
-  const labelledCount = classified.filter((c) => c.source === "label").length;
+  const bySource = {
+    crew: classified.filter((c) => c.source === "crew").length,
+    label: classified.filter((c) => c.source === "label").length,
+    client: classified.filter((c) => c.source === "client").length,
+  };
+
+  // The Jobber crew accounts that actually logged time, so the page names the
+  // thing driving the split rather than describing it abstractly.
+  const crewAccounts = Array.from(
+    new Set(
+      classified
+        .filter((c) => c.source === "crew")
+        .map((c) => c.entry.employeeName)
+        .filter(Boolean) as string[]
+    )
+  ).sort();
   const segmentTotals: Record<Segment, number> = {
     residential: 0,
     commercial: 0,
@@ -373,20 +390,25 @@ export default async function TimesheetsPage({
             <CardContent className="space-y-2 py-4 text-xs text-muted-foreground">
               <p>
                 <span className="font-medium text-foreground">How crews are split:</span>{" "}
-                {labelledCount > 0 ? (
+                {crewAccounts.length > 0 ? (
                   <>
-                    {labelledCount} of {classified.length} entries were classified by
-                    their Jobber time label
-                    {labelledCount < classified.length && (
-                      <> and the rest by client type (company = commercial)</>
-                    )}
-                    .
+                    {bySource.crew} of {classified.length} entries were logged under
+                    your Jobber crew accounts ({crewAccounts.join(", ")}).
                   </>
                 ) : (
                   <>
-                    no Jobber time labels have synced yet, so entries are classified by
-                    client type (a client with a company name counts as commercial). Run
-                    a sync after crews start picking a time category in Jobber.
+                    no time was logged under a Jobber crew account named
+                    &ldquo;Residential&rdquo; or &ldquo;Commercial&rdquo; in this range.
+                  </>
+                )}
+                {bySource.label > 0 && (
+                  <> {bySource.label} came from a Jobber time label.</>
+                )}
+                {bySource.client > 0 && (
+                  <>
+                    {" "}
+                    {bySource.client} were logged under an individual&apos;s own account
+                    and are classified by client type (company = commercial).
                   </>
                 )}{" "}
                 Residential {formatDuration(segmentTotals.residential)} · Commercial{" "}
@@ -543,7 +565,14 @@ export default async function TimesheetsPage({
                   <tbody className="divide-y divide-border">
                     {employees.map((e, i) => (
                       <tr key={i} className="hover:bg-muted/30">
-                        <td className="px-4 py-3 font-medium">{e.name}</td>
+                        <td className="px-4 py-3">
+                          <span className="font-medium">{e.name}</span>
+                          {isCrewAccount(e.name) && (
+                            <Badge variant="muted" className="ml-2">
+                              Crew account
+                            </Badge>
+                          )}
+                        </td>
                         {showSplitColumns && (
                           <>
                             <td className="px-4 py-3 text-muted-foreground">
