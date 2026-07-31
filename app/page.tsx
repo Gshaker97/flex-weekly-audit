@@ -8,6 +8,7 @@ import { Badge } from "@/components/ui/Badge";
 import { StatCard } from "@/components/ui/StatCard";
 import { ClickableStatCard } from "@/components/ui/ClickableStatCard";
 import DateRangeFilter from "@/components/ui/DateRangeFilter";
+import DownloadReportButton from "@/components/ui/DownloadReportButton";
 import RevenueLineChart from "@/components/ui/RevenueLineChart";
 import NewCustomersBarChart from "@/components/ui/NewCustomersBarChart";
 import SyncButton from "./SyncButton";
@@ -349,8 +350,9 @@ function DashboardHeader({
             : "not yet synced"}
         </p>
       </div>
-      <div className="flex items-center gap-3">
+      <div className="flex flex-wrap items-center gap-3">
         <DateRangeFilter />
+        <DownloadReportButton />
         <SyncButton />
       </div>
     </div>
