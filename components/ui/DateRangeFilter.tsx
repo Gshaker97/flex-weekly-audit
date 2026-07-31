@@ -31,7 +31,14 @@ const MONTHS = [
   "July", "August", "September", "October", "November", "December",
 ];
 
-export default function DateRangeFilter() {
+// `defaultPreset` is the range the page shows when no `range` param is set.
+// Pages that default to something other than YTD (Time Tracking uses all time)
+// pass their own, so the dropdown never disagrees with the data on screen.
+export default function DateRangeFilter({
+  defaultPreset = "ytd",
+}: {
+  defaultPreset?: string;
+} = {}) {
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
@@ -39,7 +46,7 @@ export default function DateRangeFilter() {
   const urlStart = searchParams.get("start");
   const urlEnd = searchParams.get("end");
   const isCustom = !!(urlStart || urlEnd);
-  const currentPreset = isCustom ? "custom" : searchParams.get("range") ?? "ytd";
+  const currentPreset = isCustom ? "custom" : searchParams.get("range") ?? defaultPreset;
 
   const [open, setOpen] = useState(false);
   const [selStart, setSelStart] = useState<string | null>(urlStart);

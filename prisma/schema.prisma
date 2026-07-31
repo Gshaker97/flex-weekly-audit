@@ -120,6 +120,15 @@ model TimeEntry {
   jobNumber       String?
   jobTitle        String?
   clientName      String?
+  // Jobber's own time-tracking label on the entry (Track Time categories).
+  // This is what splits residential vs commercial crew time.
+  label           String?
+  // Jobber's labour rate for the entry, used to cost the logged time.
+  labourRate      Float?
+  visitId         String?
+  // Kept separately from clientName (which falls back to the person's name) so
+  // an entry can still be classified when it carries no label.
+  clientCompanyName String?
   employeeId      String?
   employeeName    String?
   durationSeconds Int       @default(0)
@@ -132,6 +141,7 @@ model TimeEntry {
   @@index([jobberJobId])
   @@index([employeeId])
   @@index([occurredAt])
+  @@index([label])
 }
 
 model Customer {
