@@ -144,7 +144,27 @@ export default async function TimesheetsPage({
   const entries = rows.map((r) => r.entry);
 
   // ------------------------------------------------------------------ KPIs
+  // Jobber's "General" bucket is time clocked without a job attached — travel,
+  // shop time, breaks, or a timer nobody stopped. It is real payroll but it
+  // isn't work on a job, so it stays out of the per-job figures and is
+  // reported on its own rather than quietly inflating every average.
+  const onJobRows = rows.filter(
+    (r) => r.entry.jobberJobId || r.entry.jobNumber
+  );
+  const generalRows = rows.filter(
+    (r) => !r.entry.jobberJobId && !r.entry.jobNumber
+  );
+
   const totalSeconds = entries.reduce((a, e) => a + (e.durationSeconds || 0), 0);
+  const onJobSeconds = onJobRows.reduce(
+    (a, r) => a + (r.entry.durationSeconds || 0),
+    0
+  );
+  const generalSeconds = generalRows.reduce(
+    (a, r) => a + (r.entry.durationSeconds || 0),
+    0
+  );
+
   const crewMembers = new Set(
     entries.map((e) => e.employeeId || e.employeeName).filter(Boolean)
   );
@@ -153,9 +173,21 @@ export default async function TimesheetsPage({
   );
   const visitIds = new Set(entries.map((e) => e.visitId).filter(Boolean));
 
-  const avgSecondsPerJob = jobKeys.size > 0 ? totalSeconds / jobKeys.size : 0;
+  const avgSecondsPerJob = jobKeys.size > 0 ? onJobSeconds / jobKeys.size : 0;
   const avgSecondsPerVisit =
-    visitIds.size > 0 ? totalSeconds / visitIds.size : null;
+    visitIds.size > 0 ? onJobSeconds / visitIds.size : null;
+
+  // A single entry longer than this is almost certainly a timer left running,
+  // which is what Jobber's own warning triangles flag. Surfaced so a runaway
+  // timer is visible rather than silently swelling the hours and the cost.
+  const LONG_ENTRY_SECONDS = 14 * HOUR;
+  const longEntries = entries.filter(
+    (e) => (e.durationSeconds || 0) > LONG_ENTRY_SECONDS
+  );
+  const longEntrySeconds = longEntries.reduce(
+    (a, e) => a + (e.durationSeconds || 0),
+    0
+  );
 
   // Labour cost prefers Jobber's own rate on the entry; the blended rate in the
   // toolbar covers entries that don't carry one.
@@ -245,8 +277,8 @@ export default async function TimesheetsPage({
       revenue: number;
     }
   >();
-  for (const { entry: e, segment } of rows) {
-    const key = e.jobberJobId || `#${e.jobNumber ?? "?"}`;
+  for (const { entry: e, segment } of onJobRows) {
+    const key = e.jobberJobId || `#${e.jobNumber}`;
     const job = e.jobberJobId ? jobByJobberId.get(e.jobberJobId) : null;
     const ex = byJob.get(key) ?? {
       jobNumber: e.jobNumber,
@@ -336,7 +368,13 @@ export default async function TimesheetsPage({
             <StatCard
               label="Total Hours"
               value={`${formatHoursDecimal(totalSeconds)} h`}
-              sublabel={`Tracked on site · ${segmentNoun}`}
+              sublabel={
+                generalSeconds > 0
+                  ? `${formatHoursDecimal(onJobSeconds)} h on jobs · ${formatHoursDecimal(
+                      generalSeconds
+                    )} h general`
+                  : `Tracked on site · ${segmentNoun}`
+              }
               accent="brand"
               icon={<Clock size={18} />}
             />
@@ -359,7 +397,9 @@ export default async function TimesheetsPage({
             <StatCard
               label="Avg Hours per Job"
               value={`${formatHoursDecimal(avgSecondsPerJob)} h`}
-              sublabel={`Across ${jobKeys.size} job${jobKeys.size === 1 ? "" : "s"}`}
+              sublabel={`On-job time across ${jobKeys.size} job${
+                jobKeys.size === 1 ? "" : "s"
+              }`}
               icon={<Timer size={18} />}
             />
             <StatCard
@@ -437,6 +477,29 @@ export default async function TimesheetsPage({
                   ))}
                 </p>
               )}
+              {generalSeconds > 0 && (
+                <p>
+                  <span className="font-medium text-foreground">
+                    General (not on a job):
+                  </span>{" "}
+                  {formatDuration(generalSeconds)} across {generalRows.length}{" "}
+                  {generalRows.length === 1 ? "entry" : "entries"} — Jobber&apos;s
+                  General bucket is time clocked without a job attached (travel, shop
+                  time, breaks, or a timer left running). It counts toward total hours
+                  and labor cost but is left out of the per-job table and the per-job
+                  averages.
+                </p>
+              )}
+              {longEntries.length > 0 && (
+                <p className="text-warning">
+                  <span className="font-medium">Check these:</span>{" "}
+                  {longEntries.length}{" "}
+                  {longEntries.length === 1 ? "entry runs" : "entries run"} longer than
+                  14 hours ({formatDuration(longEntrySeconds)} in total) — usually a
+                  timer nobody stopped. Fix them in Jobber and re-sync, or these hours
+                  will overstate the totals and the labor cost.
+                </p>
+              )}
               {uncostedSeconds > 0 && hasCost && (
                 <p>
                   {formatDuration(uncostedSeconds)} has no labour rate and is excluded
@@ -452,9 +515,18 @@ export default async function TimesheetsPage({
               <CardDescription>
                 Every job with logged time, longest first — how long it took, who worked
                 it, and what it billed.
+                {generalSeconds > 0 && " General (no-job) time is excluded."}
               </CardDescription>
             </CardHeader>
             <CardContent>
+              {jobs.length === 0 ? (
+                <div className="rounded-lg border border-dashed border-border py-10 text-center">
+                  <p className="text-sm text-muted-foreground">
+                    No time was logged against a specific job in this range — all of it
+                    sits in Jobber&apos;s General bucket.
+                  </p>
+                </div>
+              ) : (
               <div className="overflow-x-auto rounded-lg border border-border">
                 <table className="w-full min-w-[860px] text-sm">
                   <thead className="bg-muted/50">
@@ -546,6 +618,7 @@ export default async function TimesheetsPage({
                   </tbody>
                 </table>
               </div>
+              )}
             </CardContent>
           </Card>
 
