@@ -285,6 +285,15 @@ export default async function TimesheetsPage({
     segmentFilter === "all" ? "all crews" : `${SEGMENT_LABELS[segmentFilter]} crews`;
   const showSplitColumns = segmentFilter === "all";
 
+  // Flexx logs everything under the two Jobber crew accounts rather than under
+  // individual people, so when that's all we see, call them crews — counting
+  // them as "crew members" would read as a headcount, which it isn't.
+  const loggingAccounts = Array.from(
+    new Set(entries.map((e) => e.employeeName).filter(Boolean))
+  ) as string[];
+  const crewAccountsOnly =
+    loggingAccounts.length > 0 && loggingAccounts.every(isCrewAccount);
+
   return (
     <div className="space-y-6">
       <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
@@ -338,9 +347,13 @@ export default async function TimesheetsPage({
               icon={<Briefcase size={18} />}
             />
             <StatCard
-              label="Crew Members"
+              label={crewAccountsOnly ? "Crews Tracked" : "Crew Members"}
               value={crewMembers.size}
-              sublabel="Clocked in during range"
+              sublabel={
+                crewAccountsOnly
+                  ? "Jobber crew accounts logging time"
+                  : "Clocked in during range"
+              }
               icon={<Users size={18} />}
             />
             <StatCard
@@ -450,7 +463,7 @@ export default async function TimesheetsPage({
                       <th className="px-4 py-2.5 font-medium">Customer</th>
                       <th className="px-4 py-2.5 font-medium">Type</th>
                       <th className="px-4 py-2.5 font-medium">Last worked</th>
-                      <th className="px-4 py-2.5 font-medium">Crew</th>
+                      <th className="px-4 py-2.5 font-medium">Logged by</th>
                       <th className="px-4 py-2.5 font-medium">Visits</th>
                       <th className="px-4 py-2.5 font-medium">Time on site</th>
                       <th className="px-4 py-2.5 font-medium">Labor cost</th>
@@ -486,7 +499,8 @@ export default async function TimesheetsPage({
                           <td className="px-4 py-3 text-muted-foreground">
                             {j.crew.size > 0 ? (
                               <span title={Array.from(j.crew).join(", ")}>
-                                {j.crew.size}
+                                {Array.from(j.crew)[0]}
+                                {j.crew.size > 1 && ` +${j.crew.size - 1}`}
                               </span>
                             ) : (
                               "—"
@@ -537,10 +551,14 @@ export default async function TimesheetsPage({
 
           <Card>
             <CardHeader>
-              <CardTitle>Hours by Crew Member</CardTitle>
+              <CardTitle>
+                {crewAccountsOnly ? "Hours by Crew" : "Hours by Crew Member"}
+              </CardTitle>
               <CardDescription>
                 {showSplitColumns
-                  ? "Total time clocked in, split by the work each person spent it on."
+                  ? `Total time clocked in, split by the work each ${
+                      crewAccountsOnly ? "crew" : "person"
+                    } spent it on.`
                   : `Total time clocked in on ${segmentNoun}.`}
               </CardDescription>
             </CardHeader>
@@ -549,7 +567,9 @@ export default async function TimesheetsPage({
                 <table className="w-full min-w-[640px] text-sm">
                   <thead className="bg-muted/50">
                     <tr className="text-left text-xs uppercase tracking-wide text-muted-foreground">
-                      <th className="px-4 py-2.5 font-medium">Crew member</th>
+                      <th className="px-4 py-2.5 font-medium">
+                        {crewAccountsOnly ? "Crew" : "Crew member"}
+                      </th>
                       {showSplitColumns && (
                         <>
                           <th className="px-4 py-2.5 font-medium">Residential</th>
