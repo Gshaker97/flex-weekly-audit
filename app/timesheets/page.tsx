@@ -171,11 +171,24 @@ export default async function TimesheetsPage({
   const jobKeys = new Set(
     entries.map((e) => e.jobberJobId || e.jobNumber).filter(Boolean)
   );
-  const visitIds = new Set(entries.map((e) => e.visitId).filter(Boolean));
-
   const avgSecondsPerJob = jobKeys.size > 0 ? onJobSeconds / jobKeys.size : 0;
+
+  // Hours per visit answers "how long is one trip out to the property", so it
+  // must divide visit-linked time by visits. Not every job-linked entry carries
+  // a visit — a timer started from the job rather than from a scheduled visit
+  // has none — so the numerator is restricted to entries that do, otherwise
+  // unlinked time would inflate the average against a smaller denominator.
+  const visitRows = onJobRows.filter((r) => r.entry.visitId);
+  const visitIds = new Set(visitRows.map((r) => r.entry.visitId as string));
+  const visitLinkedSeconds = visitRows.reduce(
+    (a, r) => a + (r.entry.durationSeconds || 0),
+    0
+  );
   const avgSecondsPerVisit =
-    visitIds.size > 0 ? onJobSeconds / visitIds.size : null;
+    visitIds.size > 0 ? visitLinkedSeconds / visitIds.size : null;
+  // How much of the on-job time this average actually covers.
+  const visitCoverage =
+    onJobSeconds > 0 ? (visitLinkedSeconds / onJobSeconds) * 100 : 0;
 
   // A single entry longer than this is almost certainly a timer left running,
   // which is what Jobber's own warning triangles flag. Surfaced so a runaway
@@ -410,9 +423,13 @@ export default async function TimesheetsPage({
                   : "—"
               }
               sublabel={
-                avgSecondsPerVisit != null
-                  ? `Across ${visitIds.size} visit${visitIds.size === 1 ? "" : "s"}`
-                  : "Needs a sync to link entries to visits"
+                avgSecondsPerVisit == null
+                  ? "Needs a sync to link entries to visits"
+                  : visitCoverage < 99
+                  ? `Across ${visitIds.size} visit${
+                      visitIds.size === 1 ? "" : "s"
+                    } · ${Math.round(visitCoverage)}% of on-job time`
+                  : `Across ${visitIds.size} visit${visitIds.size === 1 ? "" : "s"}`
               }
               icon={<Timer size={18} />}
             />
