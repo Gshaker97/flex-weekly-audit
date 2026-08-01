@@ -21,7 +21,7 @@ import {
   formatHoursDecimal,
   formatDate,
 } from "@/lib/utils";
-import { Clock, Users, Briefcase, Timer, DollarSign, Percent } from "lucide-react";
+import { Clock, Briefcase, Timer, DollarSign, Percent } from "lucide-react";
 
 export const dynamic = "force-dynamic";
 
@@ -165,9 +165,6 @@ export default async function TimesheetsPage({
     0
   );
 
-  const crewMembers = new Set(
-    entries.map((e) => e.employeeId || e.employeeName).filter(Boolean)
-  );
   const jobKeys = new Set(
     entries.map((e) => e.jobberJobId || e.jobNumber).filter(Boolean)
   );
@@ -227,6 +224,12 @@ export default async function TimesheetsPage({
   }, 0);
   const labourShare =
     hasCost && jobRevenue > 0 ? (labourCost / jobRevenue) * 100 : null;
+  // What an hour on site is worth. Uses on-job time, since General hours
+  // aren't what earned the revenue.
+  const revenuePerHour =
+    jobRevenue > 0 && onJobSeconds > 0
+      ? jobRevenue / (onJobSeconds / HOUR)
+      : null;
 
   // -------------------------------------------------------------- rollups
   const byEmployee = new Map<
@@ -398,19 +401,26 @@ export default async function TimesheetsPage({
               icon={<Briefcase size={18} />}
             />
             <StatCard
-              label={crewAccountsOnly ? "Crews Tracked" : "Crew Members"}
-              value={crewMembers.size}
+              label="Revenue Generated"
+              value={jobRevenue > 0 ? formatCurrency(jobRevenue) : "—"}
               sublabel={
-                crewAccountsOnly
-                  ? "Jobber crew accounts logging time"
-                  : "Clocked in during range"
+                jobRevenue > 0
+                  ? `Value of the ${jobKeys.size} job${
+                      jobKeys.size === 1 ? "" : "s"
+                    } worked${
+                      revenuePerHour != null
+                        ? ` · ${formatCurrency(revenuePerHour)}/hr`
+                        : ""
+                    }`
+                  : "No job value on the jobs worked"
               }
-              icon={<Users size={18} />}
+              accent="brand"
+              icon={<DollarSign size={18} />}
             />
             <StatCard
               label="Avg Hours per Job"
               value={`${formatHoursDecimal(avgSecondsPerJob)} h`}
-              sublabel={`On-job time across ${jobKeys.size} job${
+              sublabel={`A whole job, every visit added up · ${jobKeys.size} job${
                 jobKeys.size === 1 ? "" : "s"
               }`}
               icon={<Timer size={18} />}
@@ -426,10 +436,12 @@ export default async function TimesheetsPage({
                 avgSecondsPerVisit == null
                   ? "Needs a sync to link entries to visits"
                   : visitCoverage < 99
-                  ? `Across ${visitIds.size} visit${
+                  ? `One trip out to the property · ${visitIds.size} visit${
                       visitIds.size === 1 ? "" : "s"
-                    } · ${Math.round(visitCoverage)}% of on-job time`
-                  : `Across ${visitIds.size} visit${visitIds.size === 1 ? "" : "s"}`
+                    }, ${Math.round(visitCoverage)}% of on-job time`
+                  : `One trip out to the property · ${visitIds.size} visit${
+                      visitIds.size === 1 ? "" : "s"
+                    }`
               }
               icon={<Timer size={18} />}
             />
@@ -438,9 +450,9 @@ export default async function TimesheetsPage({
               value={hasCost ? formatCurrency(labourCost) : "—"}
               sublabel={
                 hasCost
-                  ? `of ${formatCurrency(jobRevenue)} job value${
-                      labourShare != null ? ` · ${labourShare.toFixed(1)}% labor` : ""
-                    }`
+                  ? labourShare != null
+                    ? `${labourShare.toFixed(1)}% of the revenue generated`
+                    : "Wages for the hours logged"
                   : "Set an hourly rate above to cost these hours"
               }
               accent={
@@ -458,6 +470,35 @@ export default async function TimesheetsPage({
 
           <Card>
             <CardContent className="space-y-2 py-4 text-xs text-muted-foreground">
+              <p>
+                <span className="font-medium text-foreground">
+                  Hours per job vs hours per visit:
+                </span>{" "}
+                a <span className="font-medium text-foreground">visit</span> is one trip
+                out to the property. A{" "}
+                <span className="font-medium text-foreground">job</span> is the whole
+                piece of work, which for recurring customers is many visits over months.
+                {avgSecondsPerVisit != null && jobKeys.size > 0 && (
+                  <>
+                    {" "}
+                    Here a job averages {formatHoursDecimal(avgSecondsPerJob)} h in
+                    total but only {formatHoursDecimal(avgSecondsPerVisit)} h per trip
+                    {visitIds.size >= jobKeys.size && (
+                      <>
+                        {" "}
+                        — about {Math.round(visitIds.size / jobKeys.size)} visit
+                        {Math.round(visitIds.size / jobKeys.size) === 1 ? "" : "s"} per
+                        job
+                      </>
+                    )}
+                    .
+                  </>
+                )}{" "}
+                Use <span className="font-medium text-foreground">per visit</span> to
+                price and schedule a single stop, and{" "}
+                <span className="font-medium text-foreground">per job</span> to see what
+                an account has cost you in total.
+              </p>
               <p>
                 <span className="font-medium text-foreground">How crews are split:</span>{" "}
                 {crewAccounts.length > 0 ? (
