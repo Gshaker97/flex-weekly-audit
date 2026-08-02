@@ -384,7 +384,7 @@ const VISITS_QUERY = `
         title
         visitStatus
         invoice { id }
-        job { id jobNumber total visits(first: 1) { totalCount } }
+        job { id jobNumber total jobType billingType visits(first: 1) { totalCount } }
         client { id name companyName }
       }
     }
@@ -587,9 +587,39 @@ interface FlatVisitNode {
     id: string;
     jobNumber: string | number | null;
     total: number | null;
+    jobType?: string | null;
+    billingType?: string | null;
     visits?: { totalCount?: number | null } | null;
   } | null;
   client: { id: string; name?: string | null; companyName?: string | null } | null;
+}
+
+/**
+ * Is the job behind a visit a recurring one? Mirrors the signals the job sync
+ * uses (jobType, then billingType, then visit count), applied to the smaller
+ * job selection the visits query carries.
+ */
+function isRecurringVisitJob(
+  job: FlatVisitNode["job"]
+): boolean {
+  if (!job) return false;
+  if (job.jobType) {
+    const t = job.jobType.toLowerCase();
+    if (t.includes("recurring")) return true;
+    if (t.includes("one") && t.includes("off")) return false;
+  }
+  if (job.billingType) {
+    const b = job.billingType.toLowerCase();
+    if (
+      b.includes("per_visit") ||
+      b.includes("monthly") ||
+      b.includes("fixed_price_per_visit") ||
+      b.includes("recurring")
+    ) {
+      return true;
+    }
+  }
+  return (job.visits?.totalCount ?? 0) >= 2;
 }
 
 export async function fetchAllJobVisits(since: Date | null = null): Promise<FlatVisit[]> {
@@ -598,6 +628,16 @@ export async function fetchAllJobVisits(since: Date | null = null): Promise<Flat
   return visits.map((v) => {
     const jobTotal = v.job?.total != null ? Number(v.job.total) : 0;
     const count = v.job?.visits?.totalCount ?? 1;
+    // Jobber prices a RECURRING job per visit: the job total is what one trip
+    // is worth, however many trips the schedule holds. Dividing it by the
+    // visit count (which includes every future scheduled visit) shrank each
+    // visit to a couple of dollars. A ONE-OFF job prices the whole piece of
+    // work, so its total does spread across its visits.
+    const perVisit = isRecurringVisitJob(v.job)
+      ? jobTotal
+      : count > 0
+      ? jobTotal / count
+      : jobTotal;
     return {
       jobberVisitId: v.id,
       jobberJobId: v.job?.id ?? null,
@@ -610,7 +650,7 @@ export async function fetchAllJobVisits(since: Date | null = null): Promise<Flat
       endAt: v.endAt ?? null,
       completedAt: v.completedAt ?? null,
       hasInvoice: v.invoice != null,
-      estimatedValue: count > 0 ? jobTotal / count : 0,
+      estimatedValue: perVisit,
     };
   });
 }

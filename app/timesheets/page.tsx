@@ -73,28 +73,15 @@ export default async function TimesheetsPage({
           total: true,
           customerId: true,
           jobType: true,
+          isRecurring: true,
         },
       })
     : [];
   const jobByJobberId = new Map(jobRecords.map((j) => [j.jobberJobId, j]));
 
   // Revenue is credited per VISIT, not per whole job, so a one-week view isn't
-  // handed a whole season's contract value. VisitRecord.estimatedValue is
-  // already the job total divided by the job's visit count, which is exactly
-  // the per-trip share we want.
-  const visitIdList = Array.from(
-    new Set(allEntries.map((e) => e.visitId).filter(Boolean))
-  ) as string[];
-  const visitRecords = visitIdList.length
-    ? await prisma.visitRecord.findMany({
-        where: { jobberVisitId: { in: visitIdList } },
-        select: { jobberVisitId: true, estimatedValue: true },
-      })
-    : [];
-  const visitByJobberId = new Map(
-    visitRecords.map((v) => [v.jobberVisitId, v])
-  );
-
+  // handed a whole season's worth of work.
+  //
   // Visit counts per job, so time that isn't linked to a specific visit can
   // still be credited one trip's share instead of the entire job.
   const visitCountRows = jobIdList.length
@@ -108,9 +95,23 @@ export default async function TimesheetsPage({
     visitCountRows.map((r) => [r.jobberJobId as string, r._count._all])
   );
 
-  /** One visit's share of a job's value. */
-  function visitShareOf(jobberJobId: string): number {
-    const total = jobByJobberId.get(jobberJobId)?.total ?? 0;
+  /**
+   * What one visit to a job is worth.
+   *
+   * Jobber prices a RECURRING job per visit — the job total is what the
+   * customer pays for a single trip, however many trips the schedule holds. A
+   * ONE-OFF job prices the whole piece of work, so its total spreads across
+   * however many visits it takes.
+   *
+   * Dividing a recurring job's total by its visit count (which includes every
+   * future scheduled visit) shrank each visit to a couple of dollars and made
+   * revenue collapse.
+   */
+  function visitValueOf(jobberJobId: string): number {
+    const job = jobByJobberId.get(jobberJobId);
+    const total = job?.total ?? 0;
+    if (total <= 0) return 0;
+    if (job?.isRecurring) return total;
     const count = visitCountByJob.get(jobberJobId) ?? 1;
     return count > 0 ? total / count : total;
   }
@@ -121,15 +122,9 @@ export default async function TimesheetsPage({
     visitsWorked: Set<string>
   ): number {
     if (!jobberJobId) return 0;
-    // Only unlinked time on this job — credit a single trip's share, which for
-    // a one-off job (a single visit) is the whole job.
-    if (visitsWorked.size === 0) return visitShareOf(jobberJobId);
-    let sum = 0;
-    for (const visitId of visitsWorked) {
-      const value = visitByJobberId.get(visitId)?.estimatedValue ?? 0;
-      sum += value > 0 ? value : visitShareOf(jobberJobId);
-    }
-    return sum;
+    // Only unlinked time on this job — credit a single trip.
+    const trips = visitsWorked.size === 0 ? 1 : visitsWorked.size;
+    return trips * visitValueOf(jobberJobId);
   }
 
   const customerIds = Array.from(
