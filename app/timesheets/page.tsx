@@ -78,6 +78,60 @@ export default async function TimesheetsPage({
     : [];
   const jobByJobberId = new Map(jobRecords.map((j) => [j.jobberJobId, j]));
 
+  // Revenue is credited per VISIT, not per whole job, so a one-week view isn't
+  // handed a whole season's contract value. VisitRecord.estimatedValue is
+  // already the job total divided by the job's visit count, which is exactly
+  // the per-trip share we want.
+  const visitIdList = Array.from(
+    new Set(allEntries.map((e) => e.visitId).filter(Boolean))
+  ) as string[];
+  const visitRecords = visitIdList.length
+    ? await prisma.visitRecord.findMany({
+        where: { jobberVisitId: { in: visitIdList } },
+        select: { jobberVisitId: true, estimatedValue: true },
+      })
+    : [];
+  const visitByJobberId = new Map(
+    visitRecords.map((v) => [v.jobberVisitId, v])
+  );
+
+  // Visit counts per job, so time that isn't linked to a specific visit can
+  // still be credited one trip's share instead of the entire job.
+  const visitCountRows = jobIdList.length
+    ? await prisma.visitRecord.groupBy({
+        by: ["jobberJobId"],
+        where: { jobberJobId: { in: jobIdList } },
+        _count: { _all: true },
+      })
+    : [];
+  const visitCountByJob = new Map(
+    visitCountRows.map((r) => [r.jobberJobId as string, r._count._all])
+  );
+
+  /** One visit's share of a job's value. */
+  function visitShareOf(jobberJobId: string): number {
+    const total = jobByJobberId.get(jobberJobId)?.total ?? 0;
+    const count = visitCountByJob.get(jobberJobId) ?? 1;
+    return count > 0 ? total / count : total;
+  }
+
+  /** Value earned on a job by the visits actually worked in this range. */
+  function revenueForJob(
+    jobberJobId: string | null,
+    visitsWorked: Set<string>
+  ): number {
+    if (!jobberJobId) return 0;
+    // Only unlinked time on this job — credit a single trip's share, which for
+    // a one-off job (a single visit) is the whole job.
+    if (visitsWorked.size === 0) return visitShareOf(jobberJobId);
+    let sum = 0;
+    for (const visitId of visitsWorked) {
+      const value = visitByJobberId.get(visitId)?.estimatedValue ?? 0;
+      sum += value > 0 ? value : visitShareOf(jobberJobId);
+    }
+    return sum;
+  }
+
   const customerIds = Array.from(
     new Set(jobRecords.map((j) => j.customerId).filter(Boolean))
   ) as string[];
@@ -215,13 +269,24 @@ export default async function TimesheetsPage({
   }, 0);
   const hasCost = costedSeconds > 0;
 
-  // Revenue of the jobs that have time logged against them in this view. The
-  // job total is the whole job, so treat this as an approximation when a job
-  // straddles the range boundary.
-  const jobRevenue = Array.from(jobKeys).reduce((sum, key) => {
-    const job = jobByJobberId.get(key as string);
-    return sum + (job?.total ?? 0);
-  }, 0);
+  // Which visits of each job were actually worked in this range. A job that
+  // only has unlinked time still gets an entry with an empty set, so it is
+  // credited one trip's share rather than being dropped.
+  const visitsWorkedByJob = new Map<string, Set<string>>();
+  for (const { entry: e } of onJobRows) {
+    if (!e.jobberJobId) continue;
+    const worked = visitsWorkedByJob.get(e.jobberJobId) ?? new Set<string>();
+    if (e.visitId) worked.add(e.visitId);
+    visitsWorkedByJob.set(e.jobberJobId, worked);
+  }
+
+  // Revenue earned in this range: the value of the visits worked, not the full
+  // value of every job those visits belong to. A season-long recurring job
+  // contributes one trip's share to a one-week view, not the whole contract.
+  const jobRevenue = Array.from(visitsWorkedByJob).reduce(
+    (sum, [jobberJobId, worked]) => sum + revenueForJob(jobberJobId, worked),
+    0
+  );
   const labourShare =
     hasCost && jobRevenue > 0 ? (labourCost / jobRevenue) * 100 : null;
   // What an hour on site is worth. Uses on-job time, since General hours
@@ -277,6 +342,7 @@ export default async function TimesheetsPage({
   const byJob = new Map<
     string,
     {
+      jobberJobId: string | null;
       jobNumber: string | null;
       jobTitle: string | null;
       clientName: string | null;
@@ -295,8 +361,8 @@ export default async function TimesheetsPage({
   >();
   for (const { entry: e, segment } of onJobRows) {
     const key = e.jobberJobId || `#${e.jobNumber}`;
-    const job = e.jobberJobId ? jobByJobberId.get(e.jobberJobId) : null;
     const ex = byJob.get(key) ?? {
+      jobberJobId: e.jobberJobId,
       jobNumber: e.jobNumber,
       jobTitle: e.jobTitle,
       clientName: e.clientName,
@@ -310,7 +376,8 @@ export default async function TimesheetsPage({
       ticking: false,
       cost: 0,
       costed: false,
-      revenue: job?.total ?? 0,
+      // Filled in after the loop, once every visit worked is known.
+      revenue: 0,
     };
     const seconds = e.durationSeconds || 0;
     ex.seconds += seconds;
@@ -326,6 +393,11 @@ export default async function TimesheetsPage({
       ex.costed = true;
     }
     byJob.set(key, ex);
+  }
+  // Credit each job only the value of the visits worked in this range, so the
+  // table's revenue column adds up to the Revenue Generated stat above it.
+  for (const job of byJob.values()) {
+    job.revenue = revenueForJob(job.jobberJobId, job.visits);
   }
   const jobs = Array.from(byJob.values()).sort((a, b) => b.seconds - a.seconds);
 
@@ -405,14 +477,14 @@ export default async function TimesheetsPage({
               value={jobRevenue > 0 ? formatCurrency(jobRevenue) : "—"}
               sublabel={
                 jobRevenue > 0
-                  ? `Value of the ${jobKeys.size} job${
+                  ? `Earned in range across ${jobKeys.size} job${
                       jobKeys.size === 1 ? "" : "s"
-                    } worked${
+                    }${
                       revenuePerHour != null
                         ? ` · ${formatCurrency(revenuePerHour)}/hr`
                         : ""
                     }`
-                  : "No job value on the jobs worked"
+                  : "No job value on the visits worked"
               }
               accent="brand"
               icon={<DollarSign size={18} />}
@@ -446,7 +518,7 @@ export default async function TimesheetsPage({
               icon={<Timer size={18} />}
             />
             <StatCard
-              label="Labor Cost vs Job Value"
+              label="Labor Cost vs Revenue"
               value={hasCost ? formatCurrency(labourCost) : "—"}
               sublabel={
                 hasCost
@@ -597,7 +669,7 @@ export default async function TimesheetsPage({
                       <th className="px-4 py-2.5 font-medium">Visits</th>
                       <th className="px-4 py-2.5 font-medium">Time on site</th>
                       <th className="px-4 py-2.5 font-medium">Labor cost</th>
-                      <th className="px-4 py-2.5 font-medium">Job value</th>
+                      <th className="px-4 py-2.5 font-medium">Revenue</th>
                       <th className="px-4 py-2.5 font-medium">Status</th>
                     </tr>
                   </thead>
