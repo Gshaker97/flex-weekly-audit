@@ -21,7 +21,16 @@ import {
   formatHoursDecimal,
   formatDate,
 } from "@/lib/utils";
-import { Clock, Briefcase, Timer, DollarSign, Percent } from "lucide-react";
+import {
+  Clock,
+  Briefcase,
+  Timer,
+  DollarSign,
+  Percent,
+  ClipboardCheck,
+  CalendarCheck,
+  AlertCircle,
+} from "lucide-react";
 
 export const dynamic = "force-dynamic";
 
@@ -59,11 +68,25 @@ export default async function TimesheetsPage({
     orderBy: { occurredAt: "desc" },
   });
 
+  // Every visit SCHEDULED in the range, whether or not anyone clocked into it.
+  // This is the basis Jobber's own "Recent visits" widget uses, and it's what
+  // makes the coverage row below able to reconcile against it.
+  const scheduledVisits = await prisma.visitRecord.findMany({
+    where: { visitDate: { gte: range.start, lte: range.end } },
+    select: { jobberVisitId: true, jobberJobId: true, clientName: true },
+  });
+
   // Job records give each tracked job its value; the customer record is the
   // fallback for classifying entries whose own client company name hasn't been
-  // filled in by a sync yet.
+  // filled in by a sync yet. Jobs behind scheduled visits are included so
+  // their value is known even when nobody logged time against them.
   const jobIdList = Array.from(
-    new Set(allEntries.map((e) => e.jobberJobId).filter(Boolean))
+    new Set(
+      [
+        ...allEntries.map((e) => e.jobberJobId),
+        ...scheduledVisits.map((v) => v.jobberJobId),
+      ].filter(Boolean)
+    )
   ) as string[];
   const jobRecords = jobIdList.length
     ? await prisma.jobRecord.findMany({
@@ -282,6 +305,52 @@ export default async function TimesheetsPage({
     (sum, [jobberJobId, worked]) => sum + revenueForJob(jobberJobId, worked),
     0
   );
+
+  // ------------------------------------------------- scheduled vs serviced
+  // What was on the schedule, against what actually got time logged. A visit
+  // with no time entry has no crew to classify it by, so these fall back to
+  // the client: a company is commercial work, an individual is residential.
+  const scheduledInSegment = scheduledVisits.filter((v) => {
+    if (segmentFilter === "all") return true;
+    const job = v.jobberJobId ? jobByJobberId.get(v.jobberJobId) : null;
+    const customer = job?.customerId ? customerById.get(job.customerId) : null;
+    const { segment } = classifyEntry({
+      employeeName: null,
+      label: null,
+      clientCompanyName: customer?.companyName ?? null,
+    });
+    return matchesFilter(segment, segmentFilter);
+  });
+
+  const scheduledJobIds = new Set(
+    scheduledInSegment.map((v) => v.jobberJobId).filter(Boolean) as string[]
+  );
+  // Jobs that were worked but whose visits sit outside the range still count
+  // as scheduled work for this view, so coverage can never exceed 100%.
+  for (const key of jobKeys) scheduledJobIds.add(key as string);
+
+  const expectedRevenue = scheduledInSegment.reduce(
+    (sum, v) => sum + (v.jobberJobId ? visitValueOf(v.jobberJobId) : 0),
+    0
+  );
+
+  const servicedVisitIds = new Set<string>();
+  for (const worked of visitsWorkedByJob.values()) {
+    for (const id of worked) servicedVisitIds.add(id);
+  }
+  const scheduledVisitCount = scheduledInSegment.length;
+  const servicedVisitCount = scheduledInSegment.filter((v) =>
+    servicedVisitIds.has(v.jobberVisitId)
+  ).length;
+
+  const jobCoverage =
+    scheduledJobIds.size > 0 ? (jobKeys.size / scheduledJobIds.size) * 100 : null;
+  // Scheduled work carrying no logged time. Clamped, since a job worked in
+  // range whose visits fall outside it can earn more than this view scheduled.
+  const untrackedRevenue = Math.max(0, expectedRevenue - jobRevenue);
+  const untrackedShare =
+    expectedRevenue > 0 ? (untrackedRevenue / expectedRevenue) * 100 : null;
+
   const labourShare =
     hasCost && jobRevenue > 0 ? (labourCost / jobRevenue) * 100 : null;
   // What an hour on site is worth. Uses on-job time, since General hours
@@ -535,8 +604,86 @@ export default async function TimesheetsPage({
             />
           </div>
 
+          {/* What was on the schedule, against what actually got tracked. */}
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+            <StatCard
+              label="Jobs With Time Logged"
+              value={
+                scheduledJobIds.size > 0
+                  ? `${jobKeys.size} of ${scheduledJobIds.size}`
+                  : String(jobKeys.size)
+              }
+              sublabel={
+                jobCoverage != null
+                  ? `${Math.round(jobCoverage)}% of the jobs scheduled in range`
+                  : "Jobs with any time logged"
+              }
+              accent={
+                jobCoverage == null
+                  ? "default"
+                  : jobCoverage >= 80
+                  ? "success"
+                  : jobCoverage >= 50
+                  ? "warning"
+                  : "danger"
+              }
+              icon={<ClipboardCheck size={18} />}
+            />
+            <StatCard
+              label="Expected Revenue"
+              value={expectedRevenue > 0 ? formatCurrency(expectedRevenue) : "—"}
+              sublabel={
+                scheduledVisitCount > 0
+                  ? `If all ${scheduledVisitCount} visit${
+                      scheduledVisitCount === 1 ? "" : "s"
+                    } scheduled in range are serviced`
+                  : "No visits scheduled in this range"
+              }
+              accent="brand"
+              icon={<CalendarCheck size={18} />}
+            />
+            <StatCard
+              label="Revenue Not Time-Tracked"
+              value={
+                expectedRevenue > 0 ? formatCurrency(untrackedRevenue) : "—"
+              }
+              sublabel={
+                untrackedShare != null
+                  ? `${Math.round(
+                      untrackedShare
+                    )}% of expected · ${servicedVisitCount} of ${scheduledVisitCount} visits have time`
+                  : "Nothing scheduled to compare against"
+              }
+              accent={
+                untrackedShare == null
+                  ? "default"
+                  : untrackedShare > 50
+                  ? "danger"
+                  : untrackedShare > 20
+                  ? "warning"
+                  : "success"
+              }
+              icon={<AlertCircle size={18} />}
+            />
+          </div>
+
           <Card>
             <CardContent className="space-y-2 py-4 text-xs text-muted-foreground">
+              {scheduledVisitCount > 0 && (
+                <p>
+                  <span className="font-medium text-foreground">
+                    Scheduled vs time-tracked:
+                  </span>{" "}
+                  Jobber counts every visit on the schedule; this page can only
+                  credit revenue to visits your crews clocked into. That is why
+                  Expected Revenue matches Jobber&apos;s visit widget while Revenue
+                  Generated is lower — the difference is work that happened without
+                  time logged against a job, most of it sitting in the General
+                  bucket. Visits with no time entry have no crew to classify them,
+                  so they fall back to the client: a company counts as commercial,
+                  an individual as residential.
+                </p>
+              )}
               <p>
                 <span className="font-medium text-foreground">
                   Hours per job vs hours per visit:
