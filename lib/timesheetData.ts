@@ -19,6 +19,18 @@ import {
 
 export const HOUR = 3600;
 
+interface WorkedOnJob {
+  visitIds: Set<string>;
+  linkedDays: Set<string>;
+  unlinkedDays: Set<string>;
+}
+
+/** Local calendar day of an entry; entries with no date share one bucket. */
+function dayKey(at: Date | null): string {
+  if (!at) return "unknown";
+  return `${at.getFullYear()}-${at.getMonth() + 1}-${at.getDate()}`;
+}
+
 export interface TimesheetDataInput {
   range: DateRange;
   segmentFilter: SegmentFilter;
@@ -120,15 +132,36 @@ export async function computeTimesheetData({
     return count > 0 ? total / count : total;
   }
 
-  /** Value earned on a job by the visits actually worked in this range. */
-  function revenueForJob(
-    jobberJobId: string | null,
-    visitsWorked: Set<string>
-  ): number {
+  /**
+   * How many trips a job was serviced in this range.
+   *
+   * Visit-linked entries are counted directly. A timer started from the job
+   * rather than from a scheduled visit carries no visit, so those are counted
+   * by DISTINCT DAY instead — a crew that services a property four times does
+   * it on four different days. Days already covered by a visit-linked entry
+   * aren't counted twice.
+   *
+   * Capped at the job's scheduled visit count, so a multi-day one-off install
+   * can't be credited more trips than the schedule holds. Two separate trips
+   * to the same property on the same day still count once; undercounting is
+   * the safer error.
+   */
+  function tripsForJob(jobberJobId: string, worked: WorkedOnJob): number {
+    let extraDays = 0;
+    for (const day of worked.unlinkedDays) {
+      if (!worked.linkedDays.has(day)) extraDays += 1;
+    }
+    const trips = Math.max(1, worked.visitIds.size + extraDays);
+    const scheduled = visitCountByJob.get(jobberJobId) ?? 0;
+    return scheduled > 0 ? Math.min(trips, scheduled) : trips;
+  }
+
+  /** Value earned on a job by the trips actually worked in this range. */
+  function revenueForJob(jobberJobId: string | null): number {
     if (!jobberJobId) return 0;
-    // Only unlinked time on this job — credit a single trip.
-    const trips = visitsWorked.size === 0 ? 1 : visitsWorked.size;
-    return trips * visitValueOf(jobberJobId);
+    const worked = workedByJob.get(jobberJobId);
+    if (!worked) return 0;
+    return tripsForJob(jobberJobId, worked) * visitValueOf(jobberJobId);
   }
 
   const customerIds = Array.from(
@@ -268,22 +301,33 @@ export async function computeTimesheetData({
   }, 0);
   const hasCost = costedSeconds > 0;
 
-  // Which visits of each job were actually worked in this range. A job that
-  // only has unlinked time still gets an entry with an empty set, so it is
-  // credited one trip's share rather than being dropped.
-  const visitsWorkedByJob = new Map<string, Set<string>>();
+  // What each job was serviced with in this range: the visits we can see, plus
+  // the days that carry time with no visit attached.
+  const workedByJob = new Map<string, WorkedOnJob>();
   for (const { entry: e } of onJobRows) {
     if (!e.jobberJobId) continue;
-    const worked = visitsWorkedByJob.get(e.jobberJobId) ?? new Set<string>();
-    if (e.visitId) worked.add(e.visitId);
-    visitsWorkedByJob.set(e.jobberJobId, worked);
+    const worked =
+      workedByJob.get(e.jobberJobId) ??
+      ({
+        visitIds: new Set<string>(),
+        linkedDays: new Set<string>(),
+        unlinkedDays: new Set<string>(),
+      } as WorkedOnJob);
+    const day = dayKey(e.occurredAt);
+    if (e.visitId) {
+      worked.visitIds.add(e.visitId);
+      worked.linkedDays.add(day);
+    } else {
+      worked.unlinkedDays.add(day);
+    }
+    workedByJob.set(e.jobberJobId, worked);
   }
 
-  // Revenue earned in this range: the value of the visits worked, not the full
-  // value of every job those visits belong to. A season-long recurring job
+  // Revenue earned in this range: the value of the trips worked, not the full
+  // value of every job those trips belong to. A season-long recurring job
   // contributes one trip's share to a one-week view, not the whole contract.
-  const jobRevenue = Array.from(visitsWorkedByJob).reduce(
-    (sum, [jobberJobId, worked]) => sum + revenueForJob(jobberJobId, worked),
+  const jobRevenue = Array.from(workedByJob.keys()).reduce(
+    (sum, jobberJobId) => sum + revenueForJob(jobberJobId),
     0
   );
 
@@ -316,13 +360,24 @@ export async function computeTimesheetData({
   );
 
   const servicedVisitIds = new Set<string>();
-  for (const worked of visitsWorkedByJob.values()) {
-    for (const id of worked) servicedVisitIds.add(id);
+  for (const worked of workedByJob.values()) {
+    for (const id of worked.visitIds) servicedVisitIds.add(id);
   }
+  // Trips actually serviced, counted the same way revenue is — so the card
+  // can't credit sixteen trips of revenue while reporting four.
+  const servicedTrips = Array.from(workedByJob).reduce(
+    (sum, [jobberJobId, worked]) => sum + tripsForJob(jobberJobId, worked),
+    0
+  );
   const scheduledVisitCount = scheduledInSegment.length;
-  const servicedVisitCount = scheduledInSegment.filter((v) =>
-    servicedVisitIds.has(v.jobberVisitId)
-  ).length;
+  const servicedVisitCount = Math.min(
+    scheduledVisitCount,
+    Math.max(
+      servicedTrips,
+      scheduledInSegment.filter((v) => servicedVisitIds.has(v.jobberVisitId))
+        .length
+    )
+  );
 
   const jobCoverage =
     scheduledJobIds.size > 0 ? (jobKeys.size / scheduledJobIds.size) * 100 : null;
@@ -442,7 +497,7 @@ export async function computeTimesheetData({
   // Credit each job only the value of the visits worked in this range, so the
   // table's revenue column adds up to the Revenue Generated stat above it.
   for (const job of byJob.values()) {
-    job.revenue = revenueForJob(job.jobberJobId, job.visits);
+    job.revenue = revenueForJob(job.jobberJobId);
   }
   const jobs = Array.from(byJob.values()).sort((a, b) => b.seconds - a.seconds);
 
@@ -495,12 +550,13 @@ export async function computeTimesheetData({
     longEntrySeconds,
     labourCost,
     hasCost,
-    visitsWorkedByJob,
+    workedByJob,
     jobRevenue,
     scheduledInSegment,
     scheduledJobIds,
     expectedRevenue,
     servicedVisitIds,
+    servicedTrips,
     scheduledVisitCount,
     servicedVisitCount,
     jobCoverage,
