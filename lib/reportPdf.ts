@@ -110,6 +110,7 @@ export function renderReportPdf(data: ReportData): Buffer {
 }
 
 function layout(data: ReportData, totalPages: number | null): PdfBuilder {
+  const title = data.reportTitle ?? "Full Business Report";
   const pdf = new PdfBuilder(PAGE_W, PAGE_H);
   let y = 0;
 
@@ -122,7 +123,7 @@ function layout(data: ReportData, totalPages: number | null): PdfBuilder {
   function startPage() {
     pdf.addPage();
     pdf.rect(0, 0, PAGE_W, 3, GREEN);
-    pdf.text(MARGIN, 26, `${data.businessName} — Full Business Report`, {
+    pdf.text(MARGIN, 26, `${data.businessName} — ${title}`, {
       size: 10,
       bold: true,
       color: INK,
@@ -156,7 +157,7 @@ function layout(data: ReportData, totalPages: number | null): PdfBuilder {
   startPage();
 
   // ------------------------------------------------------------- title block
-  pdf.text(MARGIN, y + 18, "Full Business Report", {
+  pdf.text(MARGIN, y + 18, title, {
     size: 21,
     bold: true,
     color: INK,

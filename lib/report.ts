@@ -47,6 +47,8 @@ export interface ReportSummaryItem {
 
 export interface ReportData {
   businessName: string;
+  /** Defaults to "Full Business Report". */
+  reportTitle?: string;
   rangeLabel: string;
   rangeStart: Date;
   rangeEnd: Date;
