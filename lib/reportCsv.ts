@@ -42,7 +42,7 @@ export function renderReportCsv(data: ReportData): string {
   const lines: string[] = [];
   const row = (...cells: string[]) => lines.push(cells.map(escape).join(","));
 
-  row(`${data.businessName} — Full Business Report`);
+  row(`${data.businessName} — ${data.reportTitle ?? "Full Business Report"}`);
   row("Date range", data.rangeLabel);
   row("Range start", ymd(data.rangeStart));
   row("Range end", ymd(data.rangeEnd));

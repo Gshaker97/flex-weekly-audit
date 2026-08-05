@@ -87,7 +87,10 @@ export function truncateToWidth(
   size: number,
   bold = false
 ): string {
-  if (textWidth(text, size, bold) <= maxWidth) return text;
+  // Tolerance, so text whose width lands exactly on the limit isn't clipped by
+  // floating-point noise (that turned a "Entries" column header into "Entri..").
+  const EPSILON = 0.05;
+  if (textWidth(text, size, bold) <= maxWidth + EPSILON) return text;
   const ellipsis = "..";
   const budget = maxWidth - textWidth(ellipsis, size, bold);
   if (budget <= 0) return "";

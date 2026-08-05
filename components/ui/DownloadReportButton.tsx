@@ -19,7 +19,23 @@ function prettyShort(s: string | null): string {
   ).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
 }
 
-export default function DownloadReportButton() {
+export interface DownloadReportButtonProps {
+  /** Endpoint that serves the report. Must accept range + format params. */
+  endpoint?: string;
+  /** Extra query params to forward (e.g. the crew filter and hourly rate). */
+  extraParams?: Record<string, string | null | undefined>;
+  /** Popover heading. */
+  title?: string;
+  /** One-line description of what the download contains. */
+  blurb?: string;
+}
+
+export default function DownloadReportButton({
+  endpoint = "/api/report",
+  extraParams,
+  title = "Download full report",
+  blurb = "Every metric and detail list",
+}: DownloadReportButtonProps = {}) {
   const searchParams = useSearchParams();
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState<Format | null>(null);
@@ -69,9 +85,12 @@ export default function DownloadReportButton() {
       if (!start && !end) {
         params.set("range", searchParams.get("range") ?? "ytd");
       }
+      for (const [key, value] of Object.entries(extraParams ?? {})) {
+        if (value != null && value !== "") params.set(key, value);
+      }
       params.set("format", format);
 
-      const res = await fetch(`/api/report?${params.toString()}`, {
+      const res = await fetch(`${endpoint}?${params.toString()}`, {
         cache: "no-store",
       });
       if (!res.ok) {
@@ -117,9 +136,9 @@ export default function DownloadReportButton() {
 
       {open && (
         <div className="absolute right-0 top-12 z-50 w-72 rounded-lg border border-border bg-background p-3 shadow-lg">
-          <p className="text-sm font-semibold">Download full report</p>
+          <p className="text-sm font-semibold">{title}</p>
           <p className="mt-1 text-xs text-muted-foreground">
-            Every metric and detail list for{" "}
+            {blurb} for{" "}
             <span className="font-medium text-foreground">{rangeLabel}</span>.
             Choose a format:
           </p>
