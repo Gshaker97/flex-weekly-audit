@@ -3,10 +3,10 @@
   "version": "0.2.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
+    "dev": "TZ=America/Phoenix next dev",
     "build": "prisma generate && next build",
-    "start": "prisma migrate deploy && next start -p ${PORT:-3000}",
-    "sync:cron": "tsx scripts/sync-cron.ts",
+    "start": "prisma migrate deploy && TZ=America/Phoenix next start -p ${PORT:-3000}",
+    "sync:cron": "TZ=America/Phoenix tsx scripts/sync-cron.ts",
     "lint": "next lint",
     "postinstall": "prisma generate"
   },

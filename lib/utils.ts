@@ -5,6 +5,9 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
+/** Flexx operates in Arizona (no DST, constant UTC-7). */
+export const BUSINESS_TIME_ZONE = "America/Phoenix";
+
 export function formatCurrency(amount: number | null | undefined) {
   if (amount == null) return "—";
   return new Intl.NumberFormat("en-US", {
@@ -39,6 +42,7 @@ export function formatDate(date: Date | string | null | undefined) {
     month: "short",
     day: "numeric",
     year: "numeric",
+    timeZone: BUSINESS_TIME_ZONE,
   });
 }
 
@@ -51,6 +55,7 @@ export function formatDateTime(date: Date | string | null | undefined) {
     year: "numeric",
     hour: "numeric",
     minute: "2-digit",
+    timeZone: BUSINESS_TIME_ZONE,
   });
 }
 
