@@ -104,7 +104,9 @@ export async function computeDashboardKPIs(
   // marked complete and aren't invoiced.
   const overdueAgg = await prisma.visitRecord.aggregate({
     where: {
+      // Not done on the visit AND not closed out via its job.
       isComplete: false,
+      jobComplete: false,
       hasInvoice: false,
       visitDate: { gte: range.start, lte: range.end, lt: asOf },
     },
@@ -118,7 +120,10 @@ export async function computeDashboardKPIs(
   // Excludes visits whose job is marked "No Invoice" in its Jobber notes.
   const uninvAgg = await prisma.visitRecord.aggregate({
     where: {
-      isComplete: true,
+      // Done either way: ticked on the visit, or closed out via its job. The
+      // two conditions are complements, so a visit is always in exactly one of
+      // Overdue / Uninvoiced and can never fall out of both.
+      OR: [{ isComplete: true }, { jobComplete: true }],
       hasInvoice: false,
       noInvoiceFlag: false,
       visitDate: { gte: range.start, lte: range.end },

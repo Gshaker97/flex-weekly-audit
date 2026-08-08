@@ -185,13 +185,27 @@ export async function runFullSync(
         data: { visitsFetched: visits.length },
       });
     } catch (err: any) {
+      // Recorded, not just logged: a silent failure here is indistinguishable
+      // from "I re-synced and nothing changed".
       logError("Visit sync failed (continuing):", err?.message ?? err);
+      await prisma.syncRun
+        .update({
+          where: { id: run.id },
+          data: {
+            errorMessage: `Visit sync failed: ${err?.message ?? err}`,
+          },
+        })
+        .catch(() => {});
     }
 
     // Stamp the "No Invoice" note flag onto visits so the Uninvoiced Revenue
     // metric excludes intentionally-uninvoiced jobs and all their visits.
     log("[sync] step: reconcileVisitNoInvoiceFlags");
     await reconcileVisitNoInvoiceFlags();
+
+    // Visits whose job was closed out without each visit being ticked complete.
+    log("[sync] step: reconcileVisitJobCompletion");
+    await reconcileVisitJobCompletion();
 
     log("[sync] step: recomputeCustomerAggregates");
     await recomputeCustomerAggregates();
@@ -358,6 +372,57 @@ async function reconcileVisitNoInvoiceFlags() {
     where: { noInvoiceFlag: true, jobberJobId: { notIn: flaggedJobIds } },
     data: { noInvoiceFlag: false },
   });
+}
+
+/**
+ * Inherit completion from the parent job.
+ *
+ * Jobber lets you close out a JOB without ticking each of its visits complete
+ * on the schedule, and crews routinely do exactly that. Those visits keep
+ * isComplete = false forever, so they sat in "Jobs not marked as completed"
+ * through every re-sync even though the job reads Complete in Jobber.
+ *
+ * A visit counts as done-by-job when its job is complete (or is sitting in
+ * Jobber's requires-invoicing state, which means the work is finished) and the
+ * visit happened on or before the job was completed — so visits scheduled
+ * after a job was closed out aren't swept up with it.
+ *
+ * Set-based on purpose: doing this per job would be thousands of round trips.
+ */
+async function reconcileVisitJobCompletion() {
+  const COMPLETE_JOB = `(
+    j."completedAt" IS NOT NULL
+    OR lower(coalesce(j."jobStatus", '')) LIKE '%complete%'
+    OR lower(coalesce(j."jobStatus", '')) LIKE '%requires_invoicing%'
+    OR lower(coalesce(j."jobStatus", '')) LIKE '%requires invoicing%'
+  )`;
+  const IN_WINDOW = `(j."completedAt" IS NULL OR v."visitDate" <= j."completedAt")`;
+
+  const marked = await prisma.$executeRawUnsafe(`
+    UPDATE "VisitRecord" v
+    SET "jobComplete" = true
+    FROM "JobRecord" j
+    WHERE v."jobberJobId" = j."jobberJobId"
+      AND v."jobComplete" = false
+      AND ${COMPLETE_JOB}
+      AND ${IN_WINDOW}
+  `);
+
+  // Clear it again if the job was reopened, or the visit moved past the
+  // completion date. An unmatched visit correctly falls back to false.
+  const cleared = await prisma.$executeRawUnsafe(`
+    UPDATE "VisitRecord" v
+    SET "jobComplete" = false
+    WHERE v."jobComplete" = true
+      AND NOT EXISTS (
+        SELECT 1 FROM "JobRecord" j
+        WHERE j."jobberJobId" = v."jobberJobId"
+          AND ${COMPLETE_JOB}
+          AND ${IN_WINDOW}
+      )
+  `);
+
+  log(`[sync] visit job-completion: ${marked} marked, ${cleared} cleared`);
 }
 
 async function upsertInvoices(nodes: JobberInvoiceNode[]) {
