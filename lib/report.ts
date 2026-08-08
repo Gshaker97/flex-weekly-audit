@@ -114,7 +114,7 @@ export async function buildReport(range: DateRange): Promise<ReportData> {
     }),
     prisma.visitRecord.findMany({
       where: {
-        isComplete: true,
+        OR: [{ isComplete: true }, { jobComplete: true }],
         hasInvoice: false,
         noInvoiceFlag: false,
         visitDate: { gte: range.start, lte: range.end },
@@ -124,6 +124,7 @@ export async function buildReport(range: DateRange): Promise<ReportData> {
     prisma.visitRecord.findMany({
       where: {
         isComplete: false,
+        jobComplete: false,
         hasInvoice: false,
         visitDate: { gte: range.start, lte: range.end, lt: asOf },
       },

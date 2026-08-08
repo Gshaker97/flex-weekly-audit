@@ -26,6 +26,7 @@ export default async function OverdueRevenuePage({
   const visits = await prisma.visitRecord.findMany({
     where: {
       isComplete: false,
+      jobComplete: false,
       hasInvoice: false,
       visitDate: { gte: range.start, lte: range.end, lt: asOf },
     },

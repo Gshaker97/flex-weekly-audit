@@ -23,7 +23,7 @@ export default async function UninvoicedRevenuePage({
   // Excludes visits whose job is marked "No Invoice" in its Jobber notes.
   const visits = await prisma.visitRecord.findMany({
     where: {
-      isComplete: true,
+      OR: [{ isComplete: true }, { jobComplete: true }],
       hasInvoice: false,
       noInvoiceFlag: false,
       visitDate: { gte: range.start, lte: range.end },

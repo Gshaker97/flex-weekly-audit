@@ -104,6 +104,11 @@ model VisitRecord {
   completedAt     DateTime?
   hasInvoice      Boolean   @default(false)
   noInvoiceFlag   Boolean   @default(false)
+  // True when the visit's parent JOB is closed out in Jobber, even if the
+  // individual visit was never ticked complete on the schedule. Crews commonly
+  // complete the job rather than each visit, and without this those visits sat
+  // in "not marked as completed" forever, surviving every re-sync.
+  jobComplete     Boolean   @default(false)
   estimatedValue  Float     @default(0)
   lastSyncedAt    DateTime  @default(now())
 
@@ -111,6 +116,7 @@ model VisitRecord {
   @@index([isComplete])
   @@index([hasInvoice])
   @@index([noInvoiceFlag])
+  @@index([jobComplete])
 }
 
 model TimeEntry {
