@@ -2,6 +2,7 @@ import { prisma } from "./prisma";
 import { DateRange } from "./dateRange";
 import { computeDashboardKPIs } from "./kpis";
 import { COLLECTIONS_SINCE } from "./lateInvoices";
+import { getVisitFreshnessCutoff, stillInJobber } from "./visitFreshness";
 import { classifyEntry, SEGMENT_LABELS } from "./crewSegments";
 import {
   formatCurrency,
@@ -84,6 +85,7 @@ export async function buildReport(range: DateRange): Promise<ReportData> {
   const asOf = range.end.getTime() < now.getTime() ? range.end : now;
 
   const kpis = await computeDashboardKPIs(range);
+  const visitCutoff = await getVisitFreshnessCutoff();
 
   // ---------------------------------------------------------------- summary
 
@@ -118,6 +120,7 @@ export async function buildReport(range: DateRange): Promise<ReportData> {
         hasInvoice: false,
         noInvoiceFlag: false,
         visitDate: { gte: range.start, lte: range.end },
+        ...stillInJobber(visitCutoff),
       },
       orderBy: { visitDate: "desc" },
     }),
@@ -127,6 +130,7 @@ export async function buildReport(range: DateRange): Promise<ReportData> {
         jobComplete: false,
         hasInvoice: false,
         visitDate: { gte: range.start, lte: range.end, lt: asOf },
+        ...stillInJobber(visitCutoff),
       },
       orderBy: { visitDate: "desc" },
     }),
