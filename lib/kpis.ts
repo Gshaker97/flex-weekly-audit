@@ -1,6 +1,10 @@
 import { prisma } from "./prisma";
 import { DateRange } from "./dateRange";
-import { getVisitFreshnessCutoff, stillInJobber } from "./visitFreshness";
+import {
+  excludeNotYetDue,
+  getVisitFreshnessCutoff,
+  stillInJobber,
+} from "./visitFreshness";
 
 export interface DashboardKPIs {
   range: DateRange;
@@ -115,6 +119,7 @@ export async function computeDashboardKPIs(
       hasInvoice: false,
       visitDate: { gte: range.start, lte: range.end, lt: asOf },
       ...stillInJobber(visitCutoff),
+      ...excludeNotYetDue(),
     },
     _sum: { estimatedValue: true },
     _count: true,

@@ -30,3 +30,35 @@ export async function getVisitFreshnessCutoff(): Promise<Date | null> {
 export function stillInJobber(cutoff: Date | null) {
   return cutoff ? { lastSyncedAt: { gte: cutoff } } : {};
 }
+
+/**
+ * Jobber statuses that mean the visit isn't due yet.
+ *
+ * "Not marked as completed" is about work whose day has passed with nobody
+ * closing it out. A visit Jobber still calls UPCOMING hasn't happened, and
+ * TODAY's hasn't finished — neither is a failure to close anything out, so
+ * counting them overstates the problem and pads it with future work.
+ *
+ * Anything else — LATE above all, plus a null status on an older row — still
+ * falls through to the scheduled-date test, so nothing genuinely overdue is
+ * dropped just because its status is unfamiliar.
+ */
+export const NOT_YET_DUE_STATUSES = ["UPCOMING", "TODAY"];
+
+export function excludeNotYetDue() {
+  return {
+    // The null branch is load-bearing: in SQL, NOT (NULL = 'UPCOMING') is NULL
+    // rather than true, so a bare NOT would quietly discard every visit whose
+    // status hasn't been synced — the opposite of falling back to the date.
+    OR: [
+      { visitStatus: null },
+      {
+        NOT: {
+          OR: NOT_YET_DUE_STATUSES.map((status) => ({
+            visitStatus: { equals: status, mode: "insensitive" as const },
+          })),
+        },
+      },
+    ],
+  };
+}
