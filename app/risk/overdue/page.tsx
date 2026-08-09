@@ -5,7 +5,11 @@ import { Badge } from "@/components/ui/Badge";
 import { StatCard } from "@/components/ui/StatCard";
 import DateRangeFilter from "@/components/ui/DateRangeFilter";
 import { resolveDateRange, getDateRange } from "@/lib/dateRange";
-import { getVisitFreshnessCutoff, stillInJobber } from "@/lib/visitFreshness";
+import {
+  excludeNotYetDue,
+  getVisitFreshnessCutoff,
+  stillInJobber,
+} from "@/lib/visitFreshness";
 import {
   formatCurrency,
   formatCurrencyDetailed,
@@ -36,6 +40,7 @@ export default async function OverdueRevenuePage({
     jobComplete: false,
     hasInvoice: false,
     visitDate: { gte: range.start, lte: range.end, lt: asOf },
+    ...excludeNotYetDue(),
   };
 
   const visits = await prisma.visitRecord.findMany({
@@ -90,7 +95,8 @@ export default async function OverdueRevenuePage({
             <h2 className="text-2xl font-semibold tracking-tight">Overdue Revenue</h2>
             <p className="mt-1 text-sm text-muted-foreground">
               Visits whose scheduled date has passed that haven&apos;t been marked
-              complete or invoiced. Showing{" "}
+              complete or invoiced. Work Jobber still lists as upcoming or due
+              today is excluded — it isn&apos;t late yet. Showing{" "}
               <span className="font-medium text-foreground">{range.label}</span>.
             </p>
           </div>

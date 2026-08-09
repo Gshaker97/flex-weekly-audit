@@ -2,7 +2,11 @@ import { prisma } from "./prisma";
 import { DateRange } from "./dateRange";
 import { computeDashboardKPIs } from "./kpis";
 import { COLLECTIONS_SINCE } from "./lateInvoices";
-import { getVisitFreshnessCutoff, stillInJobber } from "./visitFreshness";
+import {
+  excludeNotYetDue,
+  getVisitFreshnessCutoff,
+  stillInJobber,
+} from "./visitFreshness";
 import { classifyEntry, SEGMENT_LABELS } from "./crewSegments";
 import {
   formatCurrency,
@@ -131,6 +135,7 @@ export async function buildReport(range: DateRange): Promise<ReportData> {
         hasInvoice: false,
         visitDate: { gte: range.start, lte: range.end, lt: asOf },
         ...stillInJobber(visitCutoff),
+        ...excludeNotYetDue(),
       },
       orderBy: { visitDate: "desc" },
     }),
