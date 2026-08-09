@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { prisma } from "@/lib/prisma";
+import { getVisitFreshnessCutoff, stillInJobber } from "@/lib/visitFreshness";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/Card";
 import { Badge } from "@/components/ui/Badge";
 import { StatCard } from "@/components/ui/StatCard";
@@ -24,6 +25,7 @@ export default async function UninvoicedRevenuePage({
   const visits = await prisma.visitRecord.findMany({
     where: {
       OR: [{ isComplete: true }, { jobComplete: true }],
+      ...stillInJobber(await getVisitFreshnessCutoff()),
       hasInvoice: false,
       noInvoiceFlag: false,
       visitDate: { gte: range.start, lte: range.end },

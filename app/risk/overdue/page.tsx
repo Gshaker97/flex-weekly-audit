@@ -5,6 +5,7 @@ import { Badge } from "@/components/ui/Badge";
 import { StatCard } from "@/components/ui/StatCard";
 import DateRangeFilter from "@/components/ui/DateRangeFilter";
 import { resolveDateRange, getDateRange } from "@/lib/dateRange";
+import { getVisitFreshnessCutoff, stillInJobber } from "@/lib/visitFreshness";
 import {
   formatCurrency,
   formatCurrencyDetailed,
@@ -29,15 +30,27 @@ export default async function OverdueRevenuePage({
 
   // Visits whose scheduled date has passed but aren't marked complete (and
   // aren't invoiced) — work that should have happened and hasn't been closed out.
+  const visitCutoff = await getVisitFreshnessCutoff();
+  const baseWhere = {
+    isComplete: false,
+    jobComplete: false,
+    hasInvoice: false,
+    visitDate: { gte: range.start, lte: range.end, lt: asOf },
+  };
+
   const visits = await prisma.visitRecord.findMany({
-    where: {
-      isComplete: false,
-      jobComplete: false,
-      hasInvoice: false,
-      visitDate: { gte: range.start, lte: range.end, lt: asOf },
-    },
+    where: { ...baseWhere, ...stillInJobber(visitCutoff) },
     orderBy: { visitDate: "desc" },
   });
+
+  // Rows the latest pull no longer returned: removed or rescheduled in Jobber.
+  // Counted separately so the headline isn't inflated by work that no longer
+  // exists, but still reported rather than silently dropped.
+  const vanished = visitCutoff
+    ? await prisma.visitRecord.count({
+        where: { ...baseWhere, lastSyncedAt: { lt: visitCutoff } },
+      })
+    : 0;
 
   // Why is each row still here? Show the raw signals rather than making
   // anyone guess: what Jobber says about the visit, what it says about the
@@ -122,6 +135,17 @@ export default async function OverdueRevenuePage({
               <p className="text-danger">
                 <span className="font-medium">Sync warning:</span>{" "}
                 {lastSync.errorMessage}
+              </p>
+            )}
+            {vanished > 0 && (
+              <p>
+                <span className="font-medium text-foreground">
+                  {formatNumber(vanished)} visit
+                  {vanished === 1 ? "" : "s"} excluded:
+                </span>{" "}
+                the latest sync no longer found them in Jobber, so they were
+                rescheduled or removed there. They are not outstanding work and
+                are left out of the total above.
               </p>
             )}
             <p>

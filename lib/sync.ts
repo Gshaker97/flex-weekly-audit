@@ -402,8 +402,18 @@ async function reconcileVisitJobCompletion() {
     OR lower(coalesce(j."jobStatus", '')) LIKE '%complete%'
     OR lower(coalesce(j."jobStatus", '')) LIKE '%requires_invoicing%'
     OR lower(coalesce(j."jobStatus", '')) LIKE '%requires invoicing%'
+    OR lower(coalesce(j."jobStatus", '')) LIKE '%archiv%'
   )`;
-  const IN_WINDOW = `(j."completedAt" IS NULL OR v."visitDate" <= j."completedAt")`;
+  // An ARCHIVED job is closed out and gone from Jobber's working set, so every
+  // one of its visits is settled no matter what date it carries. Recurring
+  // schedules routinely leave visits dated after the job was archived, and
+  // those were the ones the date guard kept flagging forever.
+  const ARCHIVED = `lower(coalesce(j."jobStatus", '')) LIKE '%archiv%'`;
+  const IN_WINDOW = `(
+    ${ARCHIVED}
+    OR j."completedAt" IS NULL
+    OR v."visitDate" <= j."completedAt"
+  )`;
 
   const marked = await prisma.$executeRawUnsafe(`
     UPDATE "VisitRecord" v

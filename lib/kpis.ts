@@ -1,5 +1,6 @@
 import { prisma } from "./prisma";
 import { DateRange } from "./dateRange";
+import { getVisitFreshnessCutoff, stillInJobber } from "./visitFreshness";
 
 export interface DashboardKPIs {
   range: DateRange;
@@ -67,6 +68,10 @@ export async function computeDashboardKPIs(
   // ranges only count what was overdue/uninvoiced within that window.
   const asOf = range.end.getTime() < now0.getTime() ? range.end : now0;
 
+  // Visits the latest healthy pull no longer returned have been removed or
+  // rescheduled in Jobber; they are not outstanding work.
+  const visitCutoff = await getVisitFreshnessCutoff();
+
   const monthlyAll = await prisma.monthlySnapshot.findMany({
     orderBy: [{ year: "asc" }, { month: "asc" }],
   });
@@ -109,6 +114,7 @@ export async function computeDashboardKPIs(
       jobComplete: false,
       hasInvoice: false,
       visitDate: { gte: range.start, lte: range.end, lt: asOf },
+      ...stillInJobber(visitCutoff),
     },
     _sum: { estimatedValue: true },
     _count: true,
@@ -127,6 +133,7 @@ export async function computeDashboardKPIs(
       hasInvoice: false,
       noInvoiceFlag: false,
       visitDate: { gte: range.start, lte: range.end },
+      ...stillInJobber(visitCutoff),
     },
     _sum: { estimatedValue: true },
     _count: true,
