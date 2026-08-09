@@ -5,7 +5,13 @@ import { Badge } from "@/components/ui/Badge";
 import { StatCard } from "@/components/ui/StatCard";
 import DateRangeFilter from "@/components/ui/DateRangeFilter";
 import { resolveDateRange, getDateRange } from "@/lib/dateRange";
-import { formatCurrency, formatCurrencyDetailed, formatDate } from "@/lib/utils";
+import {
+  formatCurrency,
+  formatCurrencyDetailed,
+  formatDate,
+  formatDateTime,
+  formatNumber,
+} from "@/lib/utils";
 import { AlertCircle, ListTodo, Users } from "lucide-react";
 
 export const dynamic = "force-dynamic";
@@ -32,6 +38,30 @@ export default async function OverdueRevenuePage({
     },
     orderBy: { visitDate: "desc" },
   });
+
+  // Why is each row still here? Show the raw signals rather than making
+  // anyone guess: what Jobber says about the visit, what it says about the
+  // parent job, and when this row was last touched by a sync.
+  const jobIds = Array.from(
+    new Set(visits.map((v) => v.jobberJobId).filter(Boolean))
+  ) as string[];
+  const jobs = jobIds.length
+    ? await prisma.jobRecord.findMany({
+        where: { jobberJobId: { in: jobIds } },
+        select: { jobberJobId: true, jobStatus: true, completedAt: true },
+      })
+    : [];
+  const jobById = new Map(jobs.map((j) => [j.jobberJobId, j]));
+
+  const lastSync = await prisma.syncRun.findFirst({
+    orderBy: { startedAt: "desc" },
+  });
+  // A visit far older than the newest one wasn't refreshed by the last pull —
+  // the signature of a feed that stopped short before reaching it.
+  const newestVisitSync = visits.reduce<Date | null>(
+    (acc, v) => (!acc || v.lastSyncedAt > acc ? v.lastSyncedAt : acc),
+    null
+  );
 
   const totalValue = visits.reduce((acc, v) => acc + (v.estimatedValue || 0), 0);
   const uniqueCustomers = new Set(visits.map((v) => v.clientName).filter(Boolean)).size;
@@ -77,6 +107,35 @@ export default async function OverdueRevenuePage({
         />
       </div>
 
+      {lastSync && (
+        <Card>
+          <CardContent className="space-y-1 py-4 text-xs text-muted-foreground">
+            <p>
+              <span className="font-medium text-foreground">Last sync:</span>{" "}
+              {lastSync.completedAt
+                ? formatDateTime(lastSync.completedAt)
+                : `started ${formatDateTime(lastSync.startedAt)}`}{" "}
+              · status {lastSync.status} ·{" "}
+              {formatNumber(lastSync.visitsFetched)} visits pulled from Jobber
+            </p>
+            {lastSync.errorMessage && (
+              <p className="text-danger">
+                <span className="font-medium">Sync warning:</span>{" "}
+                {lastSync.errorMessage}
+              </p>
+            )}
+            <p>
+              A row still listed here means Jobber itself reports the visit
+              incomplete and its job not closed out. Check the two status
+              columns below: if the job reads complete, tell us the job number.
+              If &quot;row last synced&quot; is older than the others, that row
+              isn&apos;t being refreshed and the sync is the problem, not the
+              data.
+            </p>
+          </CardContent>
+        </Card>
+      )}
+
       <Card>
         <CardHeader>
           <CardTitle>Overdue Visits</CardTitle>
@@ -96,7 +155,9 @@ export default async function OverdueRevenuePage({
                     <th className="px-4 py-2.5 font-medium">Job / Visit</th>
                     <th className="px-4 py-2.5 font-medium">Customer</th>
                     <th className="px-4 py-2.5 font-medium">Scheduled date</th>
-                    <th className="px-4 py-2.5 font-medium">Status</th>
+                    <th className="px-4 py-2.5 font-medium">Visit says</th>
+                    <th className="px-4 py-2.5 font-medium">Job says</th>
+                    <th className="px-4 py-2.5 font-medium">Row last synced</th>
                     <th className="px-4 py-2.5 font-medium">Est. Value</th>
                   </tr>
                 </thead>
@@ -115,6 +176,40 @@ export default async function OverdueRevenuePage({
                       </td>
                       <td className="px-4 py-3">
                         <Badge variant="muted">{v.visitStatus ?? "incomplete"}</Badge>
+                      </td>
+                      <td className="px-4 py-3">
+                        {(() => {
+                          const job = v.jobberJobId
+                            ? jobById.get(v.jobberJobId)
+                            : null;
+                          if (!job) {
+                            return (
+                              <span className="text-xs text-muted-foreground">
+                                job not synced
+                              </span>
+                            );
+                          }
+                          return (
+                            <div>
+                              <Badge variant="muted">
+                                {job.jobStatus ?? "unknown"}
+                              </Badge>
+                              <div className="mt-1 text-xs text-muted-foreground">
+                                {job.completedAt
+                                  ? `completed ${formatDate(job.completedAt)}`
+                                  : "no completion date"}
+                              </div>
+                            </div>
+                          );
+                        })()}
+                      </td>
+                      <td className="px-4 py-3 text-xs text-muted-foreground">
+                        {formatDateTime(v.lastSyncedAt)}
+                        {newestVisitSync &&
+                          v.lastSyncedAt.getTime() <
+                            newestVisitSync.getTime() - 60 * 60 * 1000 && (
+                            <div className="text-danger">not refreshed</div>
+                          )}
                       </td>
                       <td className="px-4 py-3 font-semibold">
                         {formatCurrencyDetailed(v.estimatedValue)}
