@@ -1,6 +1,7 @@
 import { prisma } from "@/lib/prisma";
 import type { DateRange } from "@/lib/dateRange";
 import { getVisitFreshnessCutoff, stillInJobber } from "@/lib/visitFreshness";
+import { perVisitValue } from "@/lib/visitValue";
 import {
   classifyEntry,
   isCrewAccount,
@@ -133,13 +134,12 @@ export async function computeTimesheetData({
    * revenue collapse.
    */
   function visitValueOf(jobberJobId: string): number {
-    const job = jobByJobberId.get(jobberJobId);
-    const total = job?.total ?? 0;
-    if (total <= 0) return 0;
-    if (job?.isRecurring) return total;
-    const count = visitCountByJob.get(jobberJobId) ?? 1;
-    return count > 0 ? total / count : total;
+    return perVisitValue(
+      jobByJobberId.get(jobberJobId),
+      visitCountByJob.get(jobberJobId) ?? 1
+    );
   }
+
 
   /**
    * How many trips a job was serviced in this range.

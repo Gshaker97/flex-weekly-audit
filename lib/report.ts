@@ -217,7 +217,9 @@ export async function buildReport(range: DateRange): Promise<ReportData> {
       value: recurringShare == null ? "—" : formatPercent(recurringShare),
       detail: `${formatCurrencyDetailed(
         kpis.recurringRevenueInRange
-      )} recurring · ${formatCurrencyDetailed(kpis.oneOffRevenueInRange)} one-off`,
+      )} recurring · ${formatCurrencyDetailed(
+        kpis.oneOffRevenueInRange
+      )} one-off, by visits serviced in range`,
     },
     {
       label: "Jobs Not Marked Completed",

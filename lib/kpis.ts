@@ -5,6 +5,7 @@ import {
   getVisitFreshnessCutoff,
   stillInJobber,
 } from "./visitFreshness";
+import { perVisitValue } from "./visitValue";
 
 export interface DashboardKPIs {
   range: DateRange;
@@ -167,12 +168,49 @@ export async function computeDashboardKPIs(
     rangeJobs.length > 0
       ? rangeJobs.reduce((a, j) => a + j.total, 0) / rangeJobs.length
       : 0;
-  const recurringRevenueInRange = rangeJobs
-    .filter((j) => j.isRecurring)
-    .reduce((a, j) => a + j.total, 0);
-  const oneOffRevenueInRange = rangeJobs
-    .filter((j) => !j.isRecurring)
-    .reduce((a, j) => a + j.total, 0);
+  // Recurring vs one-off is measured over WORK DONE, not over jobs that
+  // finished. A recurring maintenance job never completes — it stays active
+  // all season — so it could essentially never enter a completed-jobs set, and
+  // the split read 5% recurring for a business that is mostly maintenance.
+  // Every visit serviced in range counts instead, valued per trip.
+  const doneVisits = await prisma.visitRecord.findMany({
+    where: {
+      visitDate: { gte: range.start, lte: range.end },
+      OR: [{ isComplete: true }, { jobComplete: true }, { hasInvoice: true }],
+      ...stillInJobber(visitCutoff),
+    },
+    select: { jobberJobId: true },
+  });
+  const doneJobIds = Array.from(
+    new Set(doneVisits.map((v) => v.jobberJobId).filter(Boolean))
+  ) as string[];
+  const doneJobs = doneJobIds.length
+    ? await prisma.jobRecord.findMany({
+        where: { jobberJobId: { in: doneJobIds } },
+        select: { jobberJobId: true, total: true, isRecurring: true },
+      })
+    : [];
+  const doneJobById = new Map(doneJobs.map((j) => [j.jobberJobId, j]));
+  const doneVisitCounts = doneJobIds.length
+    ? await prisma.visitRecord.groupBy({
+        by: ["jobberJobId"],
+        where: { jobberJobId: { in: doneJobIds } },
+        _count: { _all: true },
+      })
+    : [];
+  const doneCountByJob = new Map(
+    doneVisitCounts.map((r) => [r.jobberJobId as string, r._count._all])
+  );
+
+  let recurringRevenueInRange = 0;
+  let oneOffRevenueInRange = 0;
+  for (const v of doneVisits) {
+    if (!v.jobberJobId) continue;
+    const job = doneJobById.get(v.jobberJobId);
+    const value = perVisitValue(job, doneCountByJob.get(v.jobberJobId) ?? 1);
+    if (job?.isRecurring) recurringRevenueInRange += value;
+    else oneOffRevenueInRange += value;
+  }
 
   const totalCustomers = await prisma.customer.count();
   const recurringCustomers = await prisma.customer.count({

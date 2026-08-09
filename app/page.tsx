@@ -129,7 +129,7 @@ export default async function DashboardPage({
                   )}%`
                 : "—"
             }
-            sublabel="Recurring share of revenue"
+            sublabel="Recurring share of work done in range"
             icon={<Repeat size={18} />}
           />
         </div>
@@ -215,7 +215,7 @@ export default async function DashboardPage({
                   )}%`
                 : "—"
             }
-            sublabel="One-off share of revenue"
+            sublabel="One-off share of work done in range"
             icon={<TrendingUp size={18} />}
           />
         </div>
