@@ -289,6 +289,10 @@ export async function computeTimesheetData({
   const longEntries = entries.filter(
     (e) => (e.durationSeconds || 0) > LONG_ENTRY_SECONDS
   );
+  // Sorted worst-first so the breakout reads as a work-through list.
+  const longEntriesSorted = [...longEntries].sort(
+    (a, b) => (b.durationSeconds || 0) - (a.durationSeconds || 0)
+  );
   const longEntrySeconds = longEntries.reduce(
     (a, e) => a + (e.durationSeconds || 0),
     0
@@ -556,7 +560,9 @@ export async function computeTimesheetData({
     visitCoverage,
     LONG_ENTRY_SECONDS,
     longEntries,
+    longEntriesSorted,
     longEntrySeconds,
+    normalSeconds: totalSeconds - longEntrySeconds,
     labourCost,
     hasCost,
     workedByJob,

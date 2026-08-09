@@ -21,6 +21,7 @@ import {
   formatDuration,
   formatHoursDecimal,
   formatDate,
+  formatNumber,
 } from "@/lib/utils";
 import {
   Clock,
@@ -90,7 +91,9 @@ export default async function TimesheetsPage({
     visitCoverage,
     LONG_ENTRY_SECONDS,
     longEntries,
+    longEntriesSorted,
     longEntrySeconds,
+    normalSeconds,
     labourCost,
     hasCost,
     workedByJob,
@@ -171,7 +174,13 @@ export default async function TimesheetsPage({
               label="Total Hours"
               value={`${formatHoursDecimal(totalSeconds)} h`}
               sublabel={
-                generalSeconds > 0
+                longEntrySeconds > 0
+                  ? `${formatHoursDecimal(
+                      normalSeconds
+                    )} h normal · ${formatHoursDecimal(
+                      longEntrySeconds
+                    )} h in flagged timers`
+                  : generalSeconds > 0
                   ? `${formatHoursDecimal(onJobSeconds)} h on jobs · ${formatHoursDecimal(
                       generalSeconds
                     )} h general`
@@ -439,6 +448,77 @@ export default async function TimesheetsPage({
               )}
             </CardContent>
           </Card>
+
+          {longEntriesSorted.length > 0 && (
+            <Card>
+              <CardHeader>
+                <CardTitle>Timers Over 14 Hours</CardTitle>
+                <CardDescription>
+                  {formatDuration(longEntrySeconds)} across{" "}
+                  {formatNumber(longEntriesSorted.length)}{" "}
+                  {longEntriesSorted.length === 1 ? "entry" : "entries"} —{" "}
+                  {totalSeconds > 0
+                    ? Math.round((longEntrySeconds / totalSeconds) * 100)
+                    : 0}
+                  % of all logged time. Almost always a timer nobody stopped.
+                  These are still counted in every figure above; they are broken
+                  out here so you can see what the hours would look like without
+                  them ({formatDuration(normalSeconds)} normal). Longest first.
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                <div className="overflow-x-auto rounded-lg border border-border">
+                  <table className="w-full min-w-[720px] text-sm">
+                    <thead className="bg-muted/50">
+                      <tr className="text-left text-xs uppercase tracking-wide text-muted-foreground">
+                        <th className="px-4 py-2.5 font-medium">Date</th>
+                        <th className="px-4 py-2.5 font-medium">Logged by</th>
+                        <th className="px-4 py-2.5 font-medium">Customer</th>
+                        <th className="px-4 py-2.5 font-medium">Job</th>
+                        <th className="px-4 py-2.5 font-medium">Duration</th>
+                        <th className="px-4 py-2.5 font-medium">Approved</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-border">
+                      {longEntriesSorted.map((e) => (
+                        <tr key={e.id} className="hover:bg-muted/30">
+                          <td className="px-4 py-3 text-muted-foreground">
+                            {formatDate(e.occurredAt)}
+                          </td>
+                          <td className="px-4 py-3">{e.employeeName ?? "—"}</td>
+                          <td className="px-4 py-3">{e.clientName ?? "—"}</td>
+                          <td className="px-4 py-3">
+                            {e.jobNumber ? (
+                              <>
+                                <div className="font-medium">#{e.jobNumber}</div>
+                                <div className="text-xs text-muted-foreground">
+                                  {e.jobTitle ?? ""}
+                                </div>
+                              </>
+                            ) : (
+                              <span className="text-muted-foreground">
+                                General (no job)
+                              </span>
+                            )}
+                          </td>
+                          <td className="px-4 py-3 font-semibold text-warning">
+                            {formatDuration(e.durationSeconds)}
+                          </td>
+                          <td className="px-4 py-3">
+                            {e.approved ? (
+                              <Badge variant="muted">Approved</Badge>
+                            ) : (
+                              <Badge variant="warning">Not approved</Badge>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </CardContent>
+            </Card>
+          )}
 
           <Card>
             <CardHeader>

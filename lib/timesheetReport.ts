@@ -134,13 +134,18 @@ export async function buildTimesheetReport(opts: {
       )} entries clocked without a job attached`,
     },
     {
-      label: "Entries Over 14 Hours",
-      value: formatNumber(d.longEntries.length),
+      label: "Flagged Timers (14 h+)",
+      value:
+        d.longEntries.length > 0
+          ? `${formatHoursDecimal(d.longEntrySeconds)} h`
+          : "0 h",
       detail:
         d.longEntries.length > 0
-          ? `${formatHoursDecimal(
-              d.longEntrySeconds
-            )} h — usually a timer left running`
+          ? `${formatNumber(d.longEntries.length)} entries · ${Math.round(
+              (d.longEntrySeconds / d.totalSeconds) * 100
+            )}% of logged time · ${formatHoursDecimal(
+              d.normalSeconds
+            )} h without them`
           : "None — no runaway timers",
     },
   ];
@@ -264,6 +269,33 @@ export async function buildTimesheetReport(opts: {
         j.lastScheduled,
       ]) as CellValue[][],
   });
+
+  if (d.longEntriesSorted.length > 0) {
+    sections.push({
+      key: "long-entries",
+      title: "Timers Over 14 Hours",
+      description:
+        "Entries almost certainly left running. Still counted in every figure above and in the sections below — listed separately so they can be worked through and fixed in Jobber. Longest first.",
+      columns: [
+        { header: "Date", type: "date" },
+        { header: "Logged By", type: "text" },
+        { header: "Customer", type: "text" },
+        { header: "Job #", type: "text" },
+        { header: "Job Title", type: "text" },
+        { header: "Hours", type: "number" },
+        { header: "Approved", type: "bool" },
+      ],
+      rows: d.longEntriesSorted.map((e) => [
+        e.occurredAt,
+        e.employeeName,
+        e.clientName,
+        e.jobNumber ? `#${e.jobNumber}` : "General (no job)",
+        e.jobTitle,
+        hours(e.durationSeconds || 0),
+        e.approved,
+      ]) as CellValue[][],
+    });
+  }
 
   sections.push({
     key: "entries",
