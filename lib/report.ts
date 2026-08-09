@@ -199,7 +199,13 @@ export async function buildReport(range: DateRange): Promise<ReportData> {
     {
       label: "Average Job Value",
       value: formatCurrencyDetailed(kpis.averageJobValue),
-      detail: `${formatNumber(completedJobs.length)} jobs completed in range`,
+      // The average covers only jobs that carry a value, so quoting the full
+      // completed count next to it overstated what it was averaged over.
+      detail: `${formatNumber(
+        completedJobs.filter((j) => (j.total || 0) > 0).length
+      )} of ${formatNumber(
+        completedJobs.length
+      )} completed jobs carry a value`,
     },
     {
       label: "Outstanding Receivables",

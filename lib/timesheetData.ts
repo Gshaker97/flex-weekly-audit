@@ -1,5 +1,6 @@
 import { prisma } from "@/lib/prisma";
 import type { DateRange } from "@/lib/dateRange";
+import { getVisitFreshnessCutoff, stillInJobber } from "@/lib/visitFreshness";
 import {
   classifyEntry,
   isCrewAccount,
@@ -57,8 +58,16 @@ export async function computeTimesheetData({
   // Every visit SCHEDULED in the range, whether or not anyone clocked into it.
   // This is the basis Jobber's own "Recent visits" widget uses, and it's what
   // makes the coverage row below able to reconcile against it.
+  // Same exclusion the dashboard applies: a visit the latest healthy pull no
+  // longer returned was rescheduled or removed in Jobber. Counting it here
+  // would inflate Expected Revenue with work that no longer exists, and make
+  // this page disagree with the risk cards.
+  const visitCutoff = await getVisitFreshnessCutoff();
   const scheduledVisits = await prisma.visitRecord.findMany({
-    where: { visitDate: { gte: range.start, lte: range.end } },
+    where: {
+      visitDate: { gte: range.start, lte: range.end },
+      ...stillInJobber(visitCutoff),
+    },
     select: {
       jobberVisitId: true,
       jobberJobId: true,

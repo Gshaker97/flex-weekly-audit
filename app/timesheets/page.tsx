@@ -235,14 +235,23 @@ export default async function TimesheetsPage({
               label="Labor Cost vs Revenue"
               value={hasCost ? formatCurrency(labourCost) : "—"}
               sublabel={
-                hasCost
-                  ? labourShare != null
+                !hasCost
+                  ? "Set an hourly rate above to cost these hours"
+                  : // Quoting a share of revenue off a sliver of the hours
+                    // reads as a real labour ratio when it isn't. Say what
+                    // the figure actually covers until it covers most of it.
+                    costedSeconds < totalSeconds * 0.9
+                    ? `Only ${formatHoursDecimal(
+                        costedSeconds
+                      )} of ${formatHoursDecimal(
+                        totalSeconds
+                      )} h carry a rate — set one above`
+                    : labourShare != null
                     ? `${labourShare.toFixed(1)}% of the revenue generated`
                     : "Wages for the hours logged"
-                  : "Set an hourly rate above to cost these hours"
               }
               accent={
-                labourShare == null
+                labourShare == null || costedSeconds < totalSeconds * 0.9
                   ? "default"
                   : labourShare > 50
                   ? "danger"
