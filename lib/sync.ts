@@ -5,6 +5,7 @@ import {
   fetchAllInvoices,
   fetchAllJobTimesheets,
   fetchAllJobVisits,
+  takePaginationWarnings,
   JobberJobNode,
   JobberClientNode,
   JobberInvoiceNode,
@@ -180,9 +181,15 @@ export async function runFullSync(
     try {
       const visits = await fetchAllJobVisits(since);
       await upsertVisits(visits);
+      const warnings = takePaginationWarnings();
       await prisma.syncRun.update({
         where: { id: run.id },
-        data: { visitsFetched: visits.length },
+        data: {
+          visitsFetched: visits.length,
+          // A truncated pull is not an error, but it silently leaves the
+          // newest records stale — so it has to be recorded, not just logged.
+          ...(warnings.length ? { errorMessage: warnings.join(" · ") } : {}),
+        },
       });
     } catch (err: any) {
       // Recorded, not just logged: a silent failure here is indistinguishable

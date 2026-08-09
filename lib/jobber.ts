@@ -473,6 +473,18 @@ export interface JobberInvoiceNode {
   client: { id: string; name?: string | null; companyName?: string | null } | null;
 }
 
+// Raised from 500. At 100 records a page that was a 50k ceiling, which a
+// recurring-visit feed can exceed after a few years — and Jobber returns the
+// newest last, so the ceiling silently starved exactly the records that matter.
+const MAX_PAGES = 3000;
+
+// Feeds truncated during this process, drained by the sync for reporting.
+const paginationWarnings: string[] = [];
+
+export function takePaginationWarnings(): string[] {
+  return paginationWarnings.splice(0, paginationWarnings.length);
+}
+
 async function paginate<T>(
   query: string,
   rootKey: string,
@@ -494,8 +506,15 @@ async function paginate<T>(
     hasNext = block?.pageInfo?.hasNextPage ?? false;
     after = block?.pageInfo?.endCursor ?? null;
     page += 1;
-    if (page > 500) {
-      logError(`paginate: stopping at 500 pages for ${rootKey}`);
+    if (page > MAX_PAGES) {
+      // A truncated pull leaves the tail of the feed stale forever, and the
+      // newest records sort last — so this must be visible in the UI, not just
+      // in a log line nobody reads.
+      logError(`paginate: stopping at ${MAX_PAGES} pages for ${rootKey}`);
+      paginationWarnings.push(
+        `${rootKey}: stopped after ${MAX_PAGES} pages (${out.length} records) — ` +
+          `the newest ${rootKey} may be missing or stale`
+      );
       break;
     }
     if (hasNext) await new Promise((r) => setTimeout(r, delayMs));
