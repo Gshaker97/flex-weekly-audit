@@ -581,7 +581,9 @@ async function fetchIncremental<T>(
   }
   try {
     const r = await paginate<T>(injectSince(query, since), rootKey);
-    log(`[sync] ${label}: incremental ok (${r.length} changed since ${since.toISOString()})`);
+    log(
+      `[sync] ${label}: incremental ok — ${r.length} changed since ${since.toISOString()} (full pull avoided)`
+    );
     return r;
   } catch (e: any) {
     logError(`[sync] ${label}: incremental filter rejected (${e?.message ?? e}) — falling back to full pull`);
@@ -593,7 +595,13 @@ async function fetchIncremental<T>(
 
 export async function fetchAllJobs(since: Date | null = null): Promise<JobberJobNode[]> {
   // Jobber's JobFilterAttributes has no updatedAt — always full pull.
-  return fetchIncremental<JobberJobNode>(JOBS_QUERY, "jobs", since, "jobs", false);
+  // Attempt the updatedAt filter rather than assuming it is unsupported. It
+  // was hard-coded off, so every sync re-pulled all ~2,500 jobs — around a
+  // quarter of the pages fetched — even when nothing had changed.
+  // fetchIncremental falls back to the full pull on any error, so the worst
+  // case is one wasted request, and the weekly full reconcile still catches
+  // anything an incremental pull misses.
+  return fetchIncremental<JobberJobNode>(JOBS_QUERY, "jobs", since, "jobs");
 }
 
 export async function fetchAllClients(since: Date | null = null): Promise<JobberClientNode[]> {
@@ -666,6 +674,12 @@ function isRecurringVisitJob(
 
 export async function fetchAllJobVisits(since: Date | null = null): Promise<FlatVisit[]> {
   // Jobber's VisitFilterAttributes has no updatedAt — always full pull.
+  // Visits MUST stay a full pull, and not only because Jobber rejects the
+  // filter here. The dashboard decides a visit was deleted or rescheduled in
+  // Jobber by noticing that the latest pull stopped returning it — that is what
+  // cleared 102 phantom rows from "not marked as completed". An incremental
+  // visit pull returns only what changed, so every untouched visit would look
+  // deleted and the risk cards would empty out. Full pull by design.
   const visits = await fetchIncremental<FlatVisitNode>(VISITS_QUERY, "visits", since, "visits", false);
   return visits.map((v) => {
     const jobTotal = v.job?.total != null ? Number(v.job.total) : 0;
