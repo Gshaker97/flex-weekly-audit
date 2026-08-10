@@ -239,10 +239,11 @@ export async function computeTimesheetData({
   const entries = rows.map((r) => r.entry);
 
   // ------------------------------------------------------------------ KPIs
-  // Jobber's "General" bucket is time clocked without a job attached — travel,
-  // shop time, breaks, or a timer nobody stopped. It is real payroll but it
-  // isn't work on a job, so it stays out of the per-job figures and is
-  // reported on its own rather than quietly inflating every average.
+  // Jobber's "General" bucket is time clocked against a crew account with no
+  // specific job attached — at Flexx that is how the crews log much of their
+  // day, so it is real crew time rather than an oddity. There is simply no job
+  // to attribute it to, so it stays out of the per-job figures and is reported
+  // on its own instead of quietly inflating every per-job average.
   const onJobRows = rows.filter(
     (r) => r.entry.jobberJobId || r.entry.jobNumber
   );
