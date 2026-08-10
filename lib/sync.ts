@@ -45,7 +45,11 @@ function hasNoInvoiceNote(notesText: string): boolean {
 // Run an async op over many items with bounded concurrency. The old code awaited
 // each upsert one at a time (thousands of sequential round-trips → multi-minute
 // syncs). A small batch size parallelizes without exhausting the DB pool.
-const DB_BATCH_SIZE = 10;
+// Concurrent writes per batch. Each upsert is a round trip to Railway's
+// Postgres, so this is latency-bound rather than CPU-bound; Prisma queues
+// anything beyond the pool, so a larger batch costs nothing when the pool is
+// small and saves real time when it isn't.
+const DB_BATCH_SIZE = 25;
 async function inBatches<T>(
   items: T[],
   fn: (item: T) => Promise<void>,
@@ -53,6 +57,16 @@ async function inBatches<T>(
 ): Promise<void> {
   for (let i = 0; i < items.length; i += size) {
     await Promise.all(items.slice(i, i + size).map(fn));
+  }
+}
+
+/** Times a sync step and logs it, so a slow sync names its own bottleneck. */
+async function step<T>(name: string, fn: () => Promise<T>): Promise<T> {
+  const started = Date.now();
+  try {
+    return await fn();
+  } finally {
+    log(`[sync] step ${name} took ${((Date.now() - started) / 1000).toFixed(1)}s`);
   }
 }
 
@@ -146,12 +160,57 @@ export async function runFullSync(
       data: { customersFetched: clientNodes.length },
     });
 
-    const jobNodes = await fetchAllJobs(since);
-    await upsertJobs(jobNodes);
-    await prisma.syncRun.update({
-      where: { id: run.id },
-      data: { jobsFetched: jobNodes.length },
-    });
+    // Jobs and visits are the two heavy feeds — neither accepts an updatedAt
+    // filter, so both pull in full every sync and together they are the large
+    // majority of the pages fetched. They are independent of each other and
+    // write to different tables, so they run side by side rather than one
+    // after the other. Jobber throttles on query cost; jobberGraphQL already
+    // backs off on a THROTTLED reply and the page delay widens with it, so
+    // overlapping them degrades into the old behaviour rather than failing.
+    // Settled into a value rather than left as a rejectable promise: nothing
+    // awaits this until after the invoice and timesheet steps, and an
+    // unhandled rejection in that window takes the whole process down.
+    const heavyFeeds = Promise.all([
+      (async () => {
+        const jobNodes = await step("jobs", () => fetchAllJobs(since));
+        await step("jobs:write", () => upsertJobs(jobNodes));
+        await prisma.syncRun.update({
+          where: { id: run.id },
+          data: { jobsFetched: jobNodes.length },
+        });
+      })(),
+      // Visits are best-effort: they drive the visit-level Overdue/Uninvoiced
+      // tabs, and a failure here must not take the rest of the sync with it.
+      (async () => {
+        try {
+          const visits = await step("visits", () => fetchAllJobVisits(since));
+          await step("visits:write", () => upsertVisits(visits));
+          const warnings = takePaginationWarnings();
+          await prisma.syncRun.update({
+            where: { id: run.id },
+            data: {
+              visitsFetched: visits.length,
+              // A truncated pull is not an error, but it silently leaves the
+              // newest records stale — so it has to be recorded, not just logged.
+              ...(warnings.length ? { errorMessage: warnings.join(" · ") } : {}),
+            },
+          });
+        } catch (err: any) {
+          // Recorded, not just logged: a silent failure here is
+          // indistinguishable from "I re-synced and nothing changed".
+          logError("Visit sync failed (continuing):", err?.message ?? err);
+          await prisma.syncRun
+            .update({
+              where: { id: run.id },
+              data: { errorMessage: `Visit sync failed: ${err?.message ?? err}` },
+            })
+            .catch(() => {});
+        }
+      })(),
+    ]).then(
+      () => ({ ok: true as const }),
+      (err: any) => ({ ok: false as const, err })
+    );
 
     // Backfill: full invoice pull scoped to invoices issued on/after 2026-01-01,
     // replacing the incremental updatedAt filter for invoices. (Temporary — revert
@@ -176,50 +235,25 @@ export async function runFullSync(
       logError("Timesheet sync failed (continuing):", err?.message ?? err);
     }
 
-    // Visits are best-effort too. Drives the visit-level Overdue/Uninvoiced tabs.
-    log("[sync] step: visits");
-    try {
-      const visits = await fetchAllJobVisits(since);
-      await upsertVisits(visits);
-      const warnings = takePaginationWarnings();
-      await prisma.syncRun.update({
-        where: { id: run.id },
-        data: {
-          visitsFetched: visits.length,
-          // A truncated pull is not an error, but it silently leaves the
-          // newest records stale — so it has to be recorded, not just logged.
-          ...(warnings.length ? { errorMessage: warnings.join(" · ") } : {}),
-        },
-      });
-    } catch (err: any) {
-      // Recorded, not just logged: a silent failure here is indistinguishable
-      // from "I re-synced and nothing changed".
-      logError("Visit sync failed (continuing):", err?.message ?? err);
-      await prisma.syncRun
-        .update({
-          where: { id: run.id },
-          data: {
-            errorMessage: `Visit sync failed: ${err?.message ?? err}`,
-          },
-        })
-        .catch(() => {});
-    }
+    // Everything after this point reads jobs and visits together.
+    const heavy = await step("jobs+visits", () => heavyFeeds);
+    if (!heavy.ok) throw heavy.err;
 
     // Stamp the "No Invoice" note flag onto visits so the Uninvoiced Revenue
     // metric excludes intentionally-uninvoiced jobs and all their visits.
     log("[sync] step: reconcileVisitNoInvoiceFlags");
-    await reconcileVisitNoInvoiceFlags();
+    await step("reconcileVisitNoInvoiceFlags", () => reconcileVisitNoInvoiceFlags());
 
     // Visits whose job was closed out without each visit being ticked complete.
     log("[sync] step: reconcileVisitJobCompletion");
-    await reconcileVisitJobCompletion();
+    await step("reconcileVisitJobCompletion", () => reconcileVisitJobCompletion());
 
     log("[sync] step: recomputeCustomerAggregates");
-    await recomputeCustomerAggregates();
+    await step("recomputeCustomerAggregates", () => recomputeCustomerAggregates());
     log("[sync] step: recomputeMonthlySnapshots");
-    await recomputeMonthlySnapshots();
+    await step("recomputeMonthlySnapshots", () => recomputeMonthlySnapshots());
     log("[sync] step: recomputeServiceTypeRevenue");
-    await recomputeServiceTypeRevenue();
+    await step("recomputeServiceTypeRevenue", () => recomputeServiceTypeRevenue());
 
     // Mirror invoices into the GHL "Invoice Pipeline" (Sent / Overdue / Paid /
     // Canceled by status). Best-effort: a GHL outage or missing config (no API
@@ -935,13 +969,119 @@ async function upsertTimeEntries(entries: FlatTimeEntry[]) {
   });
 }
 
+/** Everything upsertVisits writes, flattened so two versions can be compared. */
+function visitSignature(v: {
+  jobberJobId: string | null;
+  jobNumber: string | null;
+  title: string | null;
+  clientName: string | null;
+  isComplete: boolean;
+  visitStatus: string | null;
+  visitDate: Date | null;
+  startAt: Date | null;
+  endAt: Date | null;
+  completedAt: Date | null;
+  hasInvoice: boolean;
+  estimatedValue: number;
+}): string {
+  const t = (d: Date | null) => (d ? d.getTime() : 0);
+  return [
+    v.jobberJobId ?? "",
+    v.jobNumber ?? "",
+    v.title ?? "",
+    v.clientName ?? "",
+    v.isComplete ? 1 : 0,
+    v.visitStatus ?? "",
+    t(v.visitDate),
+    t(v.startAt),
+    t(v.endAt),
+    t(v.completedAt),
+    v.hasInvoice ? 1 : 0,
+    Math.round((v.estimatedValue ?? 0) * 100),
+  ].join("|");
+}
+
 async function upsertVisits(visits: FlatVisit[]) {
-  await inBatches(visits, async (v) => {
+  // The visit feed is the largest by far and barely changes between syncs —
+  // rewriting every row was the bulk of the database time. Read the current
+  // rows once, write only what actually differs.
+  //
+  // Unchanged rows still need lastSyncedAt moved forward: that timestamp is
+  // what marks a visit as still present in Jobber, and leaving it behind would
+  // make every untouched visit look like it had been deleted there.
+  const now = new Date();
+  const incoming = visits.map((v) => {
     const start = v.startAt ? new Date(v.startAt) : null;
     const end = v.endAt ? new Date(v.endAt) : null;
     const completed = v.completedAt ? new Date(v.completedAt) : null;
-    // Effective date used for range filtering and overdue checks
-    const visitDate = end ?? start ?? completed ?? null;
+    return {
+      flat: v,
+      visitDate: end ?? start ?? completed ?? null,
+      start,
+      end,
+      completed,
+    };
+  });
+
+  const existing = new Map<string, string>();
+  const ids = incoming.map((i) => i.flat.jobberVisitId);
+  for (let i = 0; i < ids.length; i += 2000) {
+    const rows = await prisma.visitRecord.findMany({
+      where: { jobberVisitId: { in: ids.slice(i, i + 2000) } },
+      select: {
+        jobberVisitId: true,
+        jobberJobId: true,
+        jobNumber: true,
+        title: true,
+        clientName: true,
+        isComplete: true,
+        visitStatus: true,
+        visitDate: true,
+        startAt: true,
+        endAt: true,
+        completedAt: true,
+        hasInvoice: true,
+        estimatedValue: true,
+      },
+    });
+    for (const r of rows) existing.set(r.jobberVisitId, visitSignature(r));
+  }
+
+  const changed: typeof incoming = [];
+  const unchangedIds: string[] = [];
+  for (const item of incoming) {
+    const v = item.flat;
+    const next = visitSignature({
+      jobberJobId: v.jobberJobId,
+      jobNumber: v.jobNumber,
+      title: v.title,
+      clientName: v.clientName,
+      isComplete: v.isComplete,
+      visitStatus: v.visitStatus,
+      visitDate: item.visitDate,
+      startAt: item.start,
+      endAt: item.end,
+      completedAt: item.completed,
+      hasInvoice: v.hasInvoice,
+      estimatedValue: v.estimatedValue,
+    });
+    const prev = existing.get(v.jobberVisitId);
+    if (prev !== undefined && prev === next) unchangedIds.push(v.jobberVisitId);
+    else changed.push(item);
+  }
+
+  // One cheap statement per chunk keeps the untouched rows marked as present.
+  for (let i = 0; i < unchangedIds.length; i += 2000) {
+    await prisma.visitRecord.updateMany({
+      where: { jobberVisitId: { in: unchangedIds.slice(i, i + 2000) } },
+      data: { lastSyncedAt: now },
+    });
+  }
+  log(
+    `[sync] visits: ${changed.length} changed, ${unchangedIds.length} unchanged (timestamp only)`
+  );
+
+  await inBatches(changed, async ({ flat: v, visitDate, start, end, completed }) => {
     await prisma.visitRecord.upsert({
       where: { jobberVisitId: v.jobberVisitId },
       create: {
