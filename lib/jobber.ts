@@ -147,6 +147,7 @@ export async function jobberGraphQL<T = any>(
       clearTimeout(timer);
     }
     if (res.status === 429) {
+      noteThrottle();
       const waitMs = 5000 * (attempt + 1);
       await new Promise((r) => setTimeout(r, waitMs));
       attempt += 1;
@@ -162,6 +163,7 @@ export async function jobberGraphQL<T = any>(
         (e: any) => e.extensions?.code === "THROTTLED" || /throttl/i.test(e.message)
       );
       if (isThrottled && attempt < maxAttempts - 1) {
+        noteThrottle();
         const waitMs = 8000 * (attempt + 1);
         await new Promise((r) => setTimeout(r, waitMs));
         attempt += 1;
@@ -485,11 +487,29 @@ export function takePaginationWarnings(): string[] {
   return paginationWarnings.splice(0, paginationWarnings.length);
 }
 
+// Pace between pages. Jobber throttles on query cost and jobberGraphQL already
+// backs off hard on a 429 or a THROTTLED error, so a flat 600ms on every page
+// was paying a worst-case toll on every request: over a hundred pages a sync,
+// that alone was more than a minute of deliberate waiting. Start light, back
+// off when Jobber actually complains, and ease back down when it stops.
+const PAGE_DELAY_MIN_MS = 200;
+const PAGE_DELAY_MAX_MS = 1500;
+let pageDelayMs = PAGE_DELAY_MIN_MS;
+
+export function noteThrottle() {
+  pageDelayMs = Math.min(PAGE_DELAY_MAX_MS, Math.max(400, pageDelayMs * 2));
+}
+
+function easePageDelay() {
+  if (pageDelayMs > PAGE_DELAY_MIN_MS) {
+    pageDelayMs = Math.max(PAGE_DELAY_MIN_MS, Math.round(pageDelayMs * 0.8));
+  }
+}
+
 async function paginate<T>(
   query: string,
   rootKey: string,
-  baseVars: Record<string, any> = {},
-  delayMs = 600
+  baseVars: Record<string, any> = {}
 ): Promise<T[]> {
   const out: T[] = [];
   let after: string | null = null;
@@ -517,7 +537,10 @@ async function paginate<T>(
       );
       break;
     }
-    if (hasNext) await new Promise((r) => setTimeout(r, delayMs));
+    if (hasNext) {
+      easePageDelay();
+      await new Promise((r) => setTimeout(r, pageDelayMs));
+    }
   }
   return out;
 }
