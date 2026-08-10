@@ -127,11 +127,11 @@ export async function buildTimesheetReport(opts: {
           : "Nothing scheduled to compare against",
     },
     {
-      label: "General (No Job)",
+      label: "General (Crew, No Job)",
       value: `${formatHoursDecimal(d.generalSeconds)} h`,
       detail: `${formatNumber(
         d.generalRows.length
-      )} entries clocked without a job attached`,
+      )} entries clocked to a crew with no job attached`,
     },
     {
       label: "Flagged Timers (14 h+)",
@@ -301,7 +301,7 @@ export async function buildTimesheetReport(opts: {
     key: "entries",
     title: "Time Entries",
     description:
-      "Every entry logged in range, newest first. \"General\" means no job was attached.",
+      "Every entry logged in range, newest first. \"General\" means the time was clocked to a crew account with no specific job attached.",
     columns: [
       { header: "Date", type: "date" },
       { header: "Crew / Team Member", type: "text" },

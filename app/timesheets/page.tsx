@@ -423,11 +423,13 @@ export default async function TimesheetsPage({
                     General (not on a job):
                   </span>{" "}
                   {formatDuration(generalSeconds)} across {generalRows.length}{" "}
-                  {generalRows.length === 1 ? "entry" : "entries"} — Jobber&apos;s
-                  General bucket is time clocked without a job attached (travel, shop
-                  time, breaks, or a timer left running). It counts toward total hours
-                  and labor cost but is left out of the per-job table and the per-job
-                  averages.
+                  {generalRows.length === 1 ? "entry" : "entries"} — time clocked
+                  against a crew account without a specific job attached, which is
+                  how the crews log much of their day. It is real crew time and
+                  counts toward total hours and labor cost, but there is no job to
+                  attribute it to, so it stays out of the per-job table and the
+                  per-job averages. Getting more of it clocked against a job is what
+                  moves work out of here and into the numbers below.
                 </p>
               )}
               {longEntries.length > 0 && (
