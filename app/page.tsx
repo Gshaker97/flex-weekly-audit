@@ -9,6 +9,7 @@ import { StatCard } from "@/components/ui/StatCard";
 import { ClickableStatCard } from "@/components/ui/ClickableStatCard";
 import DateRangeFilter from "@/components/ui/DateRangeFilter";
 import DownloadReportButton from "@/components/ui/DownloadReportButton";
+import SyncStatusWatcher from "@/components/ui/SyncStatusWatcher";
 import RevenueLineChart from "@/components/ui/RevenueLineChart";
 import NewCustomersBarChart from "@/components/ui/NewCustomersBarChart";
 import SyncButton from "./SyncButton";
@@ -351,6 +352,9 @@ function DashboardHeader({
         </p>
       </div>
       <div className="flex flex-wrap items-center gap-3">
+        <SyncStatusWatcher
+          renderedAt={lastSyncAt ? lastSyncAt.getTime() : null}
+        />
         <DateRangeFilter />
         <DownloadReportButton />
         <SyncButton />

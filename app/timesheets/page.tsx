@@ -4,6 +4,7 @@ import { StatCard } from "@/components/ui/StatCard";
 import DateRangeFilter from "@/components/ui/DateRangeFilter";
 import SegmentToggle from "@/components/ui/SegmentToggle";
 import DownloadReportButton from "@/components/ui/DownloadReportButton";
+import SyncStatusWatcher from "@/components/ui/SyncStatusWatcher";
 import LabourRateInput from "@/components/ui/LabourRateInput";
 import { resolveDateRange, getDateRange } from "@/lib/dateRange";
 import { computeTimesheetData, HOUR } from "@/lib/timesheetData";
@@ -97,6 +98,7 @@ export default async function TimesheetsPage({
     labourCost,
     hasCost,
     workedByJob,
+    lastSyncAt,
     jobRevenue,
     scheduledInSegment,
     scheduledJobIds,
@@ -134,6 +136,9 @@ export default async function TimesheetsPage({
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-3">
+          <SyncStatusWatcher
+            renderedAt={lastSyncAt ? lastSyncAt.getTime() : null}
+          />
           <SegmentToggle current={segmentFilter} />
           <LabourRateInput current={manualRate} />
           <DateRangeFilter defaultPreset="allTime" />

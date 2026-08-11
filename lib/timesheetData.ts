@@ -64,6 +64,14 @@ export async function computeTimesheetData({
   // would inflate Expected Revenue with work that no longer exists, and make
   // this page disagree with the risk cards.
   const visitCutoff = await getVisitFreshnessCutoff();
+  // When the data on this page was last refreshed from Jobber, so the page can
+  // tell whether a newer sync has landed underneath it.
+  const lastSync = await prisma.syncRun.findFirst({
+    where: { status: "complete" },
+    orderBy: { completedAt: "desc" },
+    select: { completedAt: true },
+  });
+
   const scheduledVisits = await prisma.visitRecord.findMany({
     where: {
       visitDate: { gte: range.start, lte: range.end },
@@ -528,6 +536,7 @@ export async function computeTimesheetData({
   const crewAccountsOnly =
     loggingAccounts.length > 0 && loggingAccounts.every(isCrewAccount);
   return {
+    lastSyncAt: lastSync?.completedAt ?? null,
     visitValueOf,
     allEntries,
     scheduledVisits,
