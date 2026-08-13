@@ -12,6 +12,7 @@ import {
   FlatTimeEntry,
   FlatVisit,
   concatJobNotes,
+  jobberGraphQL,
 } from "./jobber";
 import {
   getInvoicePipelineRefs,
@@ -254,6 +255,16 @@ export async function runFullSync(
     await step("recomputeMonthlySnapshots", () => recomputeMonthlySnapshots());
     log("[sync] step: recomputeServiceTypeRevenue");
     await step("recomputeServiceTypeRevenue", () => recomputeServiceTypeRevenue());
+
+    // Void invoices that were deleted in Jobber before mirroring to GHL, so a
+    // stale past_due record can't keep dunning a customer who no longer owes.
+    // Best-effort: a Jobber hiccup here must not fail the whole sync.
+    try {
+      log("[sync] step: reconcileDeletedInvoices");
+      await reconcileDeletedInvoices();
+    } catch (err: any) {
+      logError("Deleted-invoice reconciliation failed (continuing):", err?.message ?? err);
+    }
 
     // Mirror invoices into the GHL "Invoice Pipeline" (Sent / Overdue / Paid /
     // Canceled by status). Best-effort: a GHL outage or missing config (no API
@@ -619,6 +630,68 @@ function skipForSync(inv: {
   amountDue: number | null;
 }): boolean {
   return isOldOrZeroInvoice(inv) || (inv.amountDue ?? 0) <= 0;
+}
+
+// Reconcile invoices that were DELETED in Jobber. The incremental sync only ever
+// adds/updates invoices Jobber returns; a deleted invoice simply stops appearing,
+// so its last-known status is frozen forever. A past_due one stays past_due and
+// keeps driving the GHL Overdue pipeline — dunning a customer who no longer owes.
+// Here we re-check every still-open invoice (issued since the cutoff) against
+// Jobber by id; any that Jobber no longer returns is voided so it drops out of
+// past_due everywhere (dashboard + GHL). Returns how many were voided.
+async function reconcileDeletedInvoices(): Promise<number> {
+  const open = await prisma.invoiceRecord.findMany({
+    where: {
+      invoiceStatus: { in: ["past_due", "awaiting_payment"] },
+      issuedAt: { gte: GHL_SYNC_SINCE },
+    },
+    select: { id: true, jobberInvoiceId: true },
+  });
+  if (open.length === 0) {
+    log("[sync] reconcile deleted invoices — checked=0 voided=0");
+    return 0;
+  }
+
+  const BATCH = 25;
+  const missingIds: string[] = [];
+  for (let i = 0; i < open.length; i += BATCH) {
+    const slice = open.slice(i, i + BATCH);
+    // One aliased query per batch: i0: invoice(id:$id0){id} i1: … — a null field
+    // means Jobber no longer has that invoice (deleted).
+    const varDefs = slice.map((_, j) => `$id${j}: EncodedId!`).join(", ");
+    const fields = slice
+      .map((_, j) => `i${j}: invoice(id: $id${j}) { id }`)
+      .join(" ");
+    const variables: Record<string, string> = {};
+    slice.forEach((inv, j) => {
+      variables[`id${j}`] = inv.jobberInvoiceId;
+    });
+    try {
+      const data = await jobberGraphQL<Record<string, { id: string } | null>>(
+        `query(${varDefs}) { ${fields} }`,
+        variables
+      );
+      slice.forEach((inv, j) => {
+        if (data[`i${j}`] === null) missingIds.push(inv.id);
+      });
+    } catch (err: any) {
+      logError(
+        `[sync] reconcile: batch of ${slice.length} failed (skipping):`,
+        err?.message ?? err
+      );
+    }
+  }
+
+  if (missingIds.length > 0) {
+    await prisma.invoiceRecord.updateMany({
+      where: { id: { in: missingIds } },
+      data: { invoiceStatus: "void", amountDue: 0, lastSyncedAt: new Date() },
+    });
+  }
+  log(
+    `[sync] reconcile deleted invoices — checked=${open.length} voided=${missingIds.length}`
+  );
+  return missingIds.length;
 }
 
 // Full GHL "Invoice Pipeline" sync: route every invoice to the stage matching
