@@ -207,7 +207,23 @@ const JOBS_QUERY = `
         }
         notes(first: 20) {
           nodes {
+            # Job.notes is a JobNoteUnion — a note can be a direct JobNote OR a
+            # "Linked note" surfaced from the client/quote/request. Pull the
+            # message from every member so e.g. a "No Invoice" note written as a
+            # linked ClientNote is still scanned (not just direct job notes).
             ... on JobNote {
+              id
+              message
+            }
+            ... on ClientNote {
+              id
+              message
+            }
+            ... on QuoteNote {
+              id
+              message
+            }
+            ... on RequestNote {
               id
               message
             }
@@ -251,7 +267,23 @@ const JOBS_BY_RANGE_QUERY = `
         }
         notes(first: 20) {
           nodes {
+            # Job.notes is a JobNoteUnion — a note can be a direct JobNote OR a
+            # "Linked note" surfaced from the client/quote/request. Pull the
+            # message from every member so e.g. a "No Invoice" note written as a
+            # linked ClientNote is still scanned (not just direct job notes).
             ... on JobNote {
+              id
+              message
+            }
+            ... on ClientNote {
+              id
+              message
+            }
+            ... on QuoteNote {
+              id
+              message
+            }
+            ... on RequestNote {
               id
               message
             }
@@ -295,7 +327,23 @@ const JOBS_BY_END_QUERY = `
         }
         notes(first: 20) {
           nodes {
+            # Job.notes is a JobNoteUnion — a note can be a direct JobNote OR a
+            # "Linked note" surfaced from the client/quote/request. Pull the
+            # message from every member so e.g. a "No Invoice" note written as a
+            # linked ClientNote is still scanned (not just direct job notes).
             ... on JobNote {
+              id
+              message
+            }
+            ... on ClientNote {
+              id
+              message
+            }
+            ... on QuoteNote {
+              id
+              message
+            }
+            ... on RequestNote {
               id
               message
             }
