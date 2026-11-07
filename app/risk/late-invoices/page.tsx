@@ -13,34 +13,26 @@ import {
   REMINDER_THRESHOLDS,
   type ReminderCell,
 } from "@/lib/lateInvoices";
+import { hasAmbiguousDateOnlyEncoding, smsReadiness } from "@/lib/collection-evidence";
 import { CalledCheckbox } from "./CalledCheckbox";
-import { CheckCircle2, Clock, XCircle, PiggyBank, FileText, Phone } from "lucide-react";
+import { PiggyBank, FileText, Phone } from "lucide-react";
 
 export const dynamic = "force-dynamic";
-// GHL conversation lookups per customer take a little while; allow headroom.
-export const maxDuration = 120;
-
+function collectionDateLabel(date: Date | null): string {
+  if (!date || !Number.isFinite(date.getTime())) return "Unknown";
+  return hasAmbiguousDateOnlyEncoding(date)
+    ? `${date.toISOString()} (stored UTC value; source date meaning unverified)`
+    : formatDate(date);
+}
 function ReminderCellView({ cell }: { cell: ReminderCell }) {
-  if (cell.status === "sent") {
-    return (
-      <span title={`Reminder sent (~${cell.threshold}d)`} className="inline-flex justify-center text-green-600">
-        <CheckCircle2 size={18} />
-      </span>
-    );
-  }
-  if (cell.status === "pending") {
-    return (
-      <span className="inline-flex flex-col items-center text-amber-500">
-        <Clock size={16} />
-        <span className="mt-0.5 text-[10px] leading-none text-muted-foreground">
-          {cell.daysUntil != null ? `${cell.daysUntil}d` : "—"}
-        </span>
-      </span>
-    );
-  }
+  const days = cell.approximateDaysUntil;
+  const timing = days == null ? "Due-date timing unverified" : days > 0
+    ? `Due-date reference in ${days}d`
+    : days === 0 ? "Due-date reference today" : `Due-date reference ${-days}d ago`;
   return (
-    <span title={`No reminder sent (was due ~${cell.threshold}d)`} className="inline-flex justify-center text-red-500">
-      <XCircle size={18} />
+    <span title="No invoice-linked reminder evidence. Timing is approximate, not a send schedule." className="inline-flex flex-col items-center text-muted-foreground">
+      <span className="text-xs font-medium">Unknown</span>
+      <span className="mt-1 text-[10px]">{timing}</span>
     </span>
   );
 }
@@ -60,9 +52,9 @@ export default async function LateInvoicesPage() {
         <div className="mt-2">
           <h2 className="text-2xl font-semibold tracking-tight">Collections — Late Invoices</h2>
           <p className="mt-1 text-sm text-muted-foreground">
-            Every past-due invoice and whether the customer has been contacted per the
-            reminder sequence. Reminder status comes from outbound SMS in GoHighLevel
-            (±3 days of the expected send date).
+            Positive cached past-due balances on invoices issued since January 1, 2026, including phone-only and email-only customers.
+            Reminder evidence is unverified: there is no stored association between an invoice,
+            a reminder milestone and a message receipt. Unrelated outbound SMS does not prove a reminder was sent.
           </p>
         </div>
       </div>
@@ -71,42 +63,44 @@ export default async function LateInvoicesPage() {
         <StatCard
           label="Past-Due Invoices"
           value={rows.length}
-          sublabel="Status: past_due"
+          sublabel="Cached past_due with positive amount due"
           icon={<FileText size={18} />}
         />
         <StatCard
           label="Total Past Due"
           value={formatCurrency(totalDue)}
-          sublabel="Balance owed"
+          sublabel="Positive cached past-due balances"
           accent="warning"
           icon={<PiggyBank size={18} />}
         />
         <StatCard
-          label="Called by Sarah"
+          label="Calls manually marked"
           value={`${calledCount} / ${rows.length}`}
-          sublabel="21-day phone step"
+          sublabel="Self-reported, not verified calls"
           icon={<Phone size={18} />}
         />
       </div>
 
       <Card>
         <CardHeader>
-          <CardTitle>Reminder Sequence</CardTitle>
-          <CardDescription className="flex flex-wrap items-center gap-x-4 gap-y-1">
-            <span className="inline-flex items-center gap-1">
-              <CheckCircle2 size={14} className="text-green-600" /> sent
-            </span>
-            <span className="inline-flex items-center gap-1">
-              <Clock size={14} className="text-amber-500" /> not yet due (sends in Xd)
-            </span>
-            <span className="inline-flex items-center gap-1">
-              <XCircle size={14} className="text-red-500" /> overdue, not sent
-            </span>
+          <CardTitle>Reminder Evidence and Policy Reference</CardTitle>
+          <CardDescription>
+            Maintenance reference: days 10, 15, 20, 25 and 30. Irrigation reference: days 10 and 15 only.
+            Sarah&apos;s manual call prompt is day 21; a prompt is not proof of a call.
+            Service classification is unknown for these invoices, so the columns do not indicate required steps.
+            Timing below is approximate, based on the stored due date in Arizona time.
+            UTC-midnight values may encode date-only source fields; their calendar age is withheld until verified.
+            Policy: invoice sent day is day 0 and due that day; the next Arizona calendar day is day 1 late.
+            The verified sent date is not yet available, so stored source due dates are not treated as that policy clock.
+            A documented attempt needs an invoice-and-milestone-linked message record. Provider-confirmed delivery
+            needs a delivery receipt for that exact message; an attempt alone does not prove delivery.
+            Neither evidence is available here. No automatic sends are scheduled by this page.
+            Unknown means neither sent nor not sent is established.
           </CardDescription>
         </CardHeader>
         <CardContent>
           {rows.length === 0 ? (
-            <p className="text-sm text-muted-foreground">No past-due invoices. 🎉</p>
+            <p className="text-sm text-muted-foreground">No positive cached past-due balances in this date scope.</p>
           ) : (
             <div className="overflow-x-auto rounded-lg border border-border">
               <table className="w-full text-sm">
@@ -114,14 +108,14 @@ export default async function LateInvoicesPage() {
                   <tr className="text-left text-xs uppercase tracking-wide text-muted-foreground">
                     <th className="px-4 py-2.5 font-medium">Customer</th>
                     <th className="px-4 py-2.5 font-medium">Invoice</th>
-                    <th className="px-4 py-2.5 font-medium">Service Date</th>
-                    <th className="px-4 py-2.5 text-center font-medium">Days Past Due</th>
+                    <th className="px-4 py-2.5 font-medium">Service / Issue Date (proxy)</th>
+                    <th className="px-4 py-2.5 text-center font-medium">Days Past Stored Due Date (approx.)</th>
                     {REMINDER_THRESHOLDS.map((t) => (
                       <th key={t} className="px-3 py-2.5 text-center font-medium">
-                        {t}-day
+                        Day {t} reference
                       </th>
                     ))}
-                    <th className="px-4 py-2.5 text-center font-medium">Sarah called (21d)</th>
+                    <th className="px-4 py-2.5 text-center font-medium">Manual call mark (day 21 reference)</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-border">
@@ -129,10 +123,11 @@ export default async function LateInvoicesPage() {
                     <tr key={r.invoiceId} className="hover:bg-muted/30">
                       <td className="px-4 py-3">
                         <div className="font-medium">{r.customerName}</div>
+                        <div className="text-xs text-muted-foreground">Service type: unknown</div>
+                        <div className="text-xs text-muted-foreground">{smsReadiness(r.phone)}</div>
                         <div className="text-xs text-muted-foreground">
                           {r.email ?? "no email"}
                           {r.phone ? ` · ${r.phone}` : ""}
-                          {r.ghlError ? " · GHL lookup failed" : ""}
                         </div>
                       </td>
                       <td className="px-4 py-3">
@@ -142,11 +137,14 @@ export default async function LateInvoicesPage() {
                         <div className="text-xs text-muted-foreground">
                           {formatCurrencyDetailed(r.amountDue)}
                         </div>
+                        <div className="text-xs text-muted-foreground">
+                          Stored due value: {collectionDateLabel(r.dueAt)}
+                        </div>
                       </td>
                       <td className="px-4 py-3 text-muted-foreground">
-                        {r.serviceDate ? formatDate(r.serviceDate) : "—"}
+                        {collectionDateLabel(r.serviceDate)}
                       </td>
-                      <td className="px-4 py-3 text-center font-semibold">{r.daysPastDue}</td>
+                      <td className="px-4 py-3 text-center font-semibold">{r.daysPastDue ?? "Unknown"}</td>
                       {r.reminders.map((cell) => (
                         <td key={cell.threshold} className="px-3 py-3 text-center">
                           <ReminderCellView cell={cell} />
@@ -157,6 +155,7 @@ export default async function LateInvoicesPage() {
                           invoiceId={r.invoiceId}
                           initial={r.called}
                           calledBy={r.calledBy}
+                          calledAt={r.calledAt?.toISOString() ?? null}
                         />
                       </td>
                     </tr>

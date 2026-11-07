@@ -6,6 +6,7 @@ import {
   stillInJobber,
 } from "./visitFreshness";
 import { perVisitValue } from "./visitValue";
+import { issuedInvoiceWhere, openReceivablesWhere, balanceReviewWhere, sumInvoiceMonths } from "./invoiceMetrics";
 
 export interface DashboardKPIs {
   range: DateRange;
@@ -19,6 +20,8 @@ export interface DashboardKPIs {
   uninvoicedRevenue: number;
   uninvoicedJobCount: number;
   outstandingReceivables: number;
+  balanceReviewTotal: number;
+  balanceReviewCount: number;
   averageJobValue: number;
 
   totalCustomers: number;
@@ -81,6 +84,13 @@ export async function computeDashboardKPIs(
     orderBy: [{ year: "asc" }, { month: "asc" }],
   });
 
+  // Do not reuse unfiltered monthly invoice totals from an older sync. The
+  // chart and headline share one billing definition and the current cache.
+  const monthlyInvoices = await prisma.invoiceRecord.findMany({
+    where: issuedInvoiceWhere(),
+    select: { issuedAt: true, total: true },
+  });
+  const monthlyValues = sumInvoiceMonths(monthlyInvoices);
   const monthlySeries = monthlyAll.map((m) => ({
     year: m.year,
     month: m.month,
@@ -88,20 +98,20 @@ export async function computeDashboardKPIs(
       month: "short",
       year: "2-digit",
     }),
-    invoicedRevenue: m.invoicedRevenue,
+    invoicedRevenue: monthlyValues.get(`${m.year}-${String(m.month).padStart(2, "0")}`) ?? 0,
     newCustomers: m.newCustomers,
     jobsCompleted: m.jobsCompleted,
     averageJobValue: m.averageJobValue,
   }));
 
   const revInRange = await prisma.invoiceRecord.aggregate({
-    where: { issuedAt: { gte: range.start, lte: range.end } },
+    where: issuedInvoiceWhere(range),
     _sum: { total: true },
   });
   const revenueInRange = revInRange._sum.total ?? 0;
 
   const revPrev = await prisma.invoiceRecord.aggregate({
-    where: { issuedAt: { gte: prev.start, lte: prev.end } },
+    where: issuedInvoiceWhere(prev),
     _sum: { total: true },
   });
   const revenueCompareValue = revPrev._sum.total ?? 0;
@@ -149,13 +159,17 @@ export async function computeDashboardKPIs(
 
   // Outstanding Receivables (range-aware): invoices issued in range still owed.
   const outstandingAgg = await prisma.invoiceRecord.aggregate({
-    where: {
-      amountDue: { gt: 0 },
-      issuedAt: { gte: range.start, lte: range.end },
-    },
+    where: openReceivablesWhere(range),
     _sum: { amountDue: true },
   });
   const outstandingReceivables = outstandingAgg._sum.amountDue ?? 0;
+  const reviewAgg = await prisma.invoiceRecord.aggregate({
+    where: balanceReviewWhere(range),
+    _sum: { amountDue: true },
+    _count: true,
+  });
+  const balanceReviewTotal = reviewAgg._sum.amountDue ?? 0;
+  const balanceReviewCount = reviewAgg._count ?? 0;
 
   const rangeJobs = await prisma.jobRecord.findMany({
     where: {
@@ -305,6 +319,8 @@ export async function computeDashboardKPIs(
     uninvoicedRevenue,
     uninvoicedJobCount,
     outstandingReceivables,
+    balanceReviewTotal,
+    balanceReviewCount,
     averageJobValue,
     totalCustomers,
     recurringCustomers,

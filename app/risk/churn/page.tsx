@@ -46,13 +46,13 @@ export default async function ChurnPage() {
           icon={<Repeat size={18} />}
         />
         <StatCard
-          label="Historical Revenue"
+          label="Cached Job Value"
           value={formatCurrencyDetailed(totalLostValue)}
-          sublabel="Lifetime revenue from these customers"
+          sublabel="Sum of cached linked job totals"
           icon={<DollarSign size={18} />}
         />
         <StatCard
-          label="Average Customer Value"
+          label="Average Cached Job Value"
           value={
             customers.length > 0
               ? formatCurrencyDetailed(totalLostValue / customers.length)
@@ -67,7 +67,7 @@ export default async function ChurnPage() {
         <CardHeader>
           <CardTitle>Churned Customers</CardTitle>
           <CardDescription>
-            Sorted by historical revenue (most valuable first — prioritize outreach here)
+            Sorted by cached job value, highest first. Sum of cached linked job totals across statuses; not lifetime invoiced or collected revenue.
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -84,7 +84,7 @@ export default async function ChurnPage() {
                     <th className="px-4 py-2.5 font-medium">Contact</th>
                     <th className="px-4 py-2.5 font-medium">Last job</th>
                     <th className="px-4 py-2.5 font-medium">Total jobs</th>
-                    <th className="px-4 py-2.5 font-medium">Lifetime Revenue</th>
+                    <th className="px-4 py-2.5 font-medium">Cached Job Value</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-border">

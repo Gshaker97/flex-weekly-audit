@@ -2,6 +2,7 @@ import { prisma } from "./prisma";
 import { DateRange } from "./dateRange";
 import { computeDashboardKPIs } from "./kpis";
 import { COLLECTIONS_SINCE } from "./lateInvoices";
+import { openReceivablesWhere, balanceReviewWhere, overdueInvoicesWhere, legacyOverdueWhere, invoiceValueIncluded, invoiceReviewReason, totalLessBalance, invoiceMonthKey, sumInvoiceMonths } from "./invoiceMetrics";
 import {
   excludeNotYetDue,
   getVisitFreshnessCutoff,
@@ -17,8 +18,8 @@ import {
 
 // A single downloadable report covering everything the dashboard and its
 // drill-down pages show, scoped to one date range. Each section reuses the same
-// query definitions as the page it mirrors, so the report and the UI never
-// disagree about a number.
+// invoice query definitions as the page it mirrors. Values reflect the cache
+// at report generation; separate requests can observe different sync results.
 
 export type CellValue = string | number | boolean | Date | null;
 
@@ -95,9 +96,6 @@ export async function buildReport(range: DateRange): Promise<ReportData> {
 
   // Overdue invoices use the Collections definition (Jobber's exact "past_due"
   // status, issued on/after the cutoff), matching the dashboard stat.
-  const overdueFrom =
-    range.start > COLLECTIONS_SINCE ? range.start : COLLECTIONS_SINCE;
-
   const [
     invoices,
     completedJobs,
@@ -105,6 +103,8 @@ export async function buildReport(range: DateRange): Promise<ReportData> {
     notCompletedVisits,
     receivables,
     overdueInvoices,
+    balanceReviewInvoices,
+    legacyOverdueInvoices,
     churnedCustomers,
     newCustomers,
     timeEntries,
@@ -140,18 +140,22 @@ export async function buildReport(range: DateRange): Promise<ReportData> {
       orderBy: { visitDate: "desc" },
     }),
     prisma.invoiceRecord.findMany({
-      where: {
-        amountDue: { gt: 0 },
-        issuedAt: { gte: range.start, lte: range.end },
-      },
+      where: openReceivablesWhere(range),
       include: { customer: true },
       orderBy: { issuedAt: "desc" },
     }),
     prisma.invoiceRecord.findMany({
-      where: {
-        invoiceStatus: "past_due",
-        issuedAt: { gte: overdueFrom, lte: range.end },
-      },
+      where: overdueInvoicesWhere(range, COLLECTIONS_SINCE),
+      include: { customer: true },
+      orderBy: { dueAt: "asc" },
+    }),
+    prisma.invoiceRecord.findMany({
+      where: balanceReviewWhere(range),
+      include: { customer: true },
+      orderBy: { issuedAt: "desc" },
+    }),
+    prisma.invoiceRecord.findMany({
+      where: legacyOverdueWhere(range, COLLECTIONS_SINCE),
       include: { customer: true },
       orderBy: { dueAt: "asc" },
     }),
@@ -185,12 +189,12 @@ export async function buildReport(range: DateRange): Promise<ReportData> {
 
   const summary: ReportSummaryItem[] = [
     {
-      label: "Revenue",
+      label: "Issued Invoice Value",
       value: formatCurrencyDetailed(kpis.revenueInRange),
       detail:
         kpis.revenueChangePercent == null
-          ? "Invoiced in range · no prior period data"
-          : `Invoiced in range · ${
+          ? "Known issued states; excludes void/draft/unknown; not cash · no prior period data"
+          : `Issued invoice value, not cash · ${
               kpis.revenueChangePercent >= 0 ? "+" : ""
             }${formatPercent(kpis.revenueChangePercent, 1)} vs ${formatCurrency(
               kpis.revenueCompareValue
@@ -210,16 +214,16 @@ export async function buildReport(range: DateRange): Promise<ReportData> {
     {
       label: "Outstanding Receivables",
       value: formatCurrencyDetailed(kpis.outstandingReceivables),
-      detail: `${formatNumber(receivables.length)} invoices issued in range, unpaid`,
+      detail: `${formatNumber(receivables.length)} open-status positive balances now, issued in range; review conflicts excluded`,
     },
     {
-      label: "Recurring vs One-off",
+      label: "Recurring share of estimated visit value",
       value: recurringShare == null ? "—" : formatPercent(recurringShare),
       detail: `${formatCurrencyDetailed(
         kpis.recurringRevenueInRange
       )} recurring · ${formatCurrencyDetailed(
         kpis.oneOffRevenueInRange
-      )} one-off, by visits serviced in range`,
+      )} one-off. Estimated completed or invoiced visit value in range; not invoice revenue or cash`,
     },
     {
       label: "Jobs Not Marked Completed",
@@ -229,12 +233,12 @@ export async function buildReport(range: DateRange): Promise<ReportData> {
       )} visits past their date, not completed`,
     },
     {
-      label: "Overdue Invoices",
+      label: "Overdue Invoices in Collections Scope",
       value: formatCurrencyDetailed(overdueInvoiceTotal),
-      detail: `${formatNumber(overdueInvoices.length)} unpaid invoices past due`,
+      detail: `${formatNumber(overdueInvoices.length)} current past_due balances, issued since ${COLLECTIONS_SINCE.toISOString().slice(0, 10)} and in selected range`,
     },
     {
-      label: "Uninvoiced Revenue",
+      label: "Estimated Uninvoiced Work",
       value: formatCurrencyDetailed(kpis.uninvoicedRevenue),
       detail: `${formatNumber(
         kpis.uninvoicedJobCount
@@ -256,11 +260,29 @@ export async function buildReport(range: DateRange): Promise<ReportData> {
       detail: `vs ${formatNumber(kpis.newCustomersCompare)} prior period`,
     },
     {
-      label: "Invoices Issued",
+      label: "Invoice Records in Range",
       value: formatNumber(invoices.length),
-      detail: `${formatCurrencyDetailed(
-        invoices.reduce((a, i) => a + (i.total || 0), 0)
-      )} invoiced`,
+      detail: `${formatNumber(invoices.filter(i => invoiceValueIncluded(i.invoiceStatus)).length)} included in issued invoice value; raw records retained below`,
+    },
+    {
+      label: "Balances Requiring Review",
+      value: formatCurrencyDetailed(kpis.balanceReviewTotal),
+      detail: `${kpis.balanceReviewCount} positive balances with paid/void/draft/bad-debt/unknown status; not confirmed collectible`,
+    },
+    {
+      label: "Past Due Before Collections Cutoff",
+      value: formatCurrencyDetailed(legacyOverdueInvoices.reduce((sum, i) => sum + i.amountDue, 0)),
+      detail: `${legacyOverdueInvoices.length} older past_due records within selected range; not automatically settled`,
+    },
+    {
+      label: "Excluded Invoice Value",
+      value: formatCurrencyDetailed(invoices.filter(i => !invoiceValueIncluded(i.invoiceStatus)).reduce((sum, i) => sum + i.total, 0)),
+      detail: "Draft, void or unrecognized status; all underlying records retained",
+    },
+    {
+      label: "Cash Collected",
+      value: "Not verified",
+      detail: "No payment transaction ledger or actual payment dates in this report; total minus balance is not proof of cash",
     },
     {
       label: "Hours Logged",
@@ -283,24 +305,38 @@ export async function buildReport(range: DateRange): Promise<ReportData> {
     const mEnd = new Date(m.year, m.month, 0, 23, 59, 59, 999);
     return mStart <= range.end && mEnd >= range.start;
   });
+  const monthlyInvoiceValues = sumInvoiceMonths(invoices.filter(i => invoiceValueIncluded(i.invoiceStatus)));
+  const jobsByMonth = new Map<string, typeof completedJobs>();
+  for (const job of completedJobs) {
+    if (!job.completedAt) continue;
+    const key = invoiceMonthKey(job.completedAt);
+    jobsByMonth.set(key, [...(jobsByMonth.get(key) ?? []), job]);
+  }
+  const customersByMonth = new Map<string, number>();
+  for (const customer of newCustomers) {
+    if (!customer.createdAtJobber) continue;
+    const key = invoiceMonthKey(customer.createdAtJobber);
+    customersByMonth.set(key, (customersByMonth.get(key) ?? 0) + 1);
+  }
   sections.push({
     key: "monthly",
     title: "Monthly Performance",
-    description: "Invoiced revenue, jobs, and new customers per month in range.",
+    description: "Issued invoice value (not cash), completed jobs and new customers within the exact selected dates. Partial months are not expanded.",
     columns: [
       { header: "Month", type: "text" },
-      { header: "Invoiced Revenue", type: "currency" },
+      { header: "Issued Invoice Value", type: "currency" },
       { header: "Jobs Completed", type: "int" },
       { header: "Avg Job Value", type: "currency" },
       { header: "New Customers", type: "int" },
     ],
-    rows: monthly.map((m) => [
-      `${m.label}`,
-      m.invoicedRevenue,
-      m.jobsCompleted,
-      m.averageJobValue,
-      m.newCustomers,
-    ]),
+    rows: monthly.map((m) => {
+      const key = `${m.year}-${String(m.month).padStart(2, "0")}`;
+      const jobs = jobsByMonth.get(key) ?? [];
+      const valued = jobs.filter(j => j.total > 0);
+      return [m.label, monthlyInvoiceValues.get(key) ?? 0, jobs.length,
+        valued.length ? valued.reduce((sum, j) => sum + j.total, 0) / valued.length : 0,
+        customersByMonth.get(key) ?? 0];
+    }),
   });
 
   // Customer revenue in range — every customer, not just the dashboard top 10.
@@ -327,12 +363,12 @@ export async function buildReport(range: DateRange): Promise<ReportData> {
   const custById = new Map(custRecords.map((c) => [c.id, c]));
   sections.push({
     key: "customers-revenue",
-    title: "Customer Revenue",
+    title: "Completed Job Value by Customer",
     description:
-      "Every customer with completed-job revenue in range, highest first.",
+      "Completed job values in range, highest first. This is not the invoice or cash total.",
     columns: [
       { header: "Customer", type: "text" },
-      { header: "Revenue", type: "currency" },
+      { header: "Job Value", type: "currency" },
       { header: "Jobs", type: "int" },
       { header: "Avg Job", type: "currency" },
       { header: "Recurring", type: "bool" },
@@ -357,11 +393,11 @@ export async function buildReport(range: DateRange): Promise<ReportData> {
 
   sections.push({
     key: "service-types",
-    title: "Revenue by Service Type",
+    title: "Completed Job Value by Service Type",
     description: "Completed jobs in range, grouped by job type.",
     columns: [
       { header: "Service", type: "text" },
-      { header: "Revenue", type: "currency" },
+      { header: "Job Value", type: "currency" },
       { header: "Jobs", type: "int" },
       { header: "Avg Job", type: "currency" },
     ],
@@ -375,8 +411,8 @@ export async function buildReport(range: DateRange): Promise<ReportData> {
 
   sections.push({
     key: "invoices",
-    title: "Invoices Issued",
-    description: "Every invoice issued in range, newest first.",
+    title: "Invoice Records in Range",
+    description: "Every cached invoice record dated in range, including excluded statuses. Issued invoice value uses paid, awaiting_payment, past_due and bad_debt only. Total minus balance can include credits, write-offs or voids and is not cash received.",
     columns: [
       { header: "Invoice #", type: "text" },
       { header: "Customer", type: "text" },
@@ -384,8 +420,9 @@ export async function buildReport(range: DateRange): Promise<ReportData> {
       { header: "Issued", type: "date" },
       { header: "Due", type: "date" },
       { header: "Total", type: "currency" },
-      { header: "Paid", type: "currency" },
+      { header: "Total Minus Balance", type: "currency" },
       { header: "Balance Due", type: "currency" },
+      { header: "Review Note", type: "text" },
     ],
     rows: invoices.map((i) => [
       i.invoiceNumber ?? null,
@@ -394,8 +431,9 @@ export async function buildReport(range: DateRange): Promise<ReportData> {
       i.issuedAt,
       i.dueAt,
       i.total || 0,
-      i.amountPaid || 0,
+      totalLessBalance(i.total, i.amountDue),
       i.amountDue || 0,
+      invoiceReviewReason(i),
     ]),
   });
 
@@ -431,7 +469,7 @@ export async function buildReport(range: DateRange): Promise<ReportData> {
 
   sections.push({
     key: "uninvoiced",
-    title: "Uninvoiced Revenue",
+    title: "Estimated Uninvoiced Work",
     description:
       "Completed visits with no invoice attached — work done but not yet billed. Excludes jobs marked \"No Invoice\" in Jobber notes.",
     columns: [
@@ -486,7 +524,7 @@ export async function buildReport(range: DateRange): Promise<ReportData> {
     key: "receivables",
     title: "Outstanding Receivables",
     description:
-      "Invoices issued in range that still have a balance owing, newest first.",
+      "Current positive balances for awaiting_payment or past_due invoices issued in range. Other positive balances are in the review section; this is not a historical as-of balance.",
     columns: [
       { header: "Invoice #", type: "text" },
       { header: "Customer", type: "text" },
@@ -513,8 +551,8 @@ export async function buildReport(range: DateRange): Promise<ReportData> {
 
   sections.push({
     key: "overdue-invoices",
-    title: "Overdue Invoices",
-    description: `Past-due invoices, same definition as the Collections tab: Jobber "past_due" status, issued on or after ${COLLECTIONS_SINCE.toISOString().slice(
+    title: "Overdue Invoices in Collections Scope",
+    description: `Current positive balances with cached Jobber "past_due" status, issued on or after ${COLLECTIONS_SINCE.toISOString().slice(
       0,
       10
     )}. Oldest due date first.`,
@@ -544,15 +582,28 @@ export async function buildReport(range: DateRange): Promise<ReportData> {
     ]),
   });
 
+  for (const [key, title, description, records] of [
+    ["invoice-review", "Invoice Balances Requiring Review", "Positive balances with non-open status. Verify current source, credits and actual payments before collection or settlement.", balanceReviewInvoices],
+    ["legacy-overdue", "Past Due Before Collections Cutoff", "Older past_due records within the selected range, excluded by the collections cutoff rather than proven settled. Do not automatically send catch-up reminders.", legacyOverdueInvoices],
+  ] as const) {
+    sections.push({ key, title, description, columns: [
+      { header: "Invoice #", type: "text" }, { header: "Customer", type: "text" },
+      { header: "Status", type: "text" }, { header: "Issued", type: "date" },
+      { header: "Total", type: "currency" }, { header: "Balance", type: "currency" },
+      { header: "Review Note", type: "text" },
+    ], rows: records.map(i => [i.invoiceNumber, nameOf(i.clientName, i.customer), i.invoiceStatus,
+      i.issuedAt, i.total, i.amountDue, invoiceReviewReason(i) || "Outside collections cutoff; verify before any action"]), });
+  }
+
   sections.push({
     key: "churn",
     title: "Recurring Churn (90 days)",
     description:
-      "Recurring customers with no job completed in 90+ days. This list is always trailing-90-day and is not affected by the selected range.",
+      "Recurring customers with no job completed in 90+ days. This list is always trailing-90-day and is not affected by the selected range. Cached Job Value is the sum of cached linked job totals across statuses; not lifetime invoiced or collected revenue.",
     columns: [
       { header: "Customer", type: "text" },
       { header: "Last Job", type: "date" },
-      { header: "Lifetime Revenue", type: "currency" },
+      { header: "Cached Job Value", type: "currency" },
       { header: "Lifetime Jobs", type: "int" },
       { header: "Email", type: "text" },
       { header: "Phone", type: "text" },
@@ -570,12 +621,12 @@ export async function buildReport(range: DateRange): Promise<ReportData> {
   sections.push({
     key: "new-customers",
     title: "New Customers",
-    description: "Customers created in Jobber during the range, newest first.",
+    description: "Customers created in Jobber during the range, newest first. Cached Job Value is the sum of cached linked job totals across statuses; not lifetime invoiced or collected revenue.",
     columns: [
       { header: "Customer", type: "text" },
       { header: "Created", type: "date" },
       { header: "Recurring", type: "bool" },
-      { header: "Lifetime Revenue", type: "currency" },
+      { header: "Cached Job Value", type: "currency" },
       { header: "Lifetime Jobs", type: "int" },
       { header: "Email", type: "text" },
       { header: "Phone", type: "text" },

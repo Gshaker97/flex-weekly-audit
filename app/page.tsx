@@ -1,6 +1,7 @@
 import { prisma } from "@/lib/prisma";
 import { computeDashboardKPIs } from "@/lib/kpis";
 import { COLLECTIONS_SINCE } from "@/lib/lateInvoices";
+import { overdueInvoicesWhere, legacyOverdueWhere } from "@/lib/invoiceMetrics";
 import { resolveDateRange, rangeQueryString } from "@/lib/dateRange";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
@@ -57,17 +58,16 @@ export default async function DashboardPage({
   // exact "past_due" status, issued on/after the COLLECTIONS_SINCE cutoff — so
   // this stat, its detail page, and Collections all report the same count.
   // The selected range is intersected with the cutoff (never reaches earlier).
-  const overdueFrom =
-    range.start > COLLECTIONS_SINCE ? range.start : COLLECTIONS_SINCE;
   const overdueUnpaid = await prisma.invoiceRecord.findMany({
-    where: {
-      invoiceStatus: "past_due",
-      issuedAt: { gte: overdueFrom, lte: range.end },
-    },
+    where: overdueInvoicesWhere(range, COLLECTIONS_SINCE),
     select: { amountDue: true },
   });
   const overdueInvoiceTotal = overdueUnpaid.reduce((a, i) => a + (i.amountDue || 0), 0);
   const overdueInvoiceCount = overdueUnpaid.length;
+  const legacyOverdue = await prisma.invoiceRecord.aggregate({
+    where: legacyOverdueWhere(range, COLLECTIONS_SINCE),
+    _sum: { amountDue: true }, _count: true,
+  });
 
   // Carry the active range into detail-page links so the number you click
   // matches the list you land on. Default to YTD when nothing is set.
@@ -98,9 +98,9 @@ export default async function DashboardPage({
         <SectionTitle title="Revenue" />
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
           <StatCard
-            label={`Revenue (${kpis.range.label})`}
+            label={`Issued invoice value (${kpis.range.label})`}
             value={formatCurrency(kpis.revenueInRange)}
-            sublabel="Invoiced in range"
+            sublabel="Known issued states; excludes void/draft; not cash"
             accent="brand"
             icon={<DollarSign size={18} />}
             changePercent={kpis.revenueChangePercent}
@@ -115,12 +115,12 @@ export default async function DashboardPage({
             href={`/risk/receivables${qs}`}
             label="Outstanding Receivables"
             value={formatCurrency(kpis.outstandingReceivables)}
-            sublabel="Invoiced in range, unpaid"
+            sublabel="Current open balances, issued in range"
             accent={kpis.outstandingReceivables > 0 ? "warning" : "default"}
             icon={<PiggyBank size={18} />}
           />
           <StatCard
-            label="Recurring vs One-off"
+            label="Recurring share of estimated visit value"
             value={
               kpis.recurringRevenueInRange + kpis.oneOffRevenueInRange > 0
                 ? `${Math.round(
@@ -130,17 +130,24 @@ export default async function DashboardPage({
                   )}%`
                 : "—"
             }
-            sublabel="Recurring share of work done in range"
+            sublabel="Estimated completed or invoiced visit value in range"
             icon={<Repeat size={18} />}
           />
         </div>
-        <p className="text-xs text-muted-foreground">{compareLabel}</p>
+        <p className="text-xs text-muted-foreground">{compareLabel}. Invoice values are not cash collected. Payment transactions and actual receipt dates are not verified here.</p>
+        {kpis.balanceReviewCount > 0 && (
+          <p className="text-sm text-amber-700">
+            {formatCurrencyDetailed(kpis.balanceReviewTotal)} across {kpis.balanceReviewCount} positive balances has a conflicting or non-open status (including paid).
+            These are excluded from open receivables and retained on the <a className="underline" href={`/risk/receivables${qs}`}>review list</a>; verify in Jobber before collection or settlement.
+          </p>
+        )}
       </section>
 
       <section className="space-y-3">
         <SectionTitle title="Risk &amp; Gaps" />
         <p className="text-xs text-muted-foreground">
-          Click any card to see the specific jobs or customers behind the number.
+          Current cached status and balances, filtered by issue or visit date. These are not historical as-of balances. Click a card for its records.
+          {(legacyOverdue._count ?? 0) > 0 && ` ${legacyOverdue._count} older past-due records / ${formatCurrencyDetailed(legacyOverdue._sum.amountDue ?? 0)} in this range are outside the Collections cutoff and remain listed for review.`}
         </p>
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
           <ClickableStatCard
@@ -153,15 +160,15 @@ export default async function DashboardPage({
           />
           <ClickableStatCard
             href={`/risk/overdue-invoices${qs}`}
-            label="Overdue Invoices"
+            label="Overdue in Collections scope"
             value={formatCurrency(overdueInvoiceTotal)}
-            sublabel={`${overdueInvoiceCount} unpaid invoices past due`}
+            sublabel={`${overdueInvoiceCount} positive past-due balances; issued since 2026-01-01`}
             accent={overdueInvoiceTotal > 0 ? "danger" : "success"}
             icon={<Receipt size={18} />}
           />
           <ClickableStatCard
             href={`/risk/uninvoiced${qs}`}
-            label="Uninvoiced Revenue"
+            label="Estimated uninvoiced work"
             value={formatCurrency(kpis.uninvoicedRevenue)}
             sublabel={`${kpis.uninvoicedJobCount} completed visits with no invoice`}
             accent={kpis.uninvoicedRevenue > 0 ? "warning" : "success"}
@@ -206,7 +213,7 @@ export default async function DashboardPage({
             icon={<UserPlus size={18} />}
           />
           <StatCard
-            label="One-off vs Recurring Rev"
+            label="One-off share of estimated visit value"
             value={
               kpis.recurringRevenueInRange + kpis.oneOffRevenueInRange > 0
                 ? `${Math.round(
@@ -216,7 +223,7 @@ export default async function DashboardPage({
                   )}%`
                 : "—"
             }
-            sublabel="One-off share of work done in range"
+            sublabel="Estimated completed or invoiced visit value in range"
             icon={<TrendingUp size={18} />}
           />
         </div>
@@ -225,8 +232,8 @@ export default async function DashboardPage({
       <section className="grid grid-cols-1 gap-6 lg:grid-cols-2">
         <Card>
           <CardHeader>
-            <CardTitle>Monthly Revenue</CardTitle>
-            <CardDescription>Invoiced revenue, trailing 12 months</CardDescription>
+            <CardTitle>Monthly Issued Invoice Value</CardTitle>
+            <CardDescription>Known issued states, trailing 12 months; not cash</CardDescription>
           </CardHeader>
           <CardContent>
             {last12Months.length > 0 ? (
@@ -254,8 +261,8 @@ export default async function DashboardPage({
       <section className="grid grid-cols-1 gap-6 lg:grid-cols-2">
         <Card>
           <CardHeader>
-            <CardTitle>Top 10 Customers by Revenue</CardTitle>
-            <CardDescription>Within selected range</CardDescription>
+            <CardTitle>Top 10 Customers by Completed Job Value</CardTitle>
+            <CardDescription>Completed job values in selected range; not invoice or cash totals</CardDescription>
           </CardHeader>
           <CardContent>
             {kpis.topCustomers.length === 0 ? (
@@ -267,7 +274,7 @@ export default async function DashboardPage({
                     <tr className="text-left text-xs uppercase tracking-wide text-muted-foreground">
                       <th className="px-4 py-2.5 font-medium">Customer</th>
                       <th className="px-4 py-2.5 font-medium">Jobs</th>
-                      <th className="px-4 py-2.5 font-medium">Revenue</th>
+                      <th className="px-4 py-2.5 font-medium">Job Value</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-border">
@@ -295,8 +302,8 @@ export default async function DashboardPage({
 
         <Card>
           <CardHeader>
-            <CardTitle>Revenue by Service Type</CardTitle>
-            <CardDescription>Within selected range</CardDescription>
+            <CardTitle>Completed Job Value by Service Type</CardTitle>
+            <CardDescription>Completed job values in selected range; not invoice or cash totals</CardDescription>
           </CardHeader>
           <CardContent>
             {kpis.serviceTypeRevenue.length === 0 ? (
@@ -308,7 +315,7 @@ export default async function DashboardPage({
                     <tr className="text-left text-xs uppercase tracking-wide text-muted-foreground">
                       <th className="px-4 py-2.5 font-medium">Service</th>
                       <th className="px-4 py-2.5 font-medium">Jobs</th>
-                      <th className="px-4 py-2.5 font-medium">Revenue</th>
+                      <th className="px-4 py-2.5 font-medium">Job Value</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-border">

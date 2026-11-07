@@ -12,6 +12,7 @@ import { StatCard } from "@/components/ui/StatCard";
 import DateRangeFilter from "@/components/ui/DateRangeFilter";
 import { resolveDateRange, getDateRange } from "@/lib/dateRange";
 import { COLLECTIONS_SINCE } from "@/lib/lateInvoices";
+import { overdueInvoicesWhere, legacyOverdueWhere } from "@/lib/invoiceMetrics";
 import { formatCurrency, formatCurrencyDetailed, formatDate } from "@/lib/utils";
 import { Receipt, PiggyBank, Users } from "lucide-react";
 
@@ -33,16 +34,17 @@ export default async function OverdueInvoicesPage({
   // "past_due" status, issued on/after the COLLECTIONS_SINCE cutoff. The
   // selected range is intersected with the cutoff so the count here matches the
   // Collections tab and the dashboard "Overdue Invoices" stat.
-  const overdueFrom =
-    range.start > COLLECTIONS_SINCE ? range.start : COLLECTIONS_SINCE;
   const invoices = await prisma.invoiceRecord.findMany({
-    where: {
-      invoiceStatus: "past_due",
-      issuedAt: { gte: overdueFrom, lte: range.end },
-    },
+    where: overdueInvoicesWhere(range, COLLECTIONS_SINCE),
     include: { customer: true },
     orderBy: { dueAt: "asc" },
   });
+
+  const legacyInvoices = await prisma.invoiceRecord.findMany({
+    where: legacyOverdueWhere(range, COLLECTIONS_SINCE),
+    orderBy: { dueAt: "asc" },
+  });
+  const legacyTotal = legacyInvoices.reduce((sum, i) => sum + i.amountDue, 0);
 
   // Job date per invoice: match InvoiceRecord.invoiceNumber -> JobRecord.invoiceNumber
   // and use the job's completion (or scheduled end) date.
@@ -79,9 +81,8 @@ export default async function OverdueInvoicesPage({
           <div>
             <h2 className="text-2xl font-semibold tracking-tight">Overdue Invoices</h2>
             <p className="mt-1 text-sm text-muted-foreground">
-              Every invoice Jobber marks past due, with the job date and how late it is.
-              Issued{" "}
-              <span className="font-medium text-foreground">{range.label}</span>.
+              Current positive balances marked past due in the cache, issued since January 1, 2026 and within{" "}
+              <span className="font-medium text-foreground">{range.label}</span>. This is the Collections policy scope, not every historical past-due invoice.
             </p>
           </div>
           <DateRangeFilter />
@@ -110,14 +111,22 @@ export default async function OverdueInvoicesPage({
         />
       </div>
 
+      {legacyInvoices.length > 0 && <Card className="border-amber-500/40">
+        <CardHeader><CardTitle>Older Past Due Outside Collections Scope</CardTitle><CardDescription>{legacyInvoices.length} records / {formatCurrencyDetailed(legacyTotal)} within the selected range predate the cutoff. Policy exclusion does not prove settlement. Verify before any catch-up reminder.</CardDescription></CardHeader>
+        <CardContent><div className="overflow-x-auto"><table className="w-full text-sm">
+          <thead><tr className="text-left"><th className="p-2">Invoice</th><th className="p-2">Customer</th><th className="p-2">Issued</th><th className="p-2">Balance</th></tr></thead>
+          <tbody>{legacyInvoices.map(inv => <tr key={inv.id} className="border-t border-border"><td className="p-2">#{inv.invoiceNumber ?? "Unknown"}</td><td className="p-2">{inv.clientName ?? "Unknown"}</td><td className="p-2">{formatDate(inv.issuedAt)}</td><td className="p-2">{formatCurrencyDetailed(inv.amountDue)}</td></tr>)}</tbody>
+        </table></div></CardContent>
+      </Card>}
+
       <Card>
         <CardHeader>
-          <CardTitle>Overdue Invoices</CardTitle>
-          <CardDescription>Most overdue first</CardDescription>
+          <CardTitle>Overdue Invoices in Collections Scope</CardTitle>
+          <CardDescription>Oldest stored due date first. Age is elapsed days from that due date, not from the sent date. Linked job dates can describe a recurring job term, not this invoice service date or sent date.</CardDescription>
         </CardHeader>
         <CardContent>
           {invoices.length === 0 ? (
-            <p className="text-sm text-muted-foreground">No overdue invoices. 🎉</p>
+            <p className="text-sm text-muted-foreground">No overdue invoices within this Collections scope.</p>
           ) : (
             <div className="overflow-x-auto rounded-lg border border-border">
               <table className="w-full text-sm">
@@ -126,9 +135,9 @@ export default async function OverdueInvoicesPage({
                     <th className="px-4 py-2.5 font-medium">Customer</th>
                     <th className="px-4 py-2.5 font-medium">Invoice</th>
                     <th className="px-4 py-2.5 font-medium">Due Date</th>
-                    <th className="px-4 py-2.5 font-medium">Job Date</th>
-                    <th className="px-4 py-2.5 text-right font-medium">Total Invoice</th>
-                    <th className="px-4 py-2.5 text-right font-medium">How Late</th>
+                    <th className="px-4 py-2.5 font-medium">Linked Job Date</th>
+                    <th className="px-4 py-2.5 text-right font-medium">Balance Due</th>
+                    <th className="px-4 py-2.5 text-right font-medium">Due-Date Age</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-border">
@@ -154,7 +163,7 @@ export default async function OverdueInvoicesPage({
                           {jobDate ? formatDate(jobDate) : "—"}
                         </td>
                         <td className="px-4 py-3 text-right font-semibold">
-                          {formatCurrencyDetailed(inv.total)}
+                          {formatCurrencyDetailed(inv.amountDue)}
                         </td>
                         <td className="px-4 py-3 text-right">
                           <Badge variant="danger">{daysLate}d late</Badge>
