@@ -1,5 +1,6 @@
 import { prisma } from "./prisma";
 import { buildUnverifiedReminders, sourceDueDateAge, type ReminderCell } from "./collection-evidence";
+import { overdueInvoicesWhere, overdueDisplayBasis } from "./invoiceMetrics";
 export { REMINDER_THRESHOLDS } from "./collection-evidence";
 export type { ReminderCell, ReminderStatus } from "./collection-evidence";
 
@@ -15,6 +16,8 @@ export interface LateInvoiceRow {
   email: string | null;
   phone: string | null;
   amountDue: number;
+  cachedStatus: string | null;
+  displayBasis: string | null;
   daysPastDue: number | null;
   dueAt: Date | null;
   serviceDate: Date | null; // job completion/scheduled date for this invoice
@@ -24,11 +27,9 @@ export interface LateInvoiceRow {
   calledBy: string | null;
 }
 
-export async function getLateInvoiceCollections(): Promise<LateInvoiceRow[]> {
-  const now = new Date();
-
+export async function getLateInvoiceCollections(now = new Date()): Promise<LateInvoiceRow[]> {
   const invoices = await prisma.invoiceRecord.findMany({
-    where: { invoiceStatus: "past_due", amountDue: { gt: 0 }, issuedAt: { gte: COLLECTIONS_SINCE } },
+    where: overdueInvoicesWhere(undefined, COLLECTIONS_SINCE, now),
     include: { customer: true },
   });
 
@@ -81,6 +82,8 @@ export async function getLateInvoiceCollections(): Promise<LateInvoiceRow[]> {
       email: inv.customer?.email ?? null,
       phone: inv.customer?.phone ?? null,
       amountDue: inv.amountDue || 0,
+      cachedStatus: inv.invoiceStatus,
+      displayBasis: overdueDisplayBasis(inv, now),
       daysPastDue,
       dueAt,
       serviceDate,

@@ -2,7 +2,7 @@ import { prisma } from "./prisma";
 import { DateRange } from "./dateRange";
 import { computeDashboardKPIs } from "./kpis";
 import { COLLECTIONS_SINCE } from "./lateInvoices";
-import { openReceivablesWhere, balanceReviewWhere, overdueInvoicesWhere, legacyOverdueWhere, invoiceValueIncluded, invoiceReviewReason, totalLessBalance, invoiceMonthKey, sumInvoiceMonths } from "./invoiceMetrics";
+import { openReceivablesWhere, balanceReviewWhere, overdueInvoicesWhere, legacyOverdueWhere, overdueDisplayBasis, invoiceValueIncluded, invoiceReviewReason, totalLessBalance, invoiceMonthKey, sumInvoiceMonths } from "./invoiceMetrics";
 import {
   excludeNotYetDue,
   getVisitFreshnessCutoff,
@@ -83,8 +83,7 @@ function hours(seconds: number | null | undefined): number {
   return Math.round((seconds / 3600) * 100) / 100;
 }
 
-export async function buildReport(range: DateRange): Promise<ReportData> {
-  const now = new Date();
+export async function buildReport(range: DateRange, now = new Date()): Promise<ReportData> {
   // Same "as of now" cap the KPI layer uses, so a historical range only counts
   // what was actually overdue inside that window.
   const asOf = range.end.getTime() < now.getTime() ? range.end : now;
@@ -94,8 +93,8 @@ export async function buildReport(range: DateRange): Promise<ReportData> {
 
   // ---------------------------------------------------------------- summary
 
-  // Overdue invoices use the Collections definition (Jobber's exact "past_due"
-  // status, issued on/after the cutoff), matching the dashboard stat.
+  // Shared overdue display predicate, with the same issue-date scope as the
+  // dashboard. Stored-date aging does not change the underlying cached status.
   const [
     invoices,
     completedJobs,
@@ -145,7 +144,7 @@ export async function buildReport(range: DateRange): Promise<ReportData> {
       orderBy: { issuedAt: "desc" },
     }),
     prisma.invoiceRecord.findMany({
-      where: overdueInvoicesWhere(range, COLLECTIONS_SINCE),
+      where: overdueInvoicesWhere(range, COLLECTIONS_SINCE, now),
       include: { customer: true },
       orderBy: { dueAt: "asc" },
     }),
@@ -155,7 +154,7 @@ export async function buildReport(range: DateRange): Promise<ReportData> {
       orderBy: { issuedAt: "desc" },
     }),
     prisma.invoiceRecord.findMany({
-      where: legacyOverdueWhere(range, COLLECTIONS_SINCE),
+      where: legacyOverdueWhere(range, COLLECTIONS_SINCE, now),
       include: { customer: true },
       orderBy: { dueAt: "asc" },
     }),
@@ -235,7 +234,7 @@ export async function buildReport(range: DateRange): Promise<ReportData> {
     {
       label: "Overdue Invoices in Collections Scope",
       value: formatCurrencyDetailed(overdueInvoiceTotal),
-      detail: `${formatNumber(overdueInvoices.length)} current past_due balances, issued since ${COLLECTIONS_SINCE.toISOString().slice(0, 10)} and in selected range`,
+      detail: `${formatNumber(overdueInvoices.length)} positive balances; ${overdueInvoices.filter(i => i.invoiceStatus === "awaiting_payment").length} calculated from stored due dates, not refreshed source status; issued since ${COLLECTIONS_SINCE.toISOString().slice(0, 10)} and in selected range`,
     },
     {
       label: "Estimated Uninvoiced Work",
@@ -272,7 +271,7 @@ export async function buildReport(range: DateRange): Promise<ReportData> {
     {
       label: "Past Due Before Collections Cutoff",
       value: formatCurrencyDetailed(legacyOverdueInvoices.reduce((sum, i) => sum + i.amountDue, 0)),
-      detail: `${legacyOverdueInvoices.length} older past_due records within selected range; not automatically settled`,
+      detail: `${legacyOverdueInvoices.length} older invoices past due by cached status or stored due date within selected range; not automatically settled`,
     },
     {
       label: "Excluded Invoice Value",
@@ -552,13 +551,15 @@ export async function buildReport(range: DateRange): Promise<ReportData> {
   sections.push({
     key: "overdue-invoices",
     title: "Overdue Invoices in Collections Scope",
-    description: `Current positive balances with cached Jobber "past_due" status, issued on or after ${COLLECTIONS_SINCE.toISOString().slice(
+    description: `Positive balances with cached past_due status or awaiting_payment whose stored due date has passed, issued on or after ${COLLECTIONS_SINCE.toISOString().slice(
       0,
       10
-    )}. Oldest due date first.`,
+    )}. Awaiting-payment aging is calculated from stored due dates, not refreshed source status or the original sent-day reminder clock. Oldest due date first.`,
     columns: [
       { header: "Invoice #", type: "text" },
       { header: "Customer", type: "text" },
+      { header: "Cached Status", type: "text" },
+      { header: "Display Basis", type: "text" },
       { header: "Issued", type: "date" },
       { header: "Due", type: "date" },
       { header: "Days Past Due", type: "int" },
@@ -570,6 +571,8 @@ export async function buildReport(range: DateRange): Promise<ReportData> {
     rows: overdueInvoices.map((i) => [
       i.invoiceNumber ?? null,
       nameOf(i.clientName, i.customer),
+      i.invoiceStatus,
+      overdueDisplayBasis(i, now),
       i.issuedAt,
       i.dueAt,
       i.dueAt
@@ -584,7 +587,7 @@ export async function buildReport(range: DateRange): Promise<ReportData> {
 
   for (const [key, title, description, records] of [
     ["invoice-review", "Invoice Balances Requiring Review", "Positive balances with non-open status. Verify current source, credits and actual payments before collection or settlement.", balanceReviewInvoices],
-    ["legacy-overdue", "Past Due Before Collections Cutoff", "Older past_due records within the selected range, excluded by the collections cutoff rather than proven settled. Do not automatically send catch-up reminders.", legacyOverdueInvoices],
+    ["legacy-overdue", "Past Due Before Collections Cutoff", "Older invoices past due by cached status or stored due date within the selected range, excluded by the collections cutoff rather than proven settled. Do not automatically send catch-up reminders.", legacyOverdueInvoices],
   ] as const) {
     sections.push({ key, title, description, columns: [
       { header: "Invoice #", type: "text" }, { header: "Customer", type: "text" },

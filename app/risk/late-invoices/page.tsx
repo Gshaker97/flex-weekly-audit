@@ -52,7 +52,7 @@ export default async function LateInvoicesPage() {
         <div className="mt-2">
           <h2 className="text-2xl font-semibold tracking-tight">Collections — Late Invoices</h2>
           <p className="mt-1 text-sm text-muted-foreground">
-            Positive cached past-due balances on invoices issued since January 1, 2026, including phone-only and email-only customers.
+            Positive balances on invoices issued since January 1, 2026: cached past_due status or awaiting_payment whose stored due date has passed. Stored-date aging is a display calculation, not refreshed source status or the original sent-day reminder clock. Includes phone-only and email-only customers.
             Reminder evidence is unverified: there is no stored association between an invoice,
             a reminder milestone and a message receipt. Unrelated outbound SMS does not prove a reminder was sent.
           </p>
@@ -63,13 +63,13 @@ export default async function LateInvoicesPage() {
         <StatCard
           label="Past-Due Invoices"
           value={rows.length}
-          sublabel="Cached past_due with positive amount due"
+          sublabel="Cached status or stored-date aging"
           icon={<FileText size={18} />}
         />
         <StatCard
           label="Total Past Due"
           value={formatCurrency(totalDue)}
-          sublabel="Positive cached past-due balances"
+          sublabel="Positive balances in this display scope"
           accent="warning"
           icon={<PiggyBank size={18} />}
         />
@@ -100,7 +100,7 @@ export default async function LateInvoicesPage() {
         </CardHeader>
         <CardContent>
           {rows.length === 0 ? (
-            <p className="text-sm text-muted-foreground">No positive cached past-due balances in this date scope.</p>
+            <p className="text-sm text-muted-foreground">No positive overdue balances by cached status or stored due date in this scope.</p>
           ) : (
             <div className="overflow-x-auto rounded-lg border border-border">
               <table className="w-full text-sm">
@@ -140,6 +140,8 @@ export default async function LateInvoicesPage() {
                         <div className="text-xs text-muted-foreground">
                           Stored due value: {collectionDateLabel(r.dueAt)}
                         </div>
+                        <div className="text-xs text-muted-foreground">Cached status: {r.cachedStatus ?? "Unknown"}</div>
+                        <div className="text-xs text-muted-foreground">{r.displayBasis}</div>
                       </td>
                       <td className="px-4 py-3 text-muted-foreground">
                         {collectionDateLabel(r.serviceDate)}

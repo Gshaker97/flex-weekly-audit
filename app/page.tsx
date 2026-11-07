@@ -51,21 +51,21 @@ export default async function DashboardPage({
 
   if (!lastSync) return <FirstSyncPrompt />;
 
+  const now = new Date();
   const range = resolveDateRange(searchParams);
   const kpis = await computeDashboardKPIs(range);
 
-  // Overdue invoices: use the same definition as the Collections tab — Jobber's
-  // exact "past_due" status, issued on/after the COLLECTIONS_SINCE cutoff — so
-  // this stat, its detail page, and Collections all report the same count.
-  // The selected range is intersected with the cutoff (never reaches earlier).
+  // Shared display population: cached past_due or awaiting_payment whose
+  // stored due date has passed, within the existing issue-date scope.
   const overdueUnpaid = await prisma.invoiceRecord.findMany({
-    where: overdueInvoicesWhere(range, COLLECTIONS_SINCE),
-    select: { amountDue: true },
+    where: overdueInvoicesWhere(range, COLLECTIONS_SINCE, now),
+    select: { amountDue: true, invoiceStatus: true },
   });
   const overdueInvoiceTotal = overdueUnpaid.reduce((a, i) => a + (i.amountDue || 0), 0);
   const overdueInvoiceCount = overdueUnpaid.length;
+  const agedAwaitingCount = overdueUnpaid.filter(i => i.invoiceStatus === "awaiting_payment").length;
   const legacyOverdue = await prisma.invoiceRecord.aggregate({
-    where: legacyOverdueWhere(range, COLLECTIONS_SINCE),
+    where: legacyOverdueWhere(range, COLLECTIONS_SINCE, now),
     _sum: { amountDue: true }, _count: true,
   });
 
@@ -146,8 +146,8 @@ export default async function DashboardPage({
       <section className="space-y-3">
         <SectionTitle title="Risk &amp; Gaps" />
         <p className="text-xs text-muted-foreground">
-          Current cached status and balances, filtered by issue or visit date. These are not historical as-of balances. Click a card for its records.
-          {(legacyOverdue._count ?? 0) > 0 && ` ${legacyOverdue._count} older past-due records / ${formatCurrencyDetailed(legacyOverdue._sum.amountDue ?? 0)} in this range are outside the Collections cutoff and remain listed for review.`}
+          Current cached status and balances, filtered by issue or visit date. Overdue invoices include cached past_due and awaiting_payment with a stored due date that has passed. The latter is a display calculation, not refreshed source status or the original sent-day reminder clock. These are not historical as-of balances.
+          {(legacyOverdue._count ?? 0) > 0 && ` ${legacyOverdue._count} older invoices past due by status or stored due date / ${formatCurrencyDetailed(legacyOverdue._sum.amountDue ?? 0)} in this range are outside the Collections cutoff and remain listed for review.`}
         </p>
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
           <ClickableStatCard
@@ -162,7 +162,7 @@ export default async function DashboardPage({
             href={`/risk/overdue-invoices${qs}`}
             label="Overdue in Collections scope"
             value={formatCurrency(overdueInvoiceTotal)}
-            sublabel={`${overdueInvoiceCount} positive past-due balances; issued since 2026-01-01`}
+            sublabel={`${overdueInvoiceCount} positive balances; ${agedAwaitingCount} calculated from stored due dates`}
             accent={overdueInvoiceTotal > 0 ? "danger" : "success"}
             icon={<Receipt size={18} />}
           />

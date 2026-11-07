@@ -48,12 +48,12 @@ test("no-phone blocks are distinct from historical reminder evidence", async () 
   assert.match(smsReadiness("not a valid number"), /eligibility unverified/);
 });
 
-test("collections selects positive cached past-due balances without email exclusion or live message lookups", async () => {
+test("collections uses the shared overdue display query without email exclusion or live message lookups", async () => {
   const fixtures = [
     { id: "phone-only", customer: { email: null, phone: "+16025550123" } },
     { id: "email-only", customer: { email: "synthetic@example.invalid", phone: null } },
     { id: "neither", customer: null },
-  ].map((item) => ({ invoiceNumber: null, dueAt: due, issuedAt: due, amountDue: 12, clientName: "Synthetic", ...item }));
+  ].map((item) => ({ invoiceNumber: null, invoiceStatus: "past_due", dueAt: due, issuedAt: due, amountDue: 12, clientName: "Synthetic", ...item }));
   const { mock } = await import("node:test");
   const queries: unknown[] = [];
   const globals = globalThis as unknown as { prisma?: unknown };
@@ -68,12 +68,12 @@ test("collections selects positive cached past-due balances without email exclus
   const network = mock.method(globalThis, "fetch", async () => { networkCalls++; throw new Error("No network allowed in this test"); });
   try {
     const { getLateInvoiceCollections } = await import("../lib/lateInvoices");
-    const rows = await getLateInvoiceCollections();
+    const rows = await getLateInvoiceCollections(due);
     assert.equal(rows.length, 3);
     assert.ok(rows.every((r) => r.reminders.every((c) => c.status === "unknown")));
     assert.equal(rows.find((r) => r.invoiceId === "phone-only")?.calledBy, "Sarah");
     assert.deepEqual(queries[0], {
-      where: { invoiceStatus: "past_due", amountDue: { gt: 0 }, issuedAt: { gte: new Date("2026-01-01T00:00:00Z") } },
+      where: { amountDue: { gt: 0 }, OR: [{ invoiceStatus: "past_due" }, { invoiceStatus: "awaiting_payment", dueAt: { lt: due } }], issuedAt: { gte: new Date("2026-01-01T00:00:00Z") } },
       include: { customer: true },
     });
     assert.equal(networkCalls, 0);

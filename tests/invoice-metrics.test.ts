@@ -58,8 +58,8 @@ test("positive paid/non-open conflicts are retained separately, without netting 
 });
 test("collections cutoff and legacy populations partition positive past due, excluding zero balances", () => {
   const all = { start: date("2000-01-01"), end: date("2026-12-31") };
-  assert.deepEqual(invoices.filter(i => matches(i, overdueInvoicesWhere(all, cutoff))).map(i => i.id), ["partial"]);
-  assert.deepEqual(invoices.filter(i => matches(i, legacyOverdueWhere(all, cutoff))).map(i => i.id), ["legacy"]);
+  assert.deepEqual(invoices.filter(i => matches(i, overdueInvoicesWhere(all, cutoff, date("2026-01-15")))).map(i => i.id), ["partial"]);
+  assert.deepEqual(invoices.filter(i => matches(i, legacyOverdueWhere(all, cutoff, date("2026-01-15")))).map(i => i.id), ["legacy"]);
 });
 test("open status with zero or negative balance is flagged, not assumed settled", () => {
   assert.match(invoiceReviewReason({ invoiceStatus: "past_due", amountDue: 0 }), /verify source and payment evidence/);

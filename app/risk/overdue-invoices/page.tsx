@@ -12,7 +12,7 @@ import { StatCard } from "@/components/ui/StatCard";
 import DateRangeFilter from "@/components/ui/DateRangeFilter";
 import { resolveDateRange, getDateRange } from "@/lib/dateRange";
 import { COLLECTIONS_SINCE } from "@/lib/lateInvoices";
-import { overdueInvoicesWhere, legacyOverdueWhere } from "@/lib/invoiceMetrics";
+import { overdueInvoicesWhere, legacyOverdueWhere, overdueDisplayBasis } from "@/lib/invoiceMetrics";
 import { formatCurrency, formatCurrencyDetailed, formatDate } from "@/lib/utils";
 import { Receipt, PiggyBank, Users } from "lucide-react";
 
@@ -30,18 +30,16 @@ export default async function OverdueInvoicesPage({
     !!searchParams.range || !!searchParams.start || !!searchParams.end;
   const range = hasFilter ? resolveDateRange(searchParams) : getDateRange("allTime");
 
-  // Past-due invoices — same definition as the Collections tab: Jobber's exact
-  // "past_due" status, issued on/after the COLLECTIONS_SINCE cutoff. The
-  // selected range is intersected with the cutoff so the count here matches the
-  // Collections tab and the dashboard "Overdue Invoices" stat.
+  // Same display predicate and issue-date cutoff as the dashboard/report.
+  // Stored-date aging does not overwrite the cached status or trigger reminders.
   const invoices = await prisma.invoiceRecord.findMany({
-    where: overdueInvoicesWhere(range, COLLECTIONS_SINCE),
+    where: overdueInvoicesWhere(range, COLLECTIONS_SINCE, now),
     include: { customer: true },
     orderBy: { dueAt: "asc" },
   });
 
   const legacyInvoices = await prisma.invoiceRecord.findMany({
-    where: legacyOverdueWhere(range, COLLECTIONS_SINCE),
+    where: legacyOverdueWhere(range, COLLECTIONS_SINCE, now),
     orderBy: { dueAt: "asc" },
   });
   const legacyTotal = legacyInvoices.reduce((sum, i) => sum + i.amountDue, 0);
@@ -81,8 +79,8 @@ export default async function OverdueInvoicesPage({
           <div>
             <h2 className="text-2xl font-semibold tracking-tight">Overdue Invoices</h2>
             <p className="mt-1 text-sm text-muted-foreground">
-              Current positive balances marked past due in the cache, issued since January 1, 2026 and within{" "}
-              <span className="font-medium text-foreground">{range.label}</span>. This is the Collections policy scope, not every historical past-due invoice.
+              Positive balances with cached past_due status or awaiting_payment whose stored due date has passed, issued since January 1, 2026 and within{" "}
+              <span className="font-medium text-foreground">{range.label}</span>. Stored-date aging is calculated for display, not refreshed source status or the original sent-day reminder clock. This is the Collections cutoff scope.
             </p>
           </div>
           <DateRangeFilter />
@@ -100,7 +98,7 @@ export default async function OverdueInvoicesPage({
         <StatCard
           label="Invoice Count"
           value={invoices.length}
-          sublabel="Unpaid, past due"
+          sublabel="Cached status or stored-date aging"
           icon={<Receipt size={18} />}
         />
         <StatCard
@@ -115,7 +113,7 @@ export default async function OverdueInvoicesPage({
         <CardHeader><CardTitle>Older Past Due Outside Collections Scope</CardTitle><CardDescription>{legacyInvoices.length} records / {formatCurrencyDetailed(legacyTotal)} within the selected range predate the cutoff. Policy exclusion does not prove settlement. Verify before any catch-up reminder.</CardDescription></CardHeader>
         <CardContent><div className="overflow-x-auto"><table className="w-full text-sm">
           <thead><tr className="text-left"><th className="p-2">Invoice</th><th className="p-2">Customer</th><th className="p-2">Issued</th><th className="p-2">Balance</th></tr></thead>
-          <tbody>{legacyInvoices.map(inv => <tr key={inv.id} className="border-t border-border"><td className="p-2">#{inv.invoiceNumber ?? "Unknown"}</td><td className="p-2">{inv.clientName ?? "Unknown"}</td><td className="p-2">{formatDate(inv.issuedAt)}</td><td className="p-2">{formatCurrencyDetailed(inv.amountDue)}</td></tr>)}</tbody>
+          <tbody>{legacyInvoices.map(inv => <tr key={inv.id} className="border-t border-border"><td className="p-2">#{inv.invoiceNumber ?? "Unknown"}<div className="text-xs text-muted-foreground">Cached status: {inv.invoiceStatus ?? "Unknown"}<br />{overdueDisplayBasis(inv, now)}</div></td><td className="p-2">{inv.clientName ?? "Unknown"}</td><td className="p-2">{formatDate(inv.issuedAt)}</td><td className="p-2">{formatCurrencyDetailed(inv.amountDue)}</td></tr>)}</tbody>
         </table></div></CardContent>
       </Card>}
 
@@ -155,6 +153,8 @@ export default async function OverdueInvoicesPage({
                         </td>
                         <td className="px-4 py-3 font-medium">
                           {inv.invoiceNumber ? `#${inv.invoiceNumber}` : "—"}
+                          <div className="text-xs font-normal text-muted-foreground">Cached status: {inv.invoiceStatus ?? "Unknown"}</div>
+                          <div className="text-xs font-normal text-muted-foreground">{overdueDisplayBasis(inv, now)}</div>
                         </td>
                         <td className="px-4 py-3 text-muted-foreground">
                           {formatDate(inv.dueAt)}

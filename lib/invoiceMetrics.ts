@@ -36,20 +36,43 @@ export function balanceReviewWhere(range?: Pick<DateRange, "start" | "end">): Pr
   };
 }
 
-export function overdueInvoicesWhere(range: Pick<DateRange, "start" | "end">, cutoff: Date): Prisma.InvoiceRecordWhereInput {
+// Presentation only. Aging an awaiting-payment row never changes its cached
+// status, refreshes Jobber, or establishes the original sent-day reminder clock.
+function overdueDisplayWhere(asOf: Date): Prisma.InvoiceRecordWhereInput {
+  if (!Number.isFinite(asOf.getTime())) throw new RangeError("Invalid display reference time");
   return {
-    invoiceStatus: "past_due",
     amountDue: { gt: 0 },
-    issuedAt: { gte: range.start > cutoff ? range.start : cutoff, lte: range.end },
+    OR: [
+      { invoiceStatus: "past_due" },
+      { invoiceStatus: "awaiting_payment", dueAt: { lt: asOf } },
+    ],
   };
 }
 
-export function legacyOverdueWhere(range: Pick<DateRange, "start" | "end">, cutoff: Date): Prisma.InvoiceRecordWhereInput {
+export function overdueInvoicesWhere(range: Pick<DateRange, "start" | "end"> | undefined, cutoff: Date, asOf: Date): Prisma.InvoiceRecordWhereInput {
   return {
-    invoiceStatus: "past_due",
-    amountDue: { gt: 0 },
+    ...overdueDisplayWhere(asOf),
+    issuedAt: range
+      ? { gte: range.start > cutoff ? range.start : cutoff, lte: range.end }
+      : { gte: cutoff },
+  };
+}
+
+export function legacyOverdueWhere(range: Pick<DateRange, "start" | "end">, cutoff: Date, asOf: Date): Prisma.InvoiceRecordWhereInput {
+  return {
+    ...overdueDisplayWhere(asOf),
     issuedAt: { gte: range.start, lte: range.end, lt: cutoff },
   };
+}
+
+export function overdueDisplayBasis(invoice: { invoiceStatus: string | null; amountDue: number; dueAt: Date | null }, asOf: Date): string | null {
+  if (!Number.isFinite(asOf.getTime()) || !(invoice.amountDue > 0)) return null;
+  if (invoice.invoiceStatus === "past_due") return "Cached past_due status";
+  if (invoice.invoiceStatus === "awaiting_payment" && invoice.dueAt &&
+      Number.isFinite(invoice.dueAt.getTime()) && invoice.dueAt < asOf) {
+    return "Calculated from stored due date";
+  }
+  return null;
 }
 
 export function invoiceValueIncluded(status: string | null | undefined): boolean {
