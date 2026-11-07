@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { prisma } from "@/lib/prisma";
+import { assertSyncAdmission, SyncAdmissionError } from "@/lib/sync-writer-control";
 import { runFullSync } from "@/lib/sync";
 import { logError } from "@/lib/log";
 
@@ -11,30 +11,16 @@ export const runtime = "nodejs";
 export const maxDuration = 800;
 export const dynamic = "force-dynamic";
 
-// If a run has been "running" longer than this, treat it as stale (e.g. the
-// container restarted mid-sync) and allow a new one to start.
-const STALE_RUNNING_MS = 20 * 60 * 1000;
-
 async function handle(req: NextRequest) {
-  const url = new URL(req.url);
-  const isCron =
-    req.headers.get("x-cron-secret") === process.env.CRON_SECRET ||
-    url.searchParams.get("cron_secret") === process.env.CRON_SECRET;
-
-  // Don't start a second sync if one is already in flight (and not stale).
-  const running = await prisma.syncRun.findFirst({
-    where: { status: "running" },
-    orderBy: { startedAt: "desc" },
-  });
-  if (
-    running &&
-    Date.now() - new Date(running.startedAt).getTime() < STALE_RUNNING_MS
-  ) {
-    return NextResponse.json(
-      { ok: true, alreadyRunning: true, syncId: running.id },
-      { status: 202 }
-    );
+  // A cron secret never bypasses the HTTP cutover barrier, on GET or POST.
+  try { assertSyncAdmission("http"); }
+  catch (err) {
+    return NextResponse.json({ ok: false, error: err instanceof SyncAdmissionError ? err.message : "Sync admission unavailable" }, { status: 503 });
   }
+  const url = new URL(req.url);
+  const isCron = Boolean(process.env.CRON_SECRET) && (
+    req.headers.get("x-cron-secret") === process.env.CRON_SECRET ||
+    url.searchParams.get("cron_secret") === process.env.CRON_SECRET);
 
   const forceFull =
     url.searchParams.get("full") === "1" ||
@@ -47,6 +33,7 @@ async function handle(req: NextRequest) {
   // /api/sync/status for completion.
   void runFullSync({
     triggeredBy: isCron ? "cron" : "manual",
+    entrypoint: "http",
     full: forceFull,
   }).catch((err) =>
     logError("[sync] background run failed:", err?.message ?? err)

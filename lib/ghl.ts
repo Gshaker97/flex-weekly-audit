@@ -69,6 +69,10 @@ async function ghlFetch<T = any>(
       clearTimeout(timer);
     }
     if (res.status === 429) {
+      // Do not automatically replay a mutation without an idempotency key.
+      if (init.method && init.method !== "GET" && path !== "/contacts/search") {
+        throw new Error(`GHL mutation rate limited; review outcome before retry (${path})`);
+      }
       const waitMs = 5000 * (attempt + 1);
       await new Promise((r) => setTimeout(r, waitMs));
       attempt += 1;
@@ -139,7 +143,58 @@ export async function getInvoicePipelineRefs(): Promise<InvoicePipelineRefs> {
 
 export interface GhlContact {
   id: string;
+  additionalEmails?: Array<{ email: string }> | null;
+  additionalPhones?: Array<{ phone: string }> | null;
   email?: string | null;
+  phone?: string | null;
+}
+
+// Read-only POST search contract, pinned to our 2021-07-28 API version:
+// https://marketplace.gohighlevel.com/docs/2021-07-28/ghl/contacts/search-contacts-advanced/index.html
+// `total` is the matching population, not a page count. Preserve the last
+// contact's searchAfter unchanged; numbered pages truncate beyond 10,000 rows.
+export async function listContactsForPhoneMatching(): Promise<GhlContact[]> {
+  const locationId = ghlLocationId();
+  const pageLimit = 100;
+  const seenCursors = new Set<string>();
+  const contacts = new Map<string, GhlContact>();
+  let searchAfter: Array<string | number> | undefined;
+  let expectedTotal: number | undefined;
+  for (let page = 0; page < 1000; page++) {
+    const data: any = await ghlFetch("/contacts/search", {
+      method: "POST",
+      body: JSON.stringify({ locationId, pageLimit, fastPagination: false,
+        sort: [{ field: "dateAdded", direction: "asc" }],
+        ...(searchAfter ? { searchAfter } : { page: 1 }) }),
+    });
+    const total = data.total;
+    if (!Array.isArray(data.contacts) || data.contacts.length > pageLimit ||
+        !Number.isSafeInteger(total) || total < 0 ||
+        (expectedTotal !== undefined && total !== expectedTotal)) {
+      throw new Error("Unverified GHL contact snapshot pagination");
+    }
+    expectedTotal = total;
+    for (const contact of data.contacts) {
+      if (typeof contact?.id !== "string" || !contact.id || contacts.has(contact.id) ||
+          (contact.locationId != null && contact.locationId !== locationId)) {
+        throw new Error("Duplicate or invalid GHL snapshot contact");
+      }
+      contacts.set(contact.id, contact);
+    }
+    if (contacts.size > total) throw new Error("Inconsistent GHL contact total");
+    if (contacts.size === total) return [...contacts.values()];
+    const cursor = data.contacts[data.contacts.length - 1]?.searchAfter;
+    if (!Array.isArray(cursor) || !cursor.length || cursor.some(value =>
+      !(typeof value === "string" && value.length > 0) &&
+      !(typeof value === "number" && Number.isFinite(value)))) {
+      throw new Error("Missing GHL contact continuation cursor");
+    }
+    const key = JSON.stringify(cursor);
+    if (seenCursors.has(key)) throw new Error("Repeated GHL contact continuation cursor");
+    seenCursors.add(key);
+    searchAfter = cursor;
+  }
+  throw new Error("GHL contact snapshot exceeded page limit");
 }
 
 // Look up a contact by email. The `query` param is a fuzzy match, so we prefer
@@ -198,6 +253,8 @@ export interface GhlOpportunity {
   pipelineId?: string | null;
   pipelineStageId?: string | null;
   contactId?: string | null;
+  status?: string | null;
+  monetaryValue?: number | null;
 }
 
 // All opportunities for a contact within a pipeline. The search endpoint uses
@@ -222,34 +279,61 @@ export async function searchOpportunities(
 export async function listPipelineOpportunities(
   pipelineId: string
 ): Promise<GhlOpportunity[]> {
-  const loc = encodeURIComponent(ghlLocationId());
-  const pid = encodeURIComponent(pipelineId);
-  const out: GhlOpportunity[] = [];
-  let path: string | null = `/opportunities/search?location_id=${loc}&pipeline_id=${pid}&limit=100`;
-  let page = 0;
-  while (path) {
-    const data: any = await ghlFetch(path);
-    for (const o of data.opportunities ?? []) {
-      out.push({
-        id: o.id,
-        name: o.name ?? null,
-        pipelineId: o.pipelineId ?? null,
-        pipelineStageId: o.pipelineStageId ?? null,
-        contactId: o.contactId ?? null,
-      });
+  const params = new URLSearchParams({ location_id: ghlLocationId(), pipeline_id: pipelineId,
+    status: "all", limit: "100" });
+  const out = new Map<string, GhlOpportunity>();
+  const cursors = new Set<string>();
+  let expectedTotal: number | undefined;
+  for (let page = 0; page < 1000; page++) {
+    const data: any = await ghlFetch(`/opportunities/search?${params}`);
+    const total = data.meta?.total;
+    if (!Array.isArray(data.opportunities) || !Number.isSafeInteger(total) || total < 0 ||
+        (expectedTotal !== undefined && total !== expectedTotal)) throw new Error("Incomplete GHL pipeline snapshot");
+    expectedTotal = total;
+    for (const card of data.opportunities) {
+      if (typeof card?.id !== "string" || !card.id || out.has(card.id) || card.pipelineId !== pipelineId) {
+        throw new Error("Duplicate or misrouted GHL pipeline card");
+      }
+      out.set(card.id, card);
     }
-    const m = data.meta ?? {};
-    if (m.startAfterId && m.startAfter && (data.opportunities?.length ?? 0) > 0) {
-      path =
-        `/opportunities/search?location_id=${loc}&pipeline_id=${pid}&limit=100` +
-        `&startAfter=${encodeURIComponent(m.startAfter)}` +
-        `&startAfterId=${encodeURIComponent(m.startAfterId)}`;
-    } else {
-      path = null;
+    if (out.size > total) throw new Error("Inconsistent GHL pipeline total");
+    if (out.size === total) return [...out.values()];
+    const { startAfter, startAfterId } = data.meta;
+    if ((!Number.isFinite(startAfter) && !(typeof startAfter === "string" && startAfter.length)) ||
+        typeof startAfterId !== "string" || !startAfterId || !data.opportunities.length) {
+      throw new Error("Missing GHL pipeline cursor");
     }
-    if (++page > 50) break;
+    const key = JSON.stringify([startAfter, startAfterId]);
+    if (cursors.has(key)) throw new Error("Repeated GHL pipeline cursor");
+    cursors.add(key);
+    params.set("startAfter", String(startAfter));
+    params.set("startAfterId", startAfterId);
   }
-  return out;
+  throw new Error("GHL pipeline snapshot exceeded page limit");
+}
+
+// Phone path never selects a first card or invokes duplicate-create recovery.
+// Pinned GET search docs define meta.total and the snake_case filters. Search
+// every status so a hidden closed duplicate cannot establish false uniqueness.
+// https://marketplace.gohighlevel.com/docs/2021-07-28/ghl/opportunities/search-opportunity/index.html
+export async function findSinglePhoneOpportunity(contactId: string, pipelineId: string): Promise<GhlOpportunity | null> {
+  const params = new URLSearchParams({ location_id: ghlLocationId(), pipeline_id: pipelineId,
+    contact_id: contactId, status: "all", limit: "100" });
+  const data: any = await ghlFetch(`/opportunities/search?${params}`);
+  if (!Array.isArray(data.opportunities) || data.meta?.total !== data.opportunities.length ||
+      data.opportunities.length !== 1) return null;
+  const opportunity = data.opportunities[0];
+  if (opportunity.contactId !== contactId || opportunity.pipelineId !== pipelineId ||
+      opportunity.status !== "open" || !opportunity.id) return null;
+  return opportunity;
+}
+
+// Re-read immediately before a stage mutation. This is not an atomic lock;
+// callers must still avoid overlapping runs and review unknown PUT outcomes.
+export async function readOpportunity(opportunityId: string): Promise<GhlOpportunity> {
+  const data = await ghlFetch<{ opportunity: GhlOpportunity }>(`/opportunities/${encodeURIComponent(opportunityId)}`);
+  if (!data.opportunity || data.opportunity.id !== opportunityId) throw new Error("Unverified GHL opportunity readback");
+  return data.opportunity;
 }
 
 export async function moveOpportunityToStage(
@@ -258,10 +342,8 @@ export async function moveOpportunityToStage(
   monetaryValue?: number,
   name?: string
 ): Promise<void> {
-  // Always force status "open" so won/lost cards become visible again when
-  // they're moved (e.g. back into "Invoice Overdue"). Optionally refresh the
-  // monetary value and/or rename the card in the same PUT.
-  const body: Record<string, any> = { pipelineStageId, status: "open" };
+  // Preserve status. A stale snapshot must never automatically reopen a card.
+  const body: Record<string, any> = { pipelineStageId };
   if (monetaryValue != null) body.monetaryValue = monetaryValue;
   if (name != null) body.name = name;
   await ghlFetch(`/opportunities/${opportunityId}`, {
@@ -286,32 +368,10 @@ export async function createOpportunity(opts: {
     status: "open",
     monetaryValue: opts.monetaryValue ?? 0,
   };
-  try {
-    const data = await ghlFetch<{ opportunity: GhlOpportunity }>(
-      `/opportunities/`,
-      { method: "POST", body: JSON.stringify(body) }
-    );
-    return data.opportunity;
-  } catch (err: any) {
-    // GHL rejects an already-existing opportunity with 400 "Can not create
-    // duplicate opportunity" and returns its id in meta.existingId. Rather than
-    // failing, move that existing opportunity into the target stage — this is
-    // what makes overdue invoices update existing cards instead of only the
-    // brand-new ones.
-    const existingId: string | undefined =
-      err?.status === 400 ? err?.body?.meta?.existingId : undefined;
-    if (existingId) {
-      await moveOpportunityToStage(existingId, opts.pipelineStageId);
-      return {
-        id: existingId,
-        name: opts.name,
-        pipelineId: opts.pipelineId,
-        pipelineStageId: opts.pipelineStageId,
-        contactId: opts.contactId,
-      };
-    }
-    throw err;
-  }
+  const data = await ghlFetch<{ opportunity: GhlOpportunity }>(
+    `/opportunities/`, { method: "POST", body: JSON.stringify(body) }
+  );
+  return data.opportunity;
 }
 
 // Permanently delete an opportunity (the card only — the contact is untouched).
