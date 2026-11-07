@@ -90,3 +90,33 @@ Additional local checks:
 node --import tsx --test tests/jobber-source-audit.test.ts tests/ghl-readonly-preview.test.ts tests/jobber-ghl-bridge.test.ts
 ./node_modules/.bin/tsc --noEmit --pretty false --incremental false
 ```
+
+## Optional exact-invoice evidence supplement
+
+The `--with-invoice-evidence` flag adds a separate, fail-soft outcome after the core comparison and capability probe. The source comparison, deployment guards, original hook invocation, 15-minute token coverage gate, 14-minute runtime, and 14.5-minute watchdog remain unchanged. Without the flag, no additional requests occur. No app, scheduled sync, GHL, schema, auth, or deployment settings are changed by this patch.
+
+Explicit invocation, only in the already-authorized existing web deployment after publishing and deploying the reviewed patch:
+
+```sh
+node --import tsx scripts/audit-jobber-source.ts --run-in-deployment --probe-capabilities --with-invoice-evidence
+```
+
+This is a new optional invocation, not authorization to replace or remove an existing deployment hook. Preserve its required checks. The flag may coexist with `--with-ghl-preview`, but both phases share the unchanged overall budget, and either optional phase can be incomplete independently. The top-level `outcome: complete` still refers only to the core source/cache comparison; check `invoiceEvidence.outcome`, each target outcome, and `invoiceEvidenceOutcome` in the summary.
+
+- Targets are derived from all in-memory source/cache rows, never from a shipped list of customer IDs. The union includes source or cache paid-positive balances, negative balances, source/cache status differences, cache-only records, and source or cache positive `past_due` invoices issued on/after January 1, 2026. Cache reasons describe cached state, not proven current state. The cutoff does not exclude older payment conflicts, credits, differences, or cache-only records.
+- The existing `lib/sync.ts` reconciliation verifies the root shape `invoice(id: EncodedId!)`. The supplement additionally checks that root argument and return type plus the required enum metadata in one bounded schema request. It reads `updatedAt` only if the live Invoice metadata confirms `ISO8601DateTime`; otherwise it explicitly marks that field unavailable. A timestamp alone does not establish the cause of cache lag.
+- Exact invoice reads include current status, balance, total/subtotal/discount, owner ID, issue/due/creation dates, net terms, and optional `updatedAt`. Cached status/balance/owner, issue/due dates and last-sync time are retained as separate evidence. No names, emails, phones, local customer IDs, raw notes, card last four, or payment methods are output. No full source identity verification is performed; cached primary-only identities and any competing/secondary owners remain unverified.
+- Payments include only opaque record ID, amount, entry date, adjustment type, transaction status and tip amount. Entry date is not assumed to be bank settlement or invoice sent date. Allocations/refunds are not enumerated, amounts are not summed as invoice receipts, and no bank receipt claim is made.
+- Every line item is examined in memory, but only controlled fee-wording labels and their matching field names, prices, quantity, category and safe dates are retained for candidates. Arbitrary names/descriptions are never output. Word matches, including negated or waived wording, are candidates only, never proof that a fee was applied or collected. No matching label does not prove absence of a fee.
+- Payment and line-item connections paginate independently. Both require unique IDs/cursors, a terminal page, stable `totalCount`, and a final observed count equal to `totalCount`. Each continuation rechecks invoice metadata for drift. These observations are not atomic snapshots; changes within records or between invoice reads remain possible.
+- A null exact read is reported as `not_returned_by_exact_read`, not as deleted, void, or paid. Other targets still run. Any null target makes the supplement incomplete while preserving all observations and indicating whether every target was attempted. Transport/schema/other validation failures stop this optional phase with a controlled code and safe partial evidence.
+- `linkedCommunications` has no usable node in the verified schema. No communication body, delivery/reminder history or original sent date is fetched or inferred.
+
+Supplement-only bounds: 128 exact targets, 384 HTTP requests including the schema request, 25 nodes/page, eight pages and 200 records per nested connection, four minutes, and two MB of safe report content. Exceeding a bound reports incomplete, never a silently truncated success. One attempt per request; no retries or refresh. The phase deadline is also capped 60 seconds before the unchanged overall normal deadline, and it requires at least 30 seconds of remaining phase time before starting. Existing per-response, total-byte and request-time limits still apply. If the combined report exceeds the original eight MB cap, the supplement is replaced with an explicit incomplete result rather than dropping core evidence.
+
+Local synthetic checks (no credentials, database, deployment or live API calls):
+
+```sh
+node --import tsx --test tests/jobber-invoice-evidence.test.ts tests/jobber-source-audit.test.ts tests/ghl-readonly-preview.test.ts tests/jobber-ghl-bridge.test.ts
+./node_modules/.bin/tsc --noEmit --pretty false --incremental false
+```

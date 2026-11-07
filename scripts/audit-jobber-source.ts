@@ -5,6 +5,7 @@ import { AuditFailure, CacheRow, compare, deriveTargets, LIMITS, paginate } from
 import { Budget, capabilityProbe, expiryMinutes, JobberReader, requireTokenRunCoverage } from './source-audit/transport';
 import { reportLines } from './source-audit/output';
 import { runOptionalGhlPreview } from './source-audit/run-ghl-preview';
+import { runOptionalInvoiceEvidence } from './source-audit/invoice-evidence';
 
 const budget = new Budget();
 let stage = 'configuration';
@@ -49,7 +50,7 @@ async function snapshot(prisma: PrismaClient, authNeeded: boolean) {
   }, { isolationLevel: 'RepeatableRead', maxWait: 10_000, timeout: 60_000 });
 }
 async function main() {
-  if (process.argv[2] !== '--run-in-deployment' || process.argv.slice(3).some(a => !['--probe-capabilities', '--with-ghl-preview'].includes(a))) throw new AuditFailure('EXPLICIT_DEPLOYMENT_FLAG_REQUIRED');
+  if (process.argv[2] !== '--run-in-deployment' || process.argv.slice(3).some(a => !['--probe-capabilities', '--with-ghl-preview', '--with-invoice-evidence'].includes(a))) throw new AuditFailure('EXPLICIT_DEPLOYMENT_FLAG_REQUIRED');
   if (!process.env.RAILWAY_SERVICE_ID || !process.env.RAILWAY_ENVIRONMENT_ID || !process.env.RAILWAY_DEPLOYMENT_ID || !process.env.DATABASE_URL) throw new AuditFailure('EXISTING_RAILWAY_DEPLOYMENT_REQUIRED');
   if (process.env.RAILWAY_SERVICE_ID !== 'ed22ce04-2e5d-47d1-98ed-ce63c99d3d9f' ||
       process.env.RAILWAY_ENVIRONMENT_ID !== 'bc72bc2d-9a4c-494d-8bee-9ca782db1240' ||
@@ -77,6 +78,8 @@ async function main() {
     const report = compare(result.records, after.rows, deriveTargets(after.rows));
     stage = 'optional-capability-probe';
     const capabilities = process.argv.includes('--probe-capabilities') ? await capabilityProbe(reader) : { available: false, reason: 'NOT_REQUESTED', fields: [] };
+    stage = 'optional-invoice-evidence';
+    const invoiceEvidence = await runOptionalInvoiceEvidence(reader, result.records, after.rows, process.argv.includes('--with-invoice-evidence'));
     stage = 'optional-ghl-preview';
     const ghlPreview = await runOptionalGhlPreview(prisma, budget, result.records, after.rows, {
       enabled: process.argv.includes('--with-ghl-preview'), apiKey: process.env.GHL_API_KEY, locationId: process.env.GHL_LOCATION_ID,
@@ -89,7 +92,7 @@ async function main() {
       sourceRead: { startedAt: sourceStartedAt, finishedAt: sourceFinishedAt, filters: null, queryIsUnfiltered: true, apiDefaultStatusScopeVerified: false, pages: result.pages, uniqueIds: result.uniqueIds, uniqueCursors: result.uniqueCursors, terminalPageObserved: true,
         firstPageUnchangedOnRecheck: true, sourceIsAtomicSnapshot: false, totalCountFieldAvailableInExistingQuery: false },
       cacheRead: { before: before.capturedAt, after: after.capturedAt, unchangedDuringAudit: true, databaseEnforcedReadOnly: true },
-      ...report, capabilities, ghlPreview,
+      ...report, capabilities, invoiceEvidence, ghlPreview,
       limitations: [
         'Complete means every page returned by the query with no explicit filters was consumed with unique IDs/cursors and a terminal page. API default status filtering is unverified; it does not mean every account status is included, the records agree, or every field is known.',
         'Jobber pagination is not an atomic snapshot. The first page was checked again, but changes elsewhere during the read cannot be excluded. Cache/source snapshots are not transactional across systems; verify each differing invoice afresh before any later correction.',
@@ -100,12 +103,15 @@ async function main() {
         'Source status is compared without inferring paid from zero, negative or missing balance.',
         'Total minus balance and stored amountPaid are not verified cash receipts. Actual payment dates are unavailable; issuedDate is never used as a payment date.',
         'Date-only issue/due fields are compared by calendar date; creation timestamps by instant. Numeric/object/unknown date scalars remain unverifiable.',
-        'Core Jobber audit fetches no sent timestamp, payment transaction, line item/fee content, reminder messages or GHL evidence. Optional GHL preview, when explicitly enabled, has its own outcome and limitations.',
+        'Core Jobber audit fetches no sent timestamp, payment transaction, line item/fee content, reminder messages or GHL evidence. Optional invoice evidence and GHL preview, when explicitly enabled, have separate outcomes and limitations.',
         'No OAuth refresh, auth row update, invoice write, sync trigger, workflow call, GHL mutation, service configuration change or new endpoint is performed.',
       ],
     };
     if (Buffer.byteLength(JSON.stringify(final)) > LIMITS.outputBytes && process.argv.includes('--with-ghl-preview')) {
       final.ghlPreview = { outcome: 'incomplete', code: 'GHL_COMBINED_REPORT_LIMIT', countsAreComplete: false, mutationAllowed: false };
+    }
+    if (Buffer.byteLength(JSON.stringify(final)) > LIMITS.outputBytes && process.argv.includes('--with-invoice-evidence')) {
+      final.invoiceEvidence = { outcome: 'incomplete', code: 'EVIDENCE_COMBINED_REPORT_LIMIT', countsAreComplete: false, mutationAllowed: false };
     }
     stage = 'database-disconnect';
     await prisma.$disconnect();
@@ -116,7 +122,7 @@ async function main() {
       sourceTotalCents: report.source.totalCents, cacheTotalCents: report.cache.totalCents,
       sourcePositiveBalanceCents: report.source.positiveBalanceCents, sourcePaidPositiveCount: report.source.paidPositiveCount,
       sourcePaidPositiveBalanceCents: report.source.paidPositiveBalanceCents, sourceNegativeBalanceCents: report.source.negativeBalanceCents,
-      comparison: report.comparison, detailsTruncated: report.detailsTruncated, ghlPreviewOutcome: final.ghlPreview.outcome });
+      comparison: report.comparison, detailsTruncated: report.detailsTruncated, invoiceEvidenceOutcome: final.invoiceEvidence.outcome, ghlPreviewOutcome: final.ghlPreview.outcome });
     finished = true; process.exitCode = 0;
   } finally {
     // A hard watchdog remains active if disconnect itself stalls.
