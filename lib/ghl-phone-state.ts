@@ -1,4 +1,5 @@
 import { jobberGraphQL } from "./jobber";
+import { invoiceReminderClock } from "./invoice-reminder-clock";
 
 export interface PhoneInvoiceEvidence {
   id: string;
@@ -71,7 +72,6 @@ export function phoneSourcePlan(
   let overdueCents = 0;
   let overdueCount = 0;
   for (const inv of invoices) {
-    const issued = new Date(inv.issuedDate ?? inv.createdAt ?? "");
     const total = moneyCents(inv.amounts?.total);
     const balance = moneyCents(inv.amounts?.invoiceBalance);
     if (total === null || balance === null || balance > total) return null;
@@ -79,10 +79,13 @@ export function phoneSourcePlan(
     // Explicitly settled historical/zero-total rows are accounted for, not
     // silently omitted. Positive/unknown/void balances still block an exit.
     if (status === "paid" && balance === 0) continue;
-    if (!Number.isFinite(issued.getTime()) || issued < new Date("2026-01-01T00:00:00Z") || total === 0) return null;
-    const due = new Date(inv.dueDate ?? "");
-    if (balance > 0 && (status === "past_due" || (status === "awaiting_payment" && Number.isFinite(due.getTime())))) {
-      if (status === "past_due" || due < now) {
+    const clock = invoiceReminderClock(inv.issuedDate, inv.dueDate, now);
+    if (!clock || clock.sentOn < "2026-01-01" || total === 0) return null;
+    // A contradictory early past_due label is held, not used to enroll early
+    // or demote a card. Both open statuses use the same due-date clock.
+    if (status === "past_due" && !clock.isOverdue) return null;
+    if (balance > 0 && (status === "past_due" || status === "awaiting_payment")) {
+      if (clock.isOverdue) {
         overdueCents += balance;
         if (!Number.isSafeInteger(overdueCents)) return null;
         overdueCount += 1;

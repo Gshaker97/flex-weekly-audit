@@ -59,7 +59,7 @@ test("ordinary decimal cents survive binary floating point and aggregate in inte
   }
   for (const invoiceStatus of ["past_due", "awaiting_payment"]) {
     const source = [0.1, 0.2].map((invoiceBalance, index) => ({ ...invoice,
-      id: index ? "second" : invoice.id, invoiceStatus, dueDate: "2099-01-01",
+      id: index ? "second" : invoice.id, invoiceStatus, dueDate: invoiceStatus === "past_due" ? "2026-06-01" : "2099-01-01",
       amounts: { total: 100, invoiceBalance },
     }));
     assert.deepEqual(plan(source), { stage: invoiceStatus === "past_due" ? "Invoice Overdue" : "Invoice Sent", total: 0.3, count: 2 });
