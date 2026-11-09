@@ -1,6 +1,8 @@
 // Phone identity is deliberately narrower than SMS eligibility or permission.
 export function canonicalPhone(value?: string | null): string | null {
-  const raw = value?.trim() ?? "";
+  let raw = value?.trim() ?? "";
+  // Exact observed US presentation wrapper only; never guess or discard digits.
+  if (/^: [2-9]\d{2}-[2-9]\d{2}-\d{4}$/.test(raw)) raw = raw.slice(2);
   if (!/^\+?[\d ().-]+$/.test(raw)) return null;
   let phone = raw.replace(/[ ().-]/g, "");
   // User confirmed local-format Flex numbers are US. Explicit international

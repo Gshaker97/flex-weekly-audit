@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { Prisma, PrismaClient, SyncRun } from "@prisma/client";
 import { prisma } from "./prisma";
+import { invoiceCalendarDate } from "./invoice-reminder-clock";
 
 export type SyncEntrypoint = "http" | "standalone_cron";
 const JOURNAL_PREFIX = "FLEX_GHL_WRITE_JOURNAL_V1:";
@@ -59,13 +60,17 @@ export interface GhlWriteIntent {
   opportunityId: string;
   jobberClientId: string;
   expected: { stageId: string; status: "open"; amountCents: number; nameHash: string };
-  target: { stageId: string; amountCents: number; nameHash: string; updateName: boolean };
+  target: { stageId: string; amountCents: number; nameHash: string; updateName: boolean; status?: "open" };
   source: {
     observedAt: string;
     storedInvoiceIds: string[];
     invoices: Array<{ id: string; jobberClientId: string; invoiceStatus: string;
       totalCents: number; balanceCents: number; issuedDate: string | null; createdAt: string | null; dueDate: string | null }>;
   };
+  // Optional exact blank-only date repair. No stage/amount/name side effects.
+  // Retained in the same durable journal before the single provider attempt.
+  dateField?: { locationId: string; fieldId: string; key: "opportunity.due_date";
+    invoiceId: string; expectedValue: "" | null; targetValue: string; sourceFingerprint: string };
 }
 interface JournalEntry { id: string; state: "pending" | "confirmed"; preparedAt: string; confirmedAt?: string; fingerprint: string; intent: GhlWriteIntent }
 interface Journal { version: 1; runId: string; warnings: string | null; writes: JournalEntry[] }
@@ -92,6 +97,18 @@ function validateIntent(v: GhlWriteIntent): void {
     ids.add(i.id);
   }
   if (new Set(v.source.storedInvoiceIds).size !== v.source.storedInvoiceIds.length || v.source.storedInvoiceIds.some(id => !ids.has(id))) throw new SyncWriterBlockedError();
+  if (v.dateField !== undefined) {
+    const f = v.dateField;
+    const source = v.source.invoices.find(i => i.id === f?.invoiceId);
+    if (!f || !identity(f.locationId) || !identity(f.fieldId) || f.key !== "opportunity.due_date"
+        || !source || !v.source.storedInvoiceIds.includes(f.invoiceId)
+        || !["past_due", "awaiting_payment"].includes(source.invoiceStatus) || source.balanceCents <= 0
+        || (f.expectedValue !== "" && f.expectedValue !== null) || !digest(f.sourceFingerprint)
+        || !/^\d{4}-\d{2}-\d{2}$/.test(f.targetValue) || invoiceCalendarDate(f.targetValue) !== f.targetValue
+        || invoiceCalendarDate(source.dueDate) !== f.targetValue
+        || v.target.status !== v.expected.status || v.target.stageId !== v.expected.stageId || v.target.amountCents !== v.expected.amountCents
+        || v.target.nameHash !== v.expected.nameHash || v.target.updateName) throw new SyncWriterBlockedError();
+  }
 }
 function journal(message: string | null, runId: string): Journal | null {
   if (!message?.startsWith(JOURNAL_PREFIX)) return null;

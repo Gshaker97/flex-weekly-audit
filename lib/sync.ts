@@ -3,6 +3,7 @@ import { admitSyncRun, SyncEntrypoint, SyncRunWriter, SyncWriterBlockedError } f
 import { buildGhlWriteIntent, approvedGhlCards } from "./ghl-write-intent";
 import { verifyFreshGhlIdentity, readFreshJobberIdentities, strictGhlIdentityHold, validGhlContactIdentity } from "./ghl-write-identity";
 import { refreshOpenInvoiceStatuses } from "./open-invoice-status-refresh";
+import { runConfiguredDateRepair } from "./ghl-date-repair-operation";
 import {
   fetchAllClients,
   fetchAllJobs,
@@ -262,6 +263,14 @@ export async function runFullSync(
       logError("GHL invoice sync failed (continuing):", err?.message ?? err);
     }
 
+    // No-op unless an exact, short-lived request is separately approved and
+    // enabled. Only the admitted standalone cron can reach a field-only write;
+    // review mode and phone-write hold remain required. Unknown outcomes retain
+    // the durable barrier and must not be swallowed as a best-effort failure.
+    const dateRepair = await runConfiguredDateRepair({ writer, entrypoint: opts.entrypoint ?? "http" });
+    if (dateRepair.state !== "disabled") log(`[sync] exactOpportunityDateRepair: ${dateRepair.state}`);
+    if (dateRepair.state === "applied") await prisma.syncRun.update({ where: { id: run.id },
+      data: { ghlOpportunitiesSynced: { increment: 1 } } });
     return await writer.finish("complete");
   } catch (err: any) {
     // Never release admission while a rejected feed still has sibling work.

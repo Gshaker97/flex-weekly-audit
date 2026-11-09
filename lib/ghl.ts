@@ -255,6 +255,33 @@ export interface GhlOpportunity {
   contactId?: string | null;
   status?: string | null;
   monetaryValue?: number | null;
+  locationId?: string | null;
+  customFields?: Array<{ id: string; fieldValue: unknown }>;
+}
+
+// Version-pinned contract: 2021-07-28 writes field_value; GET returns fieldValue.
+// Do not silently switch the whole integration to the new v3 API.
+export async function readOpportunityCustomFields(): Promise<unknown> {
+  return ghlFetch(`/locations/${encodeURIComponent(ghlLocationId())}/customFields?model=opportunity`);
+}
+
+// Read-only metadata contract, including status/version/updatedAt/locationId.
+// No publish/edit endpoint is exposed by this helper.
+export async function readWorkflowStates(): Promise<unknown> {
+  // The live provider returns 404 without this trailing slash.
+  return ghlFetch(`/workflows/?${new URLSearchParams({ locationId: ghlLocationId() })}`);
+}
+
+/** Low-level transport only. Call through the admitted blank-date repair writer,
+ * never from an unauthenticated route, preview, or generic stage update. */
+export async function setOpportunityDueDate(opportunityId: string, fieldId: string, date: string): Promise<void> {
+  if (![opportunityId, fieldId].every(v => /^[A-Za-z0-9_-]{1,128}$/.test(v))
+      || !/^\d{4}-\d{2}-\d{2}$/.test(date) || new Date(`${date}T00:00:00Z`).toISOString().slice(0, 10) !== date) {
+    throw new Error("Invalid exact opportunity date update");
+  }
+  await ghlFetch(`/opportunities/${encodeURIComponent(opportunityId)}`, {
+    method: "PUT", body: JSON.stringify({ customFields: [{ id: fieldId, field_value: date }] }),
+  });
 }
 
 // All opportunities for a contact within a pipeline. The search endpoint uses
