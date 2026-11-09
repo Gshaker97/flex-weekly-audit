@@ -90,3 +90,12 @@ test("field mutation 429 is not automatically replayed",async()=>{process.env.GH
 test("full opportunity GET retains fieldValue contract and exact ID",async()=>{process.env.GHL_API_KEY="synthetic";globalThis.fetch=async()=>new Response(JSON.stringify({opportunity:fixture().currentCard}),{status:200});assert.deepEqual((await readOpportunity("opp-1")).customFields,fixture().currentCard.customFields);await assert.rejects(readOpportunity("other"),/readback/);});
 test("verified sparse full-card date contract journals null and preserves omitted other fields",async()=>{const h=harness();delete h.snapshot.currentCard.customFields;h.snapshot.field.currentValue=null;h.input.approval.intentSha256=dateRepairIntentHash(planOpportunityDueDate(h.snapshot).intent);h.input.transport.read=async()=>({...h.snapshot.currentCard,customFields:[{id:"date-1",fieldValue:"2026-11-02"}]});assert.equal((await repairOpportunityDueDate(h.input)).state,"applied");assert.match(h.f.rows[0].errorMessage,/"expectedValue":null/);});
 test("unavailable fresh identity before admission holds repair without blocking cache sync",async()=>{const h=harness();h.input.readFresh=async()=>{throw new Error("identity unavailable")};const r=await repairOpportunityDueDate(h.input);assert.equal(r.state,"held");assert.equal(h.f.rows[0].status,"running");assert.equal(h.f.rows[0].errorMessage,null);assert.ok(!h.calls.includes("PUT"));});
+
+for(const invalid of [undefined,null,123])test(`date repair rejects non-string approval ${String(invalid)} before reads or admission`,async()=>{
+ const h=harness();(h.input.approval as any).approvalId=invalid;(h.input.env as any).GHL_WRITE_APPROVAL_ID=invalid;
+ assert.equal((await repairOpportunityDueDate(h.input)).state,"held");assert.deepEqual(h.calls,[]);assert.equal(h.f.rows[0].errorMessage,null);
+});
+test("date repair absent actual approval holds before any source read or admission",async()=>{
+ const h=harness();delete (h.input.env as any).GHL_WRITE_APPROVAL_ID;
+ assert.equal((await repairOpportunityDueDate(h.input)).state,"held");assert.deepEqual(h.calls,[]);assert.equal(h.f.rows[0].errorMessage,null);
+});

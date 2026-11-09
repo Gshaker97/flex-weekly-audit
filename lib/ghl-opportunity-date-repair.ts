@@ -82,7 +82,8 @@ export async function repairOpportunityDueDate(input: {
   const now = input.now ?? (() => new Date()), env = { ...(input.env ?? process.env) };
   const a = { ...input.approval }, at = now().getTime(), expires = Date.parse(a.expiresAt), reviewed = Date.parse(a.effectsReviewedAt);
   const hold = (reason: string) => ({ state: "held" as const, reason });
-  if (a.approvalId !== env.GHL_WRITE_APPROVAL_ID || !/^[A-Za-z0-9._:-]{1,128}$/.test(a.approvalId)
+  if (typeof a.approvalId !== "string" || typeof env.GHL_WRITE_APPROVAL_ID !== "string" || !env.GHL_WRITE_APPROVAL_ID
+      || a.approvalId !== env.GHL_WRITE_APPROVAL_ID || !/^[A-Za-z0-9._:-]{1,128}$/.test(a.approvalId)
       || env.GHL_DUE_DATE_REPAIR_ENABLED !== "true" || !/^[a-f0-9]{64}$/.test(a.intentSha256)
       || !Number.isFinite(expires) || expires <= at || expires > at + 3600_000
       || !Number.isFinite(reviewed) || reviewed > at || at - reviewed > 900_000

@@ -3,6 +3,7 @@ import { admitSyncRun, SyncEntrypoint, SyncRunWriter, SyncWriterBlockedError } f
 import { buildGhlWriteIntent, approvedGhlCards } from "./ghl-write-intent";
 import { verifyFreshGhlIdentity, readFreshJobberIdentities, strictGhlIdentityHold, validGhlContactIdentity } from "./ghl-write-identity";
 import { refreshOpenInvoiceStatuses } from "./open-invoice-status-refresh";
+import { runConfiguredPaidCycle } from "./ghl-paid-cycle";
 import { runConfiguredDateRepair } from "./ghl-date-repair-operation";
 import {
   fetchAllClients,
@@ -271,6 +272,11 @@ export async function runFullSync(
     if (dateRepair.state !== "disabled") log(`[sync] exactOpportunityDateRepair: ${dateRepair.state}`);
     if (dateRepair.state === "applied") await prisma.syncRun.update({ where: { id: run.id },
       data: { ghlOpportunitiesSynced: { increment: 1 } } });
+    const paidCycle = await runConfiguredPaidCycle({ writer, entrypoint: opts.entrypoint ?? "http" });
+    if (paidCycle.state !== "disabled") log(`[sync] exactPaidCycle: ${paidCycle.state}`);
+    if (paidCycle.state === "applied") await prisma.syncRun.update({ where: { id: run.id },
+      data: { ghlOpportunitiesSynced: { increment: 1 } } });
+
     return await writer.finish("complete");
   } catch (err: any) {
     // Never release admission while a rejected feed still has sibling work.
