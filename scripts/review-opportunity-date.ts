@@ -1,5 +1,6 @@
 // Private read-only readiness report. No SyncRun admission or mutation methods.
 // Usage: node --import tsx scripts/review-opportunity-date.ts private-request.json private-report.json
+import type { ReviewedOmissionPolicy } from "../lib/ghl-identity-coverage";
 import { readFile, writeFile } from "node:fs/promises";
 import { prisma } from "../lib/prisma";
 import { readVerifiedDateRepairSnapshot, verifyCurrentWorkflowPauses,
@@ -10,14 +11,14 @@ import { planOpportunityDueDate } from "../lib/invoice-workflow-binding";
 async function main() {
   const [input, output] = process.argv.slice(2);
   if (!input || !output || input === output) throw new Error("Provide different private request and output paths");
-  const request = JSON.parse(await readFile(input, "utf8")) as { scope: DateReadinessScope; workflows: WorkflowPauseExpectation[] };
+  const request = JSON.parse(await readFile(input, "utf8")) as { scope: DateReadinessScope; identityCoveragePolicy?: ReviewedOmissionPolicy; workflows: WorkflowPauseExpectation[] };
   let result: unknown;
   try {
     if (!Array.isArray(request.workflows) || request.workflows.length < 2
         || !await verifyCurrentWorkflowPauses(request.scope.locationId, request.workflows)) {
       throw new Error("Reviewed affected workflow versions are not currently Draft");
     }
-    const snapshot = await readVerifiedDateRepairSnapshot(request.scope);
+    const snapshot = await readVerifiedDateRepairSnapshot(request.scope, undefined, undefined, request.identityCoveragePolicy);
     const plan = planOpportunityDueDate(snapshot);
     result = { state: plan.state, intent: plan.intent, intentSha256: dateRepairIntentHash(plan.intent),
       reasons: plan.reasons, observedAt: snapshot.source.observedAt, sourceInvoiceCount: snapshot.source.invoices.length };

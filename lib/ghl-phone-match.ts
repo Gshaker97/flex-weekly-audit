@@ -16,6 +16,22 @@ export function canonicalPhone(value?: string | null): string | null {
   return /^\+[1-9]\d{7,14}$/.test(phone) ? phone : null;
 }
 
+// Conflict-only classification for the exact observed malformed full US form.
+// Preserve every digit. An invalid area-code initial digit is NOT repaired, and
+// this value must never establish a match. Other malformed forms stay unknown.
+export function boundedMalformedUsPhoneDigits(value?: string | null): string | null {
+  const raw = value?.trim() ?? "";
+  return /^\+1[01]\d{2}[2-9]\d{6}$/.test(raw) ? raw.slice(1) : null;
+}
+function boundedMalformedPhoneOverlap(value: string | null | undefined, canonical: string): boolean {
+  const digits = boundedMalformedUsPhoneDigits(value);
+  if (!digits || !canonicalPhone(canonical)) return false;
+  const target = canonical.slice(1);
+  // Full/national-number witnesses plus conservative seven-digit ambiguity.
+  return target === digits || target === digits.slice(1)
+    || target.endsWith(digits.slice(1)) || target.endsWith(digits.slice(-7));
+}
+
 type Customer = { jobberClientId: string; email?: string | null; phone?: string | null };
 type Contact = { id: string; email?: string | null; phone?: string | null };
 // Domestic suffixes only flag competing owners; they never establish a match.
@@ -25,7 +41,8 @@ function possibleDomesticOverlap(value: string | null | undefined, canonical: st
   return digits.length >= 7 && canonical.endsWith(digits);
 }
 export function phoneMayShareOwner(value: string | null | undefined, canonical: string): boolean {
-  return canonicalPhone(value) === canonical || possibleDomesticOverlap(value, canonical);
+  return canonicalPhone(value) === canonical || possibleDomesticOverlap(value, canonical)
+    || boundedMalformedPhoneOverlap(value, canonical);
 }
 const emailKey = (email?: string | null) => email?.trim().toLowerCase() || null;
 
@@ -36,7 +53,7 @@ export function matchPhoneCustomer(customer: Customer, customers: Customer[], co
   const phone = canonicalPhone(customer.phone);
   if (!phone) return { contactId: null, candidateIds: [], reason: "unsupported phone format" };
   const candidates = contacts.filter(c => canonicalPhone(c.phone) === phone);
-  const uncertain = contacts.filter(c => possibleDomesticOverlap(c.phone, phone));
+  const uncertain = contacts.filter(c => !canonicalPhone(c.phone) && phoneMayShareOwner(c.phone, phone));
   const candidateIds = [...new Set([...candidates, ...uncertain].map(c => c.id))];
   const held = (reason: string) => ({ contactId: null, candidateIds, reason });
   if (uncertain.length || candidateIds.length !== 1) return held("missing or ambiguous GHL phone");

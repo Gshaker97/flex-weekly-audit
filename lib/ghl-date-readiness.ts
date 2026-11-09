@@ -1,6 +1,7 @@
 /** Trusted read-only adapter for exact opportunity date preparation.
  * No provider mutation, sync invocation, workflow edit or identity bypass.
  */
+import { coveragePermitsExactInvoice, readReviewedIdentityCoverage, type ReviewedOmissionPolicy } from "./ghl-identity-coverage";
 import { createHash } from "node:crypto";
 import { prisma } from "./prisma";
 import { jobberGraphQL } from "./jobber";
@@ -60,31 +61,39 @@ export function workflowsMatchPaused(raw: unknown, locationId: string, expected:
 const live = {
   customers: () => prisma.customer.findMany({ select: { jobberClientId: true, email: true, phone: true } }),
   storedInvoices: (ownerId: string) => prisma.invoiceRecord.findMany({ where: { customer: { jobberClientId: ownerId } }, select: { jobberInvoiceId: true } }),
+  coverage: readReviewedIdentityCoverage,
+  quarantineCounts: async (ids: string[]) => (await prisma.customer.findMany({
+    where: { jobberClientId: { in: ids } }, select: { jobberClientId: true, _count: { select: { jobs: true, invoices: true } } },
+  })).map(c => ({ jobberClientId: c.jobberClientId, jobs: c._count.jobs, invoices: c._count.invoices })),
   identities: readFreshJobberIdentities, contacts: listContactsForPhoneMatching,
   ownerInvoices: readOwnerInvoiceEvidence, card: readOpportunity, fields: readOpportunityCustomFields,
   refs: getInvoicePipelineRefs, cards: listPipelineOpportunities,
 };
 export type DateReadinessScope = { locationId: string; opportunityId: string; contactId: string; jobberClientId: string; invoiceId: string };
 
-/** The only identity approval path here is the existing complete-population
- * guard. Neither the request nor an allowlist can set identityVerified=true.
- * Direct user-confirmed bindings need a separately reviewed provenance adapter.
+/** Strict by default. Optional trusted-call-site policy requires fresh explicit
+ * account coverage and exact source reads; no request/env toggle sets approval.
+ * Direct user-confirmed bindings still need a separately reviewed adapter.
  */
-export async function readVerifiedDateRepairSnapshot(scope: DateReadinessScope, deps = live, now = () => new Date()): Promise<DateRepairSnapshot> {
+export async function readVerifiedDateRepairSnapshot(scope: DateReadinessScope, deps = live, now = () => new Date(), coveragePolicy?: ReviewedOmissionPolicy): Promise<DateRepairSnapshot> {
+  scope = structuredClone(scope);
+  coveragePolicy = coveragePolicy === undefined ? undefined : structuredClone(coveragePolicy);
   if (!scope || !Object.values(scope).every(safeId) || Object.keys(scope).length !== 5
       || scope.locationId !== process.env.GHL_LOCATION_ID) throw new Error("Exact date-repair scope is invalid");
   const begun = now().toISOString();
   const customers = await deps.customers();
   const owner = customers.filter(c => c.jobberClientId === scope.jobberClientId);
   if (owner.length !== 1) throw new Error("Exact cached owner is missing or duplicated");
-  const identities = await deps.identities();
+  const covered = coveragePolicy ? await deps.coverage(coveragePolicy, customers, scope,
+    () => deps.quarantineCounts(coveragePolicy.quarantine.map(c => c.jobberClientId))) : null;
+  const identities = covered?.identities ?? await deps.identities();
   const contacts = await deps.contacts();
   const selected = contacts.find(c => c.id === scope.contactId);
   const email = owner[0].email?.trim().toLowerCase();
   const phone = canonicalPhone(owner[0].phone);
   if (!selected || !((email && email === selected.email?.trim().toLowerCase())
       || (phone && phone === canonicalPhone(selected.phone)))) throw new Error("Requested contact does not match the source primary identity");
-  const identityHold = verifyFreshGhlIdentity(owner[0], customers, contacts, scope.contactId, identities);
+  const identityHold = verifyFreshGhlIdentity(owner[0], customers, contacts, scope.contactId, identities, covered?.evidence);
   if (identityHold) throw new Error(identityHold);
   const refs = await deps.refs();
   const cards = await deps.cards(refs.pipelineId);
@@ -104,10 +113,12 @@ export async function readVerifiedDateRepairSnapshot(scope: DateReadinessScope, 
     return { id: i.id, jobberClientId: scope.jobberClientId, status: i.invoiceStatus.toLowerCase(), totalCents, balanceCents,
       issuedDate: i.issuedDate, dueDate: i.dueDate, category: null };
   });
+  if (covered && !coveragePermitsExactInvoice(covered.evidence, customers, identities, scope))
+    throw new Error("Reviewed identity coverage expired or changed before snapshot completion");
   const snapshot: DateRepairSnapshot = {
     now: now().toISOString(), source: { observedAt: begun, complete: true, invoices: sourceInvoices },
     binding: { ...scope, pipelineId: refs.pipelineId, method: "unique_unpaid_invoice",
-      evidenceRef: `fresh-complete-identity:${createHash("sha256").update(JSON.stringify([scope, identities, contacts])).digest("hex")}`,
+      evidenceRef: `fresh-complete-identity:${createHash("sha256").update(JSON.stringify([scope, identities, contacts, coveragePolicy ?? null])).digest("hex")}`,
       identityVerified: true, uniqueInvoiceCardVerified: true },
     card: { id: currentCard.id, locationId: currentCard.locationId ?? "", contactId: currentCard.contactId ?? "",
       pipelineId: currentCard.pipelineId ?? "", stageId: currentCard.pipelineStageId, status: currentCard.status,

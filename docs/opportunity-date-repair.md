@@ -78,3 +78,39 @@ source/target evidence and actual provider state first.
 
 Unit tests use synthetic records and provider responses. They verify implementation
 behavior, not actual customer consent, carrier delivery or native workflow timing.
+
+## Bounded identity coverage policy (opt-in)
+
+A malformed full US number with the narrowly observed `+1`/11-digit shape and
+invalid area-code first digit is never repaired or used to establish a match.
+Its unchanged full/national/seven-digit witnesses can still hold a conflicting
+candidate. A disjoint malformed record does not automatically conflict with
+all other customers; unbounded malformed values and actual collisions stay held.
+
+The private readiness request and SHA-pinned repair request optionally accept
+`identityCoveragePolicy`. Without it, the omitted-owner guard remains strict.
+The policy records an exact current Jobber account ID, private review reference,
+review/expiry timestamps (at most24hours apart), and exactly two reviewed cached
+owner IDs with their unchanged cached email/phone witnesses. Do not put real
+policy values in this repository or public logs.
+
+Each invocation independently reads both `isArchived:false` and
+`isArchived:true` populations with validated complete pagination and account ID
+on every response. It verifies the exact selected owner/invoice, exact-null
+lookups of the two missing owners and current zero local job/invoice links.
+Every missing owner must match the reviewed pair and identifiers exactly; new
+omissions, changed account, malformed data, conflicts or incomplete reads hold.
+Quarantined records are retained, never marked deleted or merged, and continue
+to participate in candidate-specific cached identifier collision checks.
+
+Only this trusted read can mint opaque five-minute evidence, bound to unchanged
+cached/source populations, the owner and exact invoice. A JSON flag, another
+invoice or caller-provided object cannot substitute. All GHL primary/secondary
+contact uniqueness, all-status card uniqueness, fresh debt/date evidence, exact
+workflow versions and write approvals remain separate requirements.
+
+The practical coverage boundary is the provider's successfully completed,
+explicitly filtered authenticated-account API. It is not a claim that no
+undocumented inaccessible records could ever exist. Detectable source/account
+changes fail closed. This policy does not change generic stage-sync behavior,
+activate workflows, authorize messages or resolve old execution cycle ownership.

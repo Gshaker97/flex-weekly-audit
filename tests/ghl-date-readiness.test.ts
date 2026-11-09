@@ -40,3 +40,27 @@ for(const [name,change] of [
 ] as const)test(`trusted reader retains hold: ${name}`,async()=>{const f=fixture();change(f.data);await assert.rejects(readVerifiedDateRepairSnapshot(f.scope,f.deps,()=>new Date(NOW)));});
 test("source read freshness starts before all API reads, not after",async()=>{const f=fixture();let n=0;await assert.rejects(readVerifiedDateRepairSnapshot(f.scope,f.deps,()=>new Date(n++?"2026-11-09T18:16:00Z":NOW)),/stale/);});
 test("trusted full GET reader recognizes observed omitted blank date representation",async()=>{const f=fixture();delete f.data.card.customFields;const s=await readVerifiedDateRepairSnapshot(f.scope,f.deps,()=>new Date(NOW));assert.equal(s.field.currentValueKnown,true);assert.equal(s.field.currentValue,null);});
+
+test("trusted date reader opts into actual coverage reader, preserving default strict behavior",async()=>{
+ const {readReviewedIdentityCoverage}=await import("../lib/ghl-identity-coverage");
+ const f=fixture();const missing=[{jobberClientId:"missing-a",email:null,phone:null},{jobberClientId:"missing-b",email:null,phone:null}];
+ f.data.customers.push(...missing);
+ const policy:any={accountId:"account",reviewRef:"review",reviewedAt:new Date(Date.now()-1000).toISOString(),expiresAt:new Date(Date.now()+60000).toISOString(),quarantine:missing};
+ const q:any=async(s:string)=>s.includes("VerifyExplicitIdentityCoverage")?{account:{id:"account"},clients:{nodes:s.includes("isArchived: false")?f.data.identities:[],pageInfo:{hasNextPage:false}}}:s.includes("VerifyQuarantinedIdentity")?{account:{id:"account"},client:null}:{account:{id:"account"},client:f.data.identities[0],invoice:{id:f.scope.invoiceId,client:{id:f.scope.jobberClientId}}};
+ f.deps.coverage=(p:any,c:any,s:any,counts:any)=>readReviewedIdentityCoverage(p,c,s,counts,q);
+ f.deps.quarantineCounts=async(ids:string[])=>{assert.deepEqual(ids,missing.map(c=>c.jobberClientId));return ids.map(jobberClientId=>({jobberClientId,jobs:0,invoices:0}));};
+ await assert.rejects(readVerifiedDateRepairSnapshot(f.scope,f.deps,()=>new Date(NOW)),/omits/);
+ const result=await readVerifiedDateRepairSnapshot(f.scope,f.deps,()=>new Date(NOW),policy);
+ assert.equal(result.binding.identityVerified,true);
+ f.data.contacts.push({...f.data.contacts[0],id:"duplicate"});
+ await assert.rejects(readVerifiedDateRepairSnapshot(f.scope,f.deps,()=>new Date(NOW),policy),/another GHL contact/);
+});
+
+test("trusted reader snapshots caller scope and policy before its first asynchronous read",async()=>{
+ const f=fixture();const originalScope=structuredClone(f.scope);
+ const policy:any={accountId:"account",reviewRef:"review",reviewedAt:new Date(Date.now()-1000).toISOString(),expiresAt:new Date(Date.now()+60000).toISOString(),quarantine:[{jobberClientId:"missing-a",email:null,phone:null},{jobberClientId:"missing-b",email:null,phone:null}]};
+ const originalPolicy=structuredClone(policy);
+ f.deps.customers=async()=>{f.scope.invoiceId="mutated-invoice";f.scope.contactId="mutated-contact";policy.accountId="mutated-account";policy.quarantine[0].jobberClientId="mutated-owner";return f.data.customers;};
+ f.deps.coverage=async(p:any,_customers:any,scope:any)=>{assert.deepEqual(p,originalPolicy);assert.deepEqual(scope,originalScope);throw new Error("snapshot-inputs-verified");};
+ await assert.rejects(readVerifiedDateRepairSnapshot(f.scope,f.deps,()=>new Date(NOW),policy),/snapshot-inputs-verified/);
+});

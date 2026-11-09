@@ -11,10 +11,10 @@ test('exact colon-space valid US wrapper normalizes, malformed wrappers do not',
   for(const bad of [':602-555-0100',':: 602-555-0100',':  602-555-0100',': 602- 555-0100',': 6025550100',': +1 602-555-0100',': 555-0100',': 102-555-0100',': 602-155-0100',': 602-555-01000','phone: 602-555-0100','602:555:0100',': 602-555-0100 x2',': 602-555-0100 / 602-555-0101',': 602–555–0100','+11025550100'])assert.equal(normalize(bad),null,bad);
  }
 });
-test('normalization never overrides duplicate or malformed global identity holds',()=>{
+test('normalization never overrides duplicate, unbounded malformed or omitted-owner holds',()=>{
  assert.equal(matchPhoneCustomer(owner,[owner],[contact]).contactId,contact.id);
  assert.equal(matchPhoneCustomer(owner,[owner],[contact,{...contact,id:'duplicate'}]).contactId,null);
- assert.match(strictGhlIdentityHold(owner,[owner],[contact,{id:'invalid',phone:'+11025550199'}],contact.id)!,/overlap/);
+ assert.match(strictGhlIdentityHold(owner,[owner],[contact,{id:'invalid',phone:'unparsed phone'}],contact.id)!,/overlap/);
  assert.match(verifyFreshGhlIdentity(owner,[owner,{jobberClientId:'omitted',phone:null,email:null}],[contact],contact.id,[{id:owner.jobberClientId,emails:[],phones:[{number:owner.phone,primary:true}]}])!,/omits/);
 });
 test('preview and runtime matching helpers stay identical',async()=>{

@@ -1,13 +1,15 @@
+import { coveragePermitsOmissions, type IdentityCoverageEvidence } from "./ghl-identity-coverage";
 import { jobberGraphQL } from "./jobber";
 import type { GhlContact } from "./ghl";
-import { canonicalPhone, phoneMayShareOwner } from "./ghl-phone-match";
+import { boundedMalformedUsPhoneDigits, canonicalPhone, phoneMayShareOwner } from "./ghl-phone-match";
 
 type CustomerIdentity = { jobberClientId: string; email?: string | null; phone?: string | null };
 export type FreshJobberIdentity = { id: string; emails: Array<{ address: string; primary: boolean }>; phones: Array<{ number: string; primary: boolean }> };
 const hasPhone = (value?: string | null) => typeof value === "string" && !!value.trim();
 // Seven-digit domestic suffixes can only identify a possible competing owner.
+// The explicitly bounded malformed US form uses conflict-only digit witnesses.
 // Other nonempty unsupported formats cannot safely exclude a competing owner.
-const unresolvedPhone = (value?: string | null) => hasPhone(value) && !canonicalPhone(value)
+const unresolvedPhone = (value?: string | null) => hasPhone(value) && !canonicalPhone(value) && !boundedMalformedUsPhoneDigits(value)
   && !/^[2-9]\d{6}$/.test(value!.replace(/[ ().-]/g, ""));
 const overlapsPhone = (a?: string | null, b?: string | null) => {
   const ca = canonicalPhone(a), cb = canonicalPhone(b);
@@ -67,8 +69,8 @@ export async function readFreshJobberIdentities(): Promise<FreshJobberIdentity[]
   }
   throw new Error("Fresh Jobber identity snapshot exceeded limit");
 }
-export function verifyFreshGhlIdentity(customer: CustomerIdentity, customers: CustomerIdentity[], contacts: GhlContact[], selectedId: string, source: FreshJobberIdentity[]): string | null {
-  if (customers.some(c => !source.some(s => s.id === c.jobberClientId))) return "Fresh Jobber identity snapshot omits a cached owner";
+export function verifyFreshGhlIdentity(customer: CustomerIdentity, customers: CustomerIdentity[], contacts: GhlContact[], selectedId: string, source: FreshJobberIdentity[], coverage?: IdentityCoverageEvidence): string | null {
+  if (customers.some(c => !source.some(s => s.id === c.jobberClientId)) && !coveragePermitsOmissions(coverage, customers, source, customer.jobberClientId)) return "Fresh Jobber identity snapshot omits a cached owner";
   const fresh = source.find(c => c.id === customer.jobberClientId);
   const selected = contacts.find(c => c.id === selectedId);
   if (!fresh || !selected) return "Fresh owner/contact identity unavailable";

@@ -1,6 +1,7 @@
 /** Disabled-by-default, single exact date request inside an admitted cron run.
  * Not a general write endpoint or notification activation mechanism.
  */
+import type { ReviewedOmissionPolicy } from "./ghl-identity-coverage";
 import { createHash } from "node:crypto";
 import { repairOpportunityDueDate, type DateRepairApproval } from "./ghl-opportunity-date-repair";
 import { readVerifiedDateRepairSnapshot, verifyCurrentWorkflowPauses,
@@ -8,7 +9,7 @@ import { readVerifiedDateRepairSnapshot, verifyCurrentWorkflowPauses,
 import type { SyncEntrypoint, SyncRunWriter } from "./sync-writer-control";
 
 export type ConfiguredDateRequest = { version: 1; scope: DateReadinessScope;
-  approval: DateRepairApproval; workflows: WorkflowPauseExpectation[] };
+  approval: DateRepairApproval; identityCoveragePolicy?: ReviewedOmissionPolicy; workflows: WorkflowPauseExpectation[] };
 const defaults = { repair: repairOpportunityDueDate, read: readVerifiedDateRepairSnapshot, effects: verifyCurrentWorkflowPauses };
 export async function runConfiguredDateRepair(input: {
   entrypoint: SyncEntrypoint; writer: SyncRunWriter;
@@ -34,6 +35,6 @@ export async function runConfiguredDateRepair(input: {
   // No caller-supplied snapshot or identity flag. The trusted adapter establishes
   // all source/card/field evidence afresh and preserves existing identity holds.
   return deps.repair({ approval: request.approval, writer: input.writer, env,
-    readFresh: () => deps.read(request.scope),
+    readFresh: () => deps.read(request.scope, undefined, undefined, request.identityCoveragePolicy),
     verifyEffects: () => deps.effects(request.scope.locationId, request.workflows) });
 }
