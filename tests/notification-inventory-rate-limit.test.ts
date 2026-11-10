@@ -60,6 +60,38 @@ test('depleted success bucket paces the next exact page from requested cost, not
     assert.deepEqual(f.bodies.map(b => JSON.parse(b).variables), [{ after: null }, { after: 'one' }]);
     assert.ok(f.bodies.every(b => JSON.parse(b).query === NOTIFICATION_INVENTORY_QUERY));
   }));
+// Synthetic reproduction of observed Jobber metadata; no customer data.
+const resolvedAboveRequested = () => cost(9806, 182, 500, 194);
+test('successful resolved cost above requested accepts exact observed metadata and completes pagination', () =>
+  fixture([page('one', true, resolvedAboveRequested()), page('two', false, resolvedAboveRequested())], async f => {
+    const result = await f.scan();
+    assert.equal(result.coverage, 'complete-account-invoices'); assert.equal(result.terminalPageObserved, true);
+    assert.equal(result.pages, 2); assert.equal(result.invoiceCount, 2); assert.equal(result.productionSendCapability, false);
+    assert.deepEqual(f.sleeps, []); assert.equal(f.budget.requests, 2); assert.equal(f.budget.retries, 0);
+    assert.deepEqual(f.bodies.map(b => JSON.parse(b).variables), [{ after: null }, { after: 'one' }]);
+    assert.ok(f.bodies.every(b => JSON.parse(b).query === NOTIFICATION_INVENTORY_QUERY));
+  }));
+test('all-THROTTLED resolved cost above requested retries the identical read and discards partial error data', () =>
+  fixture([throttle(resolvedAboveRequested()), page('recovered', false, resolvedAboveRequested())], async f => {
+    const result = await f.scan();
+    assert.equal(result.coverage, 'complete-account-invoices'); assert.equal(result.pages, 1);
+    assert.deepEqual(result.rows.map(r => r.invoiceId), ['recovered']); assert.equal(result.productionSendCapability, false);
+    assert.deepEqual(f.sleeps, []); assert.equal(f.budget.requests, 2); assert.equal(f.budget.retries, 1);
+    assert.equal(f.bodies[0], f.bodies[1]); assert.equal(JSON.parse(f.bodies[0]).query, NOTIFICATION_INVENTORY_QUERY);
+  }));
+test('repeated all-THROTTLED resolved cost above requested retains the three-attempt cap', () =>
+  fixture(Array.from({ length: 3 }, () => throttle(resolvedAboveRequested())), async f => {
+    const result = await f.scan(); held(result, 'SOURCE_RETRIES_EXHAUSTED');
+    assert.equal(f.budget.requests, 3); assert.equal(f.budget.retries, 2); assert.deepEqual(f.sleeps, []);
+    assert.equal(new Set(f.bodies).size, 1);
+    assert.deepEqual(result.failure?.facts, { requestedQueryCost: 182, actualQueryCost: 194,
+      maximumAvailable: 10000, currentlyAvailable: 9806, restoreRate: 500, attempts: 3 });
+  }));
+test('resolved cost above requested still paces from requested cost and reported availability', () =>
+  fixture([page('one', true, cost(0, 182, 500, 194)), page('two', false, resolvedAboveRequested())], async f => {
+    assert.equal((await f.scan()).coverage, 'complete-account-invoices');
+    assert.deepEqual(f.sleeps, [364]); assert.equal(f.budget.requests, 2); assert.equal(f.budget.retries, 0);
+  }));
 test('THROTTLED then recovery retries identical serialized read/cursor and discards partial error data', () =>
   fixture([throttle(), page('recovered')], async f => {
     const result = await f.scan();
@@ -121,7 +153,10 @@ const malformed: [string, unknown][] = [
   ['string requested', { cost: { ...cost().cost, requestedQueryCost: '1000' } }],
   ['zero requested', cost(0, 0)], ['negative requested', cost(0, -1)], ['nonfinite requested', cost(0, Infinity)],
   ['missing actual', { cost: { requestedQueryCost: 1000, throttleStatus: cost().cost.throttleStatus } }],
-  ['null actual', cost(0, 1000, 500, null)], ['negative actual', cost(0, 1000, 500, -1)], ['actual above requested', cost(0, 1000, 500, 1001)],
+  ['null actual', cost(0, 1000, 500, null)], ['negative actual', cost(0, 1000, 500, -1)], ['unsafe actual', cost(0, 1000, 500, Number.MAX_SAFE_INTEGER + 1)],
+  ['nonfinite actual', cost(0, 1000, 500, Infinity)],
+  ['string actual', { cost: { ...cost().cost, actualQueryCost: '194' } }],
+  ['boolean actual', { cost: { ...cost().cost, actualQueryCost: true } }],
   ['negative availability', cost(-1)], ['availability above maximum', cost(10001)],
   ['zero restore', cost(0, 1000, 0)], ['negative restore', cost(0, 1000, -1)],
   ['string restore', { cost: { ...cost().cost, throttleStatus: { ...cost().cost.throttleStatus, restoreRate: '500' } } }],

@@ -60,7 +60,7 @@ function notificationCost(payload: Record<string, unknown>): NotificationCost {
       !numeric(status.maximumAvailable) || status.maximumAvailable <= 0 ||
       !numeric(status.currentlyAvailable) || status.currentlyAvailable > status.maximumAvailable ||
       !numeric(status.restoreRate) || status.restoreRate <= 0 ||
-      !(numeric(cost.actualQueryCost) && cost.actualQueryCost <= cost.requestedQueryCost))
+      !numeric(cost.actualQueryCost))
     throw new AuditFailure('SOURCE_RATE_LIMIT_METADATA_INVALID');
   const result = { requestedQueryCost: cost.requestedQueryCost,
     actualQueryCost: cost.actualQueryCost,
