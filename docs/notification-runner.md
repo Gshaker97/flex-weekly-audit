@@ -65,7 +65,7 @@ node node_modules/typescript/bin/tsc --noEmit --incremental false
 npm run build
 ```
 
-The focused suite uses the actual source/coverage/identity, gate, contract, contact reader, ledger factory, construction review and transport with fake transaction and streaming HTTP adapters. It checks SMS/email happy paths; no-write preflight; final paid/balance/owner/extra-invoice/DND/history drift; ownership and reservation digests; omitted channel holds; lost commit acknowledgments; provider 429/500; concurrency; single-use and new-runner retry fences; expiry at review/pending; immutable source timing; proof laundering; and disabled/CLI no-op behavior. These tests do not establish real-provider permission/semantics or actual production database execution. Real PostgreSQL validation of the earlier ledger implementation is separate from this fake-IO integration suite.
+The focused suite uses the actual source/coverage/identity, gate, contract, contact reader, ledger factory, construction review and transport with fake transaction and streaming HTTP adapters. It checks SMS/email happy paths; no-write preflight; final paid/balance/owner/extra-invoice/DND/history drift; ownership and reservation digests; present channels with omitted status hold; lost commit acknowledgments; provider 429/500; concurrency; single-use and new-runner retry fences; expiry at review/pending; immutable source timing; proof laundering; and disabled/CLI no-op behavior. These tests do not establish real-provider permission/semantics or actual production database execution. Real PostgreSQL validation of the earlier ledger implementation is separate from this fake-IO integration suite.
 
 ### Verification for this incremental candidate
 

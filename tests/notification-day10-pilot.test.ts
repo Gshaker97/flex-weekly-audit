@@ -269,7 +269,7 @@ test("active-hold change after pending commit prevents HTTP without a retry", ()
   const p = f.run(), out = await p.run(); assert.equal(out.state, "unknown"); assert.equal(f.data.posts, 0);
   assert.equal(f.db.rows[0].state, "unknown"); assert.equal((await p.run()).state, "held");
 }));
-test("absent global DND follows reviewed false default while explicit inactive channel is still required", () => clocked(async tick => {
+test("absent global DND follows reviewed false default alongside explicit inactive SMS", () => clocked(async tick => {
   const f = fixture(tick); (f.data as any).globalDnd = undefined;
   const out = await f.run("read-only").run(); assert.equal(out.phase, "read_only", JSON.stringify(out));
   assert.equal(f.data.posts, 0); assert.equal(f.db.rows.length, 0);

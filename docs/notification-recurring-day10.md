@@ -14,7 +14,7 @@ Inside the window, one exhausted invoice discovery query identifies current Day1
 4. Every source refresh remains tied to the original batch and original five-minute population expiry. A cloned or v1 source cannot enter the v2 path. Earlier external observations are not re-stamped.
 5. The original durable ledger retains event and homeowner-contact/day uniqueness. Two current Day10 invoices for one contact both hold. Unimplemented Day15/20/25/30 entries do not falsely block Day10, but any existing durable contact/day claim still applies. Unknown outcomes stop the batch; no auto-retry, reclaim, release, or catch-up exists.
 
-The source/DND adapters remain unchanged in meaning: missing SMS DND is held, not inferred allowed; no Email fallback; missing tags do not block common Day10. Configured sender is reread at every evidence phase, including after reservation. The native footer is an exact receipt suffix, not appended to the outbound message body.
+The [pinned DND contract](notification-ghl-contract.md#recipient-and-sender) accepts genuine absent SMS/settings properties as the reviewed no-SMS-override encoding, while present malformed settings or missing status still hold. Global true and explicit active/permanent SMS still block. This is suppression evidence, not consent; there is no Email fallback or Email omission default. Missing tags do not block common Day10. Configured sender is reread at every evidence phase, including after reservation. The native footer is an exact receipt suffix, not appended to the outbound message body.
 
 ## Trusted standing policy, not per-invoice approval
 

@@ -54,7 +54,7 @@ for (const channel of ["sms", "email"] as const) {
     assert.equal(parseGhlRecipient({ version: VERSION, body: contact(), expected }).state, "allowed");
     for (const patch of [{ dnd: true }, { dndSettings: { [key]: { status: "active" } } }, { dndSettings: { [key]: { status: "permanent" } } }])
       assert.equal(parseGhlRecipient({ version: VERSION, body: contact(patch), expected }).state, "blocked");
-    for (const patch of [{ dnd: undefined }, { dnd: "false" }, { dndSettings: undefined }, { dndSettings: {} },
+    for (const patch of [{ dnd: undefined }, { dnd: "false" }, { dndSettings: undefined }, { dndSettings: { [key]: {} } },
       { dndSettings: { [key]: { status: "opted_in" } } }, { dndSettings: { [key]: { status: "inactive" }, [channel]: { status: "active" } } },
       { dndSettings: { [channel]: { status: "inactive" } } }, { id: undefined }, { locationId: undefined },
       { id: "wrong-contact" }, { locationId: "wrong-location" }])
@@ -68,7 +68,7 @@ for (const channel of ["sms", "email"] as const) {
     assert.equal(parseGhlRecipient({ version: VERSION, body: contact({ [field]: "other", [additionalField]: [{ [field]: expected.destination }] }), expected }).state, "allowed");
     assert.equal(parseGhlRecipient({ version: VERSION, body: contact({ [additionalField]: [{}] }), expected }).state, "held");
   });
-  test(`${channel}: documented global omission defaults false without inventing a channel default`, () => {
+  test(`${channel}: documented global omission defaults false with channel-specific suppression evidence`, () => {
     const body = contact(), expected = binding(channel), key = channel === "sms" ? "SMS" : "Email";
     delete (body.contact as Record<string, unknown>).dnd;
     assert.equal(parseGhlRecipient({ version: VERSION, body, expected }).state, "allowed");
@@ -78,8 +78,8 @@ for (const channel of ["sms", "email"] as const) {
     }
     delete (body.contact as Record<string, unknown>).dndSettings;
     const missing = parseGhlRecipient({ version: VERSION, body, expected });
-    assert.equal(missing.state, "held");
-    assert.deepEqual(missing.reasons, ["channel_dnd_unknown"]);
+    assert.equal(missing.state, channel === "sms" ? "allowed" : "held");
+    assert.deepEqual(missing.reasons, channel === "sms" ? [] : ["channel_dnd_unknown"]);
     for (const malformed of [undefined, null, 0, "false"]) {
       const result = parseGhlRecipient({ version: VERSION, body: contact({ dnd: malformed }), expected });
       assert.equal(result.state, "held");
@@ -87,6 +87,128 @@ for (const channel of ["sms", "email"] as const) {
     }
   });
 }
+
+// Synthetic schema fixtures only. Sparse outbound fields describe suppression, not consent.
+for (const shape of ["settings-absent", "sms-absent", "unrelated-active", "explicit-inactive"] as const) {
+  for (const global of ["absent", false, true, undefined, null, "false", 0, {}] as const) {
+    test(`SMS ${shape} with global ${String(global)} preserves exact omission semantics`, () => {
+      const body = contact();
+      if (shape === "settings-absent") delete (body.contact as Record<string, unknown>).dndSettings;
+      if (shape === "sms-absent") body.contact.dndSettings = {} as typeof body.contact.dndSettings;
+      if (shape === "unrelated-active") body.contact.dndSettings = {
+        Email: { status: "active" }, Call: { status: "permanent" }, WhatsApp: { status: "active" },
+      } as unknown as typeof body.contact.dndSettings;
+      if (global === "absent") delete (body.contact as Record<string, unknown>).dnd;
+      else (body.contact as Record<string, unknown>).dnd = global;
+      const result = parseGhlRecipient({ version: VERSION, body, expected: binding() });
+      assert.equal(result.state, global === true ? "blocked" : global === false || global === "absent" ? "allowed" : "held");
+      assert.equal(result.productionSendCapability, false);
+      if (result.state === "allowed") assert.deepEqual(result.reasons, []);
+      else assert.ok(result.reasons.includes(global === true ? "recipient_suppressed" : "global_dnd_unknown"));
+    });
+  }
+}
+for (const status of ["active", "permanent"] as const) for (const global of ["absent", false, true, undefined, null] as const) {
+  test(`SMS ${status} blocks even with global ${String(global)}`, () => {
+    const body = contact({ dnd: global, dndSettings: { SMS: { status } } });
+    if (global === "absent") delete (body.contact as Record<string, unknown>).dnd;
+    const result = parseGhlRecipient({ version: VERSION, body, expected: binding() });
+    assert.equal(result.state, "blocked"); assert.ok(result.reasons.includes("recipient_suppressed"));
+  });
+}
+test("SMS omission never turns a present malformed settings/channel/status into absence", () => {
+  const malformed = [undefined, null, [], "inactive", false, 0, new Date(), Object.create({ SMS: { status: "inactive" } }),
+    Object.defineProperty({}, "SMS", { get() { throw Error("must not read"); } })];
+  for (const value of malformed) {
+    for (const dndSettings of [value, { SMS: value }]) {
+      const result = parseGhlRecipient({ version: VERSION, body: contact({ dndSettings }), expected: binding() });
+      assert.equal(result.state, "held"); assert.ok(result.reasons.includes("channel_dnd_unknown"));
+    }
+  }
+  for (const channel of [{}, ...[undefined, null, [], {}, "", "Inactive", "ACTIVE", "opted_in", false, 0].map(status => ({ status })),
+    Object.create({ status: "inactive" }), Object.defineProperty({}, "status", { get() { throw Error("must not read"); } })]) {
+    assert.equal(parseGhlRecipient({ version: VERSION, body: contact({ dndSettings: { SMS: channel } }), expected: binding() }).state, "held");
+  }
+  const nullPrototype = Object.create(null);
+  assert.equal(parseGhlRecipient({ version: VERSION, body: contact({ dndSettings: nullPrototype }), expected: binding() }).state, "allowed");
+});
+test("wrong-case top-level DND aliases never receive the omission default or override exact fields", () => {
+  for (const [canonical, alias, value] of [
+    ["dnd", "Dnd", true], ["dnd", "DND", true], ["dnd", "dnD", false],
+    ["dndSettings", "dndsettings", { SMS: { status: "active" } }],
+    ["dndSettings", "DndSettings", { SMS: { status: "permanent" } }],
+    ["dndSettings", "DNDSETTINGS", {}],
+  ] as const) for (const absent of [false, true]) {
+    const body = contact({ [alias]: value });
+    if (absent) delete (body.contact as Record<string, unknown>)[canonical];
+    const result = parseGhlRecipient({ version: VERSION, body, expected: binding() });
+    assert.equal(result.state, "held"); assert.ok(result.reasons.includes("incompatible_contact_dnd_schema"));
+  }
+});
+test("all selected-channel case variants and conflicts hold before SMS omission; lowercase guard remains", () => {
+  for (const alias of ["sms", "Sms", "sMs", "smS", "SMs", "sMS", "SmS"]) for (const exact of [false, true]) {
+    const dndSettings = { ...(exact ? { SMS: { status: "inactive" } } : {}), [alias]: { status: "active" } };
+    const result = parseGhlRecipient({ version: VERSION, body: contact({ dndSettings }), expected: binding() });
+    assert.equal(result.state, "held"); assert.ok(result.reasons.includes("incompatible_channel_dnd_schema"));
+  }
+  for (const channel of ["sms", "email"] as const) for (const alias of ["sms", "email"]) {
+    const result = parseGhlRecipient({ version: VERSION, body: contact({
+      dndSettings: { SMS: { status: "inactive" }, Email: { status: "inactive" }, [alias]: { status: "active" } },
+    }), expected: binding(channel) });
+    assert.equal(result.state, "held"); assert.ok(result.reasons.includes("incompatible_lowercase_dnd_schema"));
+  }
+  for (const alias of ["email", "EMAIL", "EMail", "eMail"]) {
+    const result = parseGhlRecipient({ version: VERSION, body: contact({ dndSettings: { [alias]: { status: "inactive" } } }), expected: binding("email") });
+    assert.equal(result.state, "held");
+  }
+  for (const alias of ["Status", "STATUS", "sTatus"]) for (const exact of [false, true]) {
+    const result = parseGhlRecipient({ version: VERSION, body: contact({ dndSettings: {
+      SMS: { ...(exact ? { status: "inactive" } : {}), [alias]: "active" },
+    } }), expected: binding() });
+    assert.equal(result.state, "held"); assert.ok(result.reasons.includes("incompatible_dnd_status_schema"));
+  }
+  const nonenumerableAlias = Object.defineProperty({}, "Sms", { value: { status: "active" } });
+  assert.equal(parseGhlRecipient({ version: VERSION, body: contact({ dndSettings: nonenumerableAlias }), expected: binding() }).state, "held");
+});
+test("Email omission stays held and canonical unrelated-channel settings remain independent", () => {
+  for (const absentSettings of [false, true]) for (const global of [false, true, "absent"] as const) {
+    const body = contact({ dnd: global, dndSettings: { SMS: { status: "inactive" } } });
+    if (absentSettings) delete (body.contact as Record<string, unknown>).dndSettings;
+    if (global === "absent") delete (body.contact as Record<string, unknown>).dnd;
+    const result = parseGhlRecipient({ version: VERSION, body, expected: binding("email") });
+    assert.equal(result.state, global === true ? "blocked" : "held"); assert.ok(result.reasons.includes("channel_dnd_unknown"));
+  }
+  for (const other of [undefined, null, {}, { status: "active" }, { status: "permanent" }, { status: "unknown" }]) {
+    assert.equal(parseGhlRecipient({ version: VERSION, body: contact({ dndSettings: { Email: other } }), expected: binding() }).state, "allowed");
+    assert.equal(parseGhlRecipient({ version: VERSION, body: contact({ dndSettings: { SMS: other, Email: { status: "inactive" } } }), expected: binding("email") }).state, "allowed");
+  }
+});
+test("sparse SMS evidence cannot bypass version, contact/location, destination or construction binding", () => {
+  const body = contact(); delete (body.contact as Record<string, unknown>).dndSettings; delete (body.contact as Record<string, unknown>).dnd;
+  for (const version of [undefined, null, "v3", "2021-04-15"])
+    assert.equal(parseGhlRecipient({ version, body, expected: binding() }).state, "held");
+  for (const patch of [{ id: "wrong" }, { locationId: "wrong" }, { phone: "+16025550199" }, { id: undefined },
+    { locationId: undefined }, { phone: undefined }, { additionalPhones: [{}] }])
+    assert.equal(parseGhlRecipient({ version: VERSION, body: { contact: { ...body.contact, ...patch } }, expected: binding() }).state, "held");
+  for (const patch of [{ accountId: "" }, { contactId: "wrong" }, { locationId: "wrong" }, { destination: "+1 6025550111" }])
+    assert.equal(parseGhlRecipient({ version: VERSION, body, expected: { ...binding(), ...patch } }).state, "held");
+  const recipient = parseGhlRecipient({ version: VERSION, body, expected: binding() }), value = input();
+  assert.equal(buildGhlMessageRequest({ ...value, recipient }).state, "constructed_disabled");
+  for (const patch of [{ accountId: "other" }, { contactId: "other" }, { locationId: "other" }, { destination: "+16025550199" }])
+    assert.equal(buildGhlMessageRequest({ ...value, recipient, binding: { ...value.binding, ...patch } }).state, "held");
+  assert.equal(buildGhlMessageRequest({ ...value, recipient: { ...recipient } }).state, "held");
+  assert.equal(buildGhlMessageRequest({ ...value, recipient, review: undefined }).state, "held");
+});
+test("inbound-only DND neither creates nor removes an outbound SMS override", () => {
+  for (const status of ["active", "inactive", "permanent"]) {
+    const body = contact({ inboundDndSettings: { all: { status } } });
+    delete (body.contact as Record<string, unknown>).dnd; delete (body.contact as Record<string, unknown>).dndSettings;
+    assert.equal(parseGhlRecipient({ version: VERSION, body, expected: binding() }).state, "allowed");
+    assert.equal(parseGhlRecipient({ version: VERSION, body, expected: binding("email") }).state, "held");
+    assert.equal(parseGhlRecipient({ version: VERSION, body: { contact: { ...body.contact, dnd: true } }, expected: binding() }).state, "blocked");
+    assert.equal(parseGhlRecipient({ version: VERSION, body: { contact: { ...body.contact, dndSettings: { SMS: {} } } }, expected: binding() }).state, "held");
+  }
+});
 
 test("unversioned/lowercase and missing contact wrappers cannot be silently accepted", () => {
   for (const version of [undefined, null, "v3", "2023-02-21"])

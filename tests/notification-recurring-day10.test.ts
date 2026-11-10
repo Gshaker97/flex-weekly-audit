@@ -194,12 +194,46 @@ test("only current Day10 invoices get exact source/sender/DND/history reads", ()
   const r = await f.run().run(); assert.equal(r.invoices.length, 31); assert.equal(r.messageAttempts, 1, JSON.stringify(r));
   assert.equal(f.state.sourceReads, 6); assert.equal(f.counts.contact, 3); // Complete owner invoice pagination on each of three reads.
 }));
-for (const kind of ["email-only", "sms-mismatch", "missing-sms-dnd", "sms-active", "sender", "unattributed-history", "quarantine", "paid", "runtime-location"])
+for (const absent of ["settings", "SMS"] as const) for (const phase of ["initial", "final"] as const)
+  test(`${phase} genuine ${absent} omission preserves one synthetic SMS attempt and ledger fencing`, () => clock(async tick => {
+    const f = fixture(tick);
+    const omit = () => { if (absent === "settings") delete f.data.contacts[0].dndSettings; else delete f.data.contacts[0].dndSettings.SMS; };
+    if (phase === "initial") omit();
+    else f.db.hook = op => { if (op === "ledger:reserve") omit(); };
+    const service = f.run(), result = await service.run();
+    assert.equal(result.invoices[0].result?.state, "accepted", JSON.stringify(result));
+    assert.equal(f.state.posts, 1); assert.equal(f.state.sourceReads, 3);
+    assert.equal(f.db.rows[0].state, "accepted");
+    assert.equal(f.http.filter(call => call.method === "POST").length, 1);
+    const wire = JSON.parse(f.http.find(call => call.method === "POST")!.body!);
+    assert.equal(wire.type, "SMS"); assert.equal(wire.message, ORIGINAL_DAY10_SMS_BODY);
+    await service.run(); await f.run().run(); assert.equal(f.state.posts, 1);
+  }));
+for (const [label, mutate] of [
+  ["global active", (c: any) => { c.dnd = true; }],
+  ["SMS active", (c: any) => { c.dndSettings = { SMS: { status: "active" } }; }],
+  ["SMS permanent", (c: any) => { c.dndSettings = { SMS: { status: "permanent" } }; }],
+  ["present malformed settings", (c: any) => { c.dndSettings = null; }],
+  ["present malformed SMS", (c: any) => { c.dndSettings = { SMS: null }; }],
+  ["present SMS missing status", (c: any) => { c.dndSettings = { SMS: {} }; }],
+  ["wrong-case SMS alias", (c: any) => { c.dndSettings = { Sms: { status: "active" } }; }],
+  ["wrong-case settings alias", (c: any) => { c.dndsettings = { SMS: { status: "active" } }; }],
+  ["wrong-case global alias", (c: any) => { c.Dnd = true; }],
+] as const) test(`sparse SMS final reread catches ${label} and retains the reservation without POST/retry`, () => clock(async tick => {
+  const f = fixture(tick); delete f.data.contacts[0].dndSettings;
+  f.db.hook = op => { if (op === "ledger:reserve") mutate(f.data.contacts[0]); };
+  const result = await f.run().run();
+  assert.equal(result.state, "unknown", JSON.stringify(result)); assert.equal(result.admissionAttempts, 1);
+  assert.equal(f.db.rows[0].state, "reserved"); assert.equal(f.state.posts, 0);
+  assert.equal(f.db.operations.includes("ledger:pending"), false);
+  await f.run().run(); assert.equal(f.state.posts, 0);
+}));
+for (const kind of ["email-only", "sms-mismatch", "missing-sms-status", "sms-active", "sender", "unattributed-history", "quarantine", "paid", "runtime-location"])
   test(`held ${kind} never creates attempt or falls back to Email`, () => clock(async tick => {
     const f = fixture(tick);
     if (kind === "email-only") { f.owner.phone = null as any; f.fresh.phones = []; f.data.contacts[0].phone = null; }
     if (kind === "sms-mismatch") f.data.contacts[0].phone = "+16025550109";
-    if (kind === "missing-sms-dnd") delete f.data.contacts[0].dndSettings.SMS;
+    if (kind === "missing-sms-status") f.data.contacts[0].dndSettings.SMS = {};
     if (kind === "sms-active") f.data.contacts[0].dndSettings.SMS.status = "active";
     if (kind === "sender") f.state.senderSms = false;
     if (kind === "unattributed-history") f.state.historyOutbound = true;
@@ -208,14 +242,14 @@ for (const kind of ["email-only", "sms-mismatch", "missing-sms-dnd", "sms-active
     if (kind === "runtime-location") (f.runtime as any).locationId = "other";
     const r = await f.run().run(); assert.equal(r.messageAttempts, 0); assert.equal(f.db.rows.length, 0);
   }));
-for (const kind of ["balance", "due-date", "identity", "missing-dnd", "sender", "history", "expiry"])
+for (const kind of ["balance", "due-date", "identity", "missing-dnd-status", "sender", "history", "expiry"])
   test(`final ${kind} change preserves reservation and forbids POST/retry`, () => clock(async tick => {
     const f = fixture(tick); f.db.hook = op => {
       if (op !== "ledger:reserve") return;
       if (kind === "balance") f.data.invoices[0].amounts.invoiceBalance = 100;
       if (kind === "due-date") f.data.invoices[0].dueDate = "2026-10-30";
       if (kind === "identity") f.data.contacts[0].phone = "+16025550109";
-      if (kind === "missing-dnd") delete f.data.contacts[0].dndSettings.SMS;
+      if (kind === "missing-dnd-status") f.data.contacts[0].dndSettings.SMS = {};
       if (kind === "sender") f.state.senderSms = false;
       if (kind === "history") f.state.historyOutbound = true;
       if (kind === "expiry") tick(300000);

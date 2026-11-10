@@ -126,7 +126,9 @@ for (const channel of ["sms", "email"] as const) test(`${channel}-only recipient
   assert.equal(f.http.length, 2);
 }));
 for (const [label, mutate, expected] of [
-  ["missing SMS DND", (c: any) => { delete c.dndSettings.SMS; }, "held"],
+  ["absent SMS override", (c: any) => { delete c.dndSettings.SMS; }, "allowed"],
+  ["absent DND settings", (c: any) => { delete c.dndSettings; }, "allowed"],
+  ["present SMS with missing status", (c: any) => { c.dndSettings.SMS = {}; }, "held"],
   ["global active", (c: any) => { c.dnd = true; }, "blocked"],
   ["SMS permanent", (c: any) => { c.dndSettings.SMS.status = "permanent"; }, "blocked"],
   ["missing global defaults false", (c: any) => { delete c.dnd; }, "allowed"],

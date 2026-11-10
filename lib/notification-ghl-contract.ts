@@ -154,19 +154,32 @@ export function parseGhlRecipient(input: Readonly<{ version: unknown; body: unkn
         else associated ||= extra.some(item => record(item)![field] === input.expected.destination);
       }
       if (!associated) reasons.push("destination_not_exact_contact_association");
+      const channelKey = input.expected.channel === "sms" ? "SMS" : "Email";
       const settings = record(contact.dndSettings);
-      const status = record(settings?.[input.expected.channel === "sms" ? "SMS" : "Email"])?.status;
+      const channelSettings = settings && Object.hasOwn(settings, channelKey) ? record(settings[channelKey]) : null;
+      const status = channelSettings && Object.hasOwn(channelSettings, "status") ? channelSettings.status : undefined;
+      const incompatibleTopLevel = Object.getOwnPropertyNames(contact).some(key =>
+        (key.toLowerCase() === "dnd" && key !== "dnd") || (key.toLowerCase() === "dndsettings" && key !== "dndSettings"));
+      const incompatibleChannel = settings && Object.getOwnPropertyNames(settings).some(key =>
+        key.toLowerCase() === input.expected.channel && key !== channelKey);
+      if (incompatibleTopLevel) reasons.push("incompatible_contact_dnd_schema");
+      if (incompatibleChannel) reasons.push("incompatible_channel_dnd_schema");
+      if (channelSettings && Object.getOwnPropertyNames(channelSettings).some(key => key.toLowerCase() === "status" && key !== "status"))
+        reasons.push("incompatible_dnd_status_schema");
       if (settings && (Object.hasOwn(settings, "sms") || Object.hasOwn(settings, "email")))
         reasons.push("incompatible_lowercase_dnd_schema");
       // HighLevel explicitly documents omitted global dnd as false across APIs.
-      // This does not define a default for omitted per-channel settings. A present
-      // malformed/null value remains unknown rather than being treated as omitted.
+      // The reviewed pinned contact response also uses genuine SMS/settings omission
+      // for no SMS override. This observed encoding is not consent or an Email default.
+      // Present malformed values and conflicting casing never receive that default.
+      const noSmsOverride = input.expected.channel === "sms" && !incompatibleTopLevel && !incompatibleChannel &&
+        (!Object.hasOwn(contact, "dndSettings") || !!settings && !Object.hasOwn(settings, channelKey));
       const globalDnd = Object.hasOwn(contact, "dnd") ? contact.dnd : false;
       blocked = globalDnd === true || status === "active" || status === "permanent";
       if (typeof globalDnd !== "boolean") reasons.push("global_dnd_unknown");
-      if (!["active", "inactive", "permanent"].includes(status as string)) reasons.push("channel_dnd_unknown");
+      if (!noSmsOverride && !["active", "inactive", "permanent"].includes(status as string)) reasons.push("channel_dnd_unknown");
       if (blocked) reasons.push("recipient_suppressed");
-      valid = reasons.length === 0 && globalDnd === false && status === "inactive";
+      valid = reasons.length === 0 && globalDnd === false && (status === "inactive" || noSmsOverride);
     }
   } catch { reasons.push("malformed_contact_input"); }
   const result: GhlRecipientResult = Object.freeze({ state: valid ? "allowed" : blocked ? "blocked" : "held",

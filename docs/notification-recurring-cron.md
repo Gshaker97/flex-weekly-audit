@@ -77,7 +77,9 @@ This is standing cohort authorization, not a per-invoice or daily approval chore
 Every new service instance obtains fresh bounded inventory/source/identity/history
 evidence. An old source or policy handle is never renewed. New invoices can qualify
 under the standing policy; previously pending/unknown events cannot be retried.
-Missing channel DND remains held. No email fallback, later milestone, fee,
+Genuine SMS/settings omission follows the reviewed no-SMS-override encoding.
+Present malformed channel/status and missing Email settings remain held.
+No email fallback, later milestone, fee,
 suspension or Angie format is enabled by this hook.
 
 ## Failure visibility and barriers
