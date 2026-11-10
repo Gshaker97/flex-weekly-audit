@@ -253,3 +253,34 @@ model ServiceTypeRevenue {
   @@unique([year, serviceName])
   @@index([year])
 }
+
+// LOCAL CANDIDATE ONLY. npm start applies pending migrations automatically.
+// Do not deploy without separate schema review and explicit migration approval.
+// SQL also enforces immutable claim data and monotonic state transitions.
+model NotificationLedger {
+  id                String    @id
+  reservationToken  String    @unique @db.VarChar(64)
+  eventKey          String    @unique @db.Text
+  accountId         String
+  invoiceId         String
+  dayPastDue        Int
+  audience          String
+  contactId         String
+  scheduledOn       DateTime  @db.Date
+  channel           String
+  eventPayload      Json      @db.JsonB
+  body              String    @db.Text
+  destination       String    @db.Text
+  eventHash         String    @db.VarChar(64)
+  bodyHash          String    @db.VarChar(64)
+  destinationHash   String    @db.VarChar(64)
+  state             String    @default("reserved")
+  providerMessageId String?
+  createdAt         DateTime  @default(now())
+  pendingAt         DateTime?
+  outcomeAt         DateTime?
+
+  @@unique([accountId, invoiceId, dayPastDue, audience])
+  @@unique([accountId, contactId, scheduledOn])
+  @@index([state, createdAt])
+}
