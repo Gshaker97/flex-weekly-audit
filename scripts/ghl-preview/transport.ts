@@ -16,8 +16,9 @@ export type ReaderOptions = { apiKey: string; locationId: string; deadlineAt?: n
 export function assertReadOnlyRequest(url: URL, method: string, body?: Record<string, unknown>): void {
   if (url.origin !== GHL_ORIGIN || url.username || url.password || url.hash) throw new GhlPreviewFailure('REQUEST_ORIGIN_REJECTED');
   const path = url.pathname;
+  const exactContact = /^\/contacts\/[A-Za-z0-9_-]{1,256}$/.test(path) && path !== '/contacts/search';
   const allowed = (method === 'POST' && path === '/contacts/search') ||
-    (method === 'GET' && (path === '/opportunities/pipelines' || path === '/opportunities/search'));
+    (method === 'GET' && (path === '/opportunities/pipelines' || path === '/opportunities/search' || exactContact));
   if (!allowed) throw new GhlPreviewFailure('REQUEST_METHOD_OR_ROUTE_REJECTED');
   const allowedQuery = path === '/opportunities/pipelines' ? ['locationId'] :
     path === '/opportunities/search' ? ['location_id', 'pipeline_id', 'status', 'limit', 'startAfter', 'startAfterId'] : [];
@@ -50,7 +51,8 @@ export class GhlReadonlyReader {
     if (++this.requests > GHL_LIMITS.maxRequests) throw new GhlPreviewFailure('GHL_REQUEST_LIMIT');
     const url = new URL(path, GHL_ORIGIN);
     assertReadOnlyRequest(url, method, body);
-    const actualLocation = method === 'POST' ? body?.locationId : url.searchParams.get(url.pathname === '/opportunities/pipelines' ? 'locationId' : 'location_id');
+    const exactContact = method === 'GET' && /^\/contacts\/[A-Za-z0-9_-]{1,256}$/.test(url.pathname) && url.pathname !== '/contacts/search';
+    const actualLocation = exactContact ? this.options.locationId : method === 'POST' ? body?.locationId : url.searchParams.get(url.pathname === '/opportunities/pipelines' ? 'locationId' : 'location_id');
     if (actualLocation !== this.options.locationId) throw new GhlPreviewFailure('REQUEST_LOCATION_REJECTED');
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), Math.max(1, Math.min(GHL_LIMITS.requestMs, this.deadlineAt - Date.now())));
@@ -76,6 +78,8 @@ export class GhlReadonlyReader {
       let data: unknown;
       try { data = JSON.parse(text); } catch { throw new GhlPreviewFailure('GHL_INVALID_JSON'); }
       if (!object(data)) throw new GhlPreviewFailure('GHL_INVALID_RESPONSE_SHAPE');
+      if (exactContact && (!object(data.contact) || data.contact.id !== url.pathname.slice('/contacts/'.length) ||
+          data.contact.locationId !== this.options.locationId)) throw new GhlPreviewFailure('EXACT_CONTACT_SCOPE_MISMATCH');
       return data;
     } catch (error) {
       if (error instanceof GhlPreviewFailure) throw error;

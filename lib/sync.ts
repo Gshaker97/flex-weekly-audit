@@ -5,6 +5,7 @@ import { verifyFreshGhlIdentity, readFreshJobberIdentities, strictGhlIdentityHol
 import { refreshOpenInvoiceStatuses } from "./open-invoice-status-refresh";
 import { runConfiguredPaidCycle } from "./ghl-paid-cycle";
 import { runConfiguredDateRepair } from "./ghl-date-repair-operation";
+import { runConfiguredRecurringDay10, recurringDay10SyncIssue } from "./notification-recurring-cron";
 import {
   fetchAllClients,
   fetchAllJobs,
@@ -129,6 +130,7 @@ export async function runFullSync(
   const { run, since } = await admitSyncRun({ ...opts, entrypoint: opts.entrypoint ?? "http" });
   const writer = new SyncRunWriter(run.id);
   let heavyFeeds: Promise<{ ok: true } | { ok: false; err: unknown }> | undefined;
+  let recurringDay10Issue: string | null = null;
   log(`[sync] mode=${run.mode}${since ? ` since=${since.toISOString()}` : ""}`);
 
   try {
@@ -138,6 +140,15 @@ export async function runFullSync(
       where: { id: run.id },
       data: { customersFetched: clientNodes.length },
     });
+
+    // Optional, default-disabled notification phase. Only an admitted standalone
+    // cron may load its private standing policy. The first ordinary Jobber call
+    // above owns the existing token lifecycle; no notification-driven refresh.
+    // Await all notification settlement before heavy feeds; unknown event outcomes
+    // retain their ledger fence without stopping unrelated dashboard cache refresh.
+    const recurringDay10 = await runConfiguredRecurringDay10({ entrypoint: opts.entrypoint ?? "http" });
+    recurringDay10Issue = recurringDay10SyncIssue(recurringDay10);
+    if (recurringDay10Issue) await prisma.syncRun.update({ where: { id: run.id }, data: { errorMessage: recurringDay10Issue } });
 
     // Jobs and visits are the two heavy feeds — neither accepts an updatedAt
     // filter, so both pull in full every sync and together they are the large
@@ -171,7 +182,7 @@ export async function runFullSync(
               visitsFetched: visits.length,
               // A truncated pull is not an error, but it silently leaves the
               // newest records stale — so it has to be recorded, not just logged.
-              ...(warnings.length ? { errorMessage: warnings.join(" · ") } : {}),
+              ...(warnings.length ? { errorMessage: [recurringDay10Issue, ...warnings].filter(Boolean).join(" · ") } : {}),
             },
           });
         } catch (err: any) {
@@ -181,7 +192,7 @@ export async function runFullSync(
           await prisma.syncRun
             .update({
               where: { id: run.id },
-              data: { errorMessage: `Visit sync failed: ${err?.message ?? err}` },
+              data: { errorMessage: [recurringDay10Issue, `Visit sync failed: ${err?.message ?? err}`].filter(Boolean).join(" · ") },
             })
             .catch(() => {});
         }
@@ -282,7 +293,7 @@ export async function runFullSync(
     // Never release admission while a rejected feed still has sibling work.
     // A killed process leaves running/blocked state for explicit operator review.
     await heavyFeeds;
-    await writer.finish("failed", err?.message ?? "Unknown error");
+    await writer.finish("failed", [recurringDay10Issue, err?.message ?? "Unknown error"].filter(Boolean).join(" · "));
     throw err;
   }
 }

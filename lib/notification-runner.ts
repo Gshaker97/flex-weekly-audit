@@ -18,13 +18,15 @@ export type NotificationRunnerPreparation = Readonly<{
 /** These are authenticated application dependencies, never a request body or a JSON approval file.
  * External history MUST cover prior workflow/manual/provider attempts, independently of this ledger.
  * No callback receives the reservation or a way to erase a local attempt. */
-export type NotificationRunnerDependencies = Readonly<{
-  sourceRequest: NotificationSourceRequest; sourceIO: NotificationSourceIO;
+export type NotificationRunnerSource =
+  | Readonly<{ sourceRequest: NotificationSourceRequest; sourceIO: NotificationSourceIO; recurringSource?: never }>
+  | Readonly<{ recurringSource: NotificationSourceHandle; sourceRequest?: never; sourceIO?: never }>;
+export type NotificationRunnerDependencies = NotificationRunnerSource & Readonly<{
   database: NotificationLedgerDatabase;
   contact: Omit<GhlReadOnlyOptions, "now">;
   transport: Omit<GhlTransportOptions, "ledger" | "now" | "mode">;
-  prepare(source: NotificationSourceSnapshot): Promise<NotificationRunnerPreparation>;
-  readExternal(source: NotificationSourceSnapshot, event: Event): Promise<Omit<NotificationExternalEvidence, "dnd">>;
+  prepare(source: NotificationSourceSnapshot, handle: NotificationSourceHandle): Promise<NotificationRunnerPreparation>;
+  readExternal(source: NotificationSourceSnapshot, event: Event, handle: NotificationSourceHandle): Promise<Omit<NotificationExternalEvidence, "dnd">>;
   review(construction: GhlConstructionResult, event: Event, binding: GhlMessageBinding): Promise<GhlTransportReview>;
 }>;
 export type NotificationRunnerResult = Readonly<{
@@ -94,21 +96,28 @@ export function createNotificationRunner(options: Readonly<{
       if (!dependencies) return report("held", "configuration", ["trusted_dependencies_required"]);
       let phase = "configuration", reserved = false, reserveAttempted = false;
       try {
-        const d = dependencies, request = structuredClone(d.sourceRequest);
-        const { prepare, readExternal, review, database, sourceIO } = d;
+        const d = dependencies;
+        const { prepare, readExternal, review, database } = d;
         const ledger = createNotificationLedger(database);
         const contactReader = createGhlReadOnlyReader({ ...d.contact, now });
         const transport = createGhlOneAttemptTransport({ ...d.transport, mode: "reviewed-one-attempt", ledger, now });
         // The source module transitively initializes legacy production clients. Keep that
         // import out of the disabled/readiness path; no deployed source bindings are invoked.
-        const { readNotificationSource, refreshNotificationSource, inspectNotificationSource, composeNotificationEvidence } =
+        const { readNotificationSource, refreshNotificationSource, inspectNotificationSource, inspectRecurringNotificationSource, composeNotificationEvidence } =
           await import("./notification-source");
         phase = "initial_source";
-        let handle = await readNotificationSource(request, sourceIO);
-        const prepared = structuredClone(await prepare(inspectNotificationSource(handle)));
+        let handle: NotificationSourceHandle;
+        if (d.recurringSource !== undefined) {
+          // Only an issuer-owned v2 capability. JSON/request clones cannot select a new IO
+          // implementation, re-stamp source evidence or renew its population lifetime.
+          inspectRecurringNotificationSource(d.recurringSource);
+          handle = d.recurringSource;
+        } else handle = await readNotificationSource(structuredClone(d.sourceRequest!), d.sourceIO!);
+        const initialSource = inspectNotificationSource(handle);
+        const prepared = structuredClone(await prepare(initialSource, handle));
         const event = immutableEvent(prepared.event), key = eventKey(event);
         notificationEventHash(event); // Reject non-JSON/unsupported data before any admission.
-        const binding: GhlMessageBinding = Object.freeze({ accountId: event.accountId, locationId: request.scope.locationId,
+        const binding: GhlMessageBinding = Object.freeze({ accountId: event.accountId, locationId: initialSource.locationId,
           contactId: event.contactId, channel: event.channel, destination: event.destination,
           eventKey: key, invoiceId: event.invoiceId, sender: prepared.sender.sender, bodyHash: event.bodyDigest });
         if (event.accountId !== d.transport.accountId || binding.locationId !== d.transport.locationId ||
@@ -117,7 +126,7 @@ export function createNotificationRunner(options: Readonly<{
 
         async function evidence(source: NotificationSourceHandle, reservation?: NotificationReservation) {
           const snapshot = inspectNotificationSource(source);
-          const external = structuredClone(await readExternal(snapshot, event));
+          const external = structuredClone(await readExternal(snapshot, event, source));
           const contactAt = Date.now(), recipient = await contactReader.readContact(binding);
           if (recipient.state !== "allowed") throw new Error("contact_not_allowed");
           const contactProof = proof(contactAt, `ghl-contact-read:${hash(JSON.stringify(binding))}`);

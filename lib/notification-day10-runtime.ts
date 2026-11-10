@@ -2,8 +2,11 @@
 import type { Day10PilotRuntime } from "./notification-day10-pilot";
 import type { NotificationLedgerDatabase } from "./notification-ledger";
 
-export function verifyDay10DeploymentHolds(env: Record<string, string | undefined>, locationId: string): void {
-  if (env.RAILWAY_SERVICE_ID !== "ed22ce04-2e5d-47d1-98ed-ce63c99d3d9f" ||
+export function verifyDay10DeploymentHolds(env: Record<string, string | undefined>, locationId: string,
+  service: "pilot" | "recurring-cron" = "pilot"): void {
+  const serviceId = service === "pilot" ? "ed22ce04-2e5d-47d1-98ed-ce63c99d3d9f"
+    : service === "recurring-cron" ? "ee3a4c67-8b0c-48d2-871d-e20bed336c4a" : null;
+  if (!serviceId || env.RAILWAY_SERVICE_ID !== serviceId ||
       env.RAILWAY_ENVIRONMENT_ID !== "bc72bc2d-9a4c-494d-8bee-9ca782db1240" ||
       (env.RAILWAY_PROJECT_ID && env.RAILWAY_PROJECT_ID !== "5d7858db-0443-4891-8a95-1eb1261d3e61") ||
       !env.RAILWAY_DEPLOYMENT_ID || !env.DATABASE_URL || !env.GHL_API_KEY || env.GHL_LOCATION_ID !== locationId)

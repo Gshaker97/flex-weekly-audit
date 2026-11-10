@@ -1,9 +1,11 @@
 /** Disabled, read-only source composition. No sender, migration, scheduler or sync hook. */
 import { createHash } from "node:crypto";
+import type { Prisma } from "@prisma/client";
 import { permitsUnknownCurrency } from "./notification-copy-policy";
 import { readOwnerInvoiceEvidence } from "./ghl-date-readiness";
 import { readReviewedIdentityCoverage, coveragePermitsExactInvoice,
-  type CachedLinkCounts, type ReviewedOmissionPolicy, type IdentityCoverageEvidence } from "./ghl-identity-coverage";
+  readReviewedIdentityInventory, inspectReviewedIdentityInventory, reviewedIdentityOwnerEvidence, bindReviewedIdentityInvoice,
+  type ReviewedIdentityInventory, type CachedLinkCounts, type ReviewedOmissionPolicy, type IdentityCoverageEvidence } from "./ghl-identity-coverage";
 import { verifyFreshGhlIdentity, validGhlContactIdentity } from "./ghl-write-identity";
 import type { FreshJobberIdentity } from "./ghl-write-identity";
 import { canonicalPhone } from "./ghl-phone-match";
@@ -12,6 +14,7 @@ import { invoiceCalendarDate, invoiceReminderClock } from "./invoice-reminder-cl
 import { PROPOSAL, type Event, type Evidence, type Proof } from "./notification-gate";
 import type { GhlContact } from "./ghl";
 import type { jobberGraphQL } from "./jobber";
+import type { NotificationWorklistTagSnapshot } from "./notification-worklist";
 import type { JobberReader } from "../scripts/source-audit/transport";
 import { GhlReadonlyReader } from "../scripts/ghl-preview/transport";
 import { readAllContacts } from "../scripts/ghl-preview/snapshot";
@@ -22,6 +25,15 @@ export type NotificationSourceRequest = Readonly<{
   scope: Readonly<{ locationId: string; jobberClientId: string; contactId: string; invoiceId: string }>;
   originalInvoice: Readonly<{ totalMinor: number; issuedDate: string; dueDate: string }>;
   identityCoveragePolicy: ReviewedOmissionPolicy;
+}>;
+/** Generated current-source pins, not manual per-invoice authorization. */
+export type NotificationRecurringSourceRequest = Omit<NotificationSourceRequest, "version"> & Readonly<{
+  version: 2; inventorySourceRef: string;
+}>;
+type SourceRequest = NotificationSourceRequest | NotificationRecurringSourceRequest;
+export type NotificationRecurringSourceIO = NotificationSourceIO & Readonly<{
+  customer(ownerId: string): Promise<Customer | null>;
+  contact(contactId: string): Promise<GhlContact & { locationId: string; tags?: unknown }>;
 }>;
 /** Trusted IO boundary, not request JSON. Each function must perform fresh, complete reads.
  * There is deliberately no injectable `coverage: true` or pre-minted identity/source proof. */
@@ -52,8 +64,8 @@ export type NotificationSourceSnapshot = Readonly<{
   productionSendCapability: false; timingApproved: false;
 }>;
 type PrivateSnapshot = {
-  snapshot: NotificationSourceSnapshot;
-  request: NotificationSourceRequest; io: NotificationSourceIO;
+  snapshot: NotificationSourceSnapshot; contactTags?: NotificationWorklistTagSnapshot | null;
+  request: SourceRequest; io: NotificationSourceIO; batch?: NotificationSourceBatch;
   customers: Customer[]; contacts: GhlContact[]; identities: FreshJobberIdentity[]; coverage: IdentityCoverageEvidence;
   homeownerEmail: string | null; homeownerPhone: string | null;
   contactEmail: string | null; contactPhone: string | null;
@@ -88,9 +100,9 @@ const sourceIdentityKey = (rows: FreshJobberIdentity[]) => JSON.stringify(rows.m
 const instant = (value: unknown) => typeof value === "string" &&
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/.test(value) && invoiceCalendarDate(value)
   ? Date.parse(value) : NaN;
-function validateRequest(r: NotificationSourceRequest, locationId: string | undefined, at: number): void {
+function validateRequest(r: SourceRequest, locationId: string | undefined, at: number): void {
   const expires = instant(r?.expiresAt), policyExpires = instant(r?.identityCoveragePolicy?.expiresAt);
-  if (r?.version !== 1 || !id(r.reviewRef) || !r.scope || Object.keys(r.scope).length !== 4 ||
+  if (![1, 2].includes(r?.version) || (r.version === 2 && !id(r.inventorySourceRef)) || !id(r.reviewRef) || !r.scope || Object.keys(r.scope).length !== 4 ||
       !Object.values(r.scope).every(id) || r.scope.locationId !== locationId ||
       !Number.isFinite(at) || !Number.isFinite(expires) || expires <= at || expires > policyExpires ||
       !Number.isSafeInteger(r.originalInvoice?.totalMinor) || r.originalInvoice.totalMinor <= 0 ||
@@ -130,6 +142,7 @@ function owned(handle: NotificationSourceHandle, sourceRequired = true): Private
  * Policy is never renewed. Its 24h maximum and coverage's 5min maximum remain unchanged.
  * Source observation time is START of all reads, never end-of-read timestamp laundering. */
 export async function readNotificationSource(request: NotificationSourceRequest, io: NotificationSourceIO): Promise<NotificationSourceHandle> {
+  if (request?.version !== 1) throw new Error("Legacy notification source requires version 1");
   io = Object.freeze({ ...io });
   const r = structuredClone(request), begun = Date.now();
   validateRequest(r, io.locationId(), begun);
@@ -183,10 +196,14 @@ async function readAndIssueSource(data: Baseline, continuity: Continuity): Promi
   };
   const invoices = structuredClone(await readOwnerInvoiceEvidence(s.jobberClientId, query));
   const stored = structuredClone(await io.storedInvoices(s.jobberClientId));
-  if (invoices.length !== 1 || invoices[0].id !== s.invoiceId || invoices[0].client?.id !== s.jobberClientId ||
-      !Array.isArray(stored) || stored.length !== 1 || stored[0]?.jobberInvoiceId !== s.invoiceId)
+  const selected = invoices.filter(invoice => invoice.id === s.invoiceId);
+  const storedComplete = Array.isArray(stored) && stored.every(row => id(row?.jobberInvoiceId)) &&
+    new Set(stored.map(row => row.jobberInvoiceId)).size === stored.length &&
+    stored.every(row => invoices.some(invoice => invoice.id === row.jobberInvoiceId));
+  if (selected.length !== 1 || selected[0].client?.id !== s.jobberClientId || !storedComplete ||
+      (r.version === 1 && (invoices.length !== 1 || stored.length !== 1 || stored[0]?.jobberInvoiceId !== s.invoiceId)))
     throw new Error("Original notification invoice set changed or incomplete");
-  const invoice = invoices[0], totalMinor = moneyCents(invoice.amounts?.total), balanceMinor = moneyCents(invoice.amounts?.invoiceBalance);
+  const invoice = selected[0], totalMinor = moneyCents(invoice.amounts?.total), balanceMinor = moneyCents(invoice.amounts?.invoiceBalance);
   if (totalMinor === null || balanceMinor === null || balanceMinor > totalMinor || totalMinor !== r.originalInvoice.totalMinor ||
       invoice.issuedDate !== r.originalInvoice.issuedDate || invoice.dueDate !== r.originalInvoice.dueDate ||
       typeof invoice.invoiceStatus !== "string" || !invoice.invoiceStatus.trim())
@@ -244,6 +261,7 @@ async function readAndIssueSource(data: Baseline, continuity: Continuity): Promi
  * unseen until coverage expires. DND and other external evidence still need their own read. */
 export async function refreshNotificationSource(handle: NotificationSourceHandle): Promise<NotificationSourceHandle> {
   const before = owned(handle, false), { request: r, io } = before, s = r.scope;
+  if (before.batch && r.version === 2) return readNotificationSourceFromBatch(before.batch, r);
   validateRequest(r, io.locationId(), Date.now());
   const cacheObservedAt = new Date(Date.now()).toISOString(), customers = structuredClone(await io.customers());
   if (customerIdentityKey(customers) !== customerIdentityKey(before.customers) || !coveragePermitsExactInvoice(before.coverage, customers, before.identities, s))
@@ -276,6 +294,137 @@ export async function refreshNotificationSource(handle: NotificationSourceHandle
 /** Inspection is not reissuance: a clone or serialized snapshot is not a source handle. */
 export function inspectNotificationSource(handle: NotificationSourceHandle): NotificationSourceSnapshot {
   return owned(handle).snapshot;
+}
+
+/** Admission for the recurring runner: the same unexpired v2 issuer capability, never
+ * a report, caller version flag, serialized request or renewed population. */
+export function inspectRecurringNotificationSource(handle: NotificationSourceHandle): NotificationSourceSnapshot {
+  const data = owned(handle);
+  if (data.request.version !== 2 || !data.batch) throw new Error("Original recurring batch source required");
+  batchData(data.batch);
+  return data.snapshot;
+}
+
+/** One authenticated population snapshot per bounded recurring batch. */
+declare const sourceBatchBrand: unique symbol;
+export type NotificationSourceBatch = Readonly<{ [sourceBatchBrand]: true }>;
+type BatchData = { policy: ReviewedOmissionPolicy; io: NotificationRecurringSourceIO;
+  coverage: ReviewedIdentityInventory; customers: Customer[]; identities: FreshJobberIdentity[]; contacts: GhlContact[];
+  observedAt: string; expiresAt: string; contactObservedAt: string; sourceRef: string; locationId: string };
+const batches = new WeakMap<NotificationSourceBatch, BatchData>();
+function batchData(handle: NotificationSourceBatch): BatchData {
+  const data = batches.get(handle);
+  if (!data || Date.now() < instant(data.observedAt) || Date.now() >= instant(data.expiresAt) || data.io.locationId() !== data.locationId)
+    throw new Error("Unissued, changed or expired notification population batch");
+  inspectReviewedIdentityInventory(data.coverage);
+  return data;
+}
+export async function readNotificationSourceBatch(policy: ReviewedOmissionPolicy, io: NotificationRecurringSourceIO): Promise<NotificationSourceBatch> {
+  policy = structuredClone(policy); io = Object.freeze({ ...io });
+  const begun = Date.now(), locationId = io.locationId();
+  if (!id(locationId) || typeof io.customer !== "function" || typeof io.contact !== "function")
+    throw new Error("Exact recurring source bindings required");
+  const customers = structuredClone(await io.customers()); customerIdentityKey(customers);
+  const coverage = await readReviewedIdentityInventory(policy, customers,
+    () => io.quarantineCounts(policy.quarantine.map(row => row.jobberClientId)), io.query);
+  const population = inspectReviewedIdentityInventory(coverage), contactObservedAt = new Date(Date.now()).toISOString();
+  const contacts = structuredClone(await io.contacts()); contactIdentityKey(contacts, locationId);
+  const observedAt = new Date(begun).toISOString();
+  const expiresAt = new Date(Math.min(begun + 300000, instant(population.expiresAt))).toISOString();
+  const sourceRef = `notification-population-v1:${sha([policy, locationId, observedAt, contactObservedAt, customerIdentityKey(customers),
+    sourceIdentityKey(population.identities), contactIdentityKey(contacts, locationId)])}`;
+  const handle = Object.freeze({}) as NotificationSourceBatch;
+  batches.set(handle, { policy, io, coverage, customers, identities: population.identities, contacts,
+    observedAt, expiresAt, contactObservedAt, sourceRef, locationId });
+  batchData(handle); return handle;
+}
+export function inspectNotificationSourceBatch(handle: NotificationSourceBatch) {
+  const data = batchData(handle);
+  return Object.freeze({ accountId: data.policy.accountId, locationId: data.locationId, observedAt: data.observedAt,
+    expiresAt: data.expiresAt, sourceRef: data.sourceRef, customerCount: data.customers.length,
+    sourceOwnerCount: data.identities.length, contactCount: data.contacts.length, productionSendCapability: false as const });
+}
+/** Planning projection from real population reads. No invoice association or send proof. */
+export function resolveNotificationBatchOwner(handle: NotificationSourceBatch, ownerId: string): Readonly<{
+  contactId: string | null; holds: readonly string[]; contactTags: NotificationWorklistTagSnapshot | null;
+}> {
+  const data = batchData(handle), owners = data.customers.filter(row => row.jobberClientId === ownerId);
+  const held = (reason: string) => Object.freeze({ contactId: null, holds: Object.freeze([reason]), contactTags: null });
+  if (owners.length !== 1) return held("cached_owner_missing_or_ambiguous");
+  const owner = owners[0], email = emailKey(owner.email), phone = canonicalPhone(owner.phone);
+  const contacts = data.contacts.filter(contact => (email && email === emailKey(contact.email)) || (phone && phone === canonicalPhone(contact.phone)));
+  if (contacts.length !== 1) return held("primary_contact_missing_or_ambiguous");
+  let coverage: IdentityCoverageEvidence;
+  try { coverage = reviewedIdentityOwnerEvidence(data.coverage, ownerId); }
+  catch { return held("source_owner_missing_or_quarantined"); }
+  if (verifyFreshGhlIdentity(owner, data.customers, data.contacts, contacts[0].id, data.identities, coverage))
+    return held("source_contact_identity_conflict");
+  // Search responses are not promoted to fresh tag evidence. Tags come from exact contact GET.
+  return Object.freeze({ contactId: contacts[0].id, holds: Object.freeze([]), contactTags: null });
+}
+export function notificationBatchPolicy(handle: NotificationSourceBatch): ReviewedOmissionPolicy {
+  return structuredClone(batchData(handle).policy);
+}
+/** Exact source/owner/cache/contact/quarantine checks reuse only original bounded collision
+ * witnesses. No repeated full population read, no extension of their five-minute lifetime. */
+export async function readNotificationSourceFromBatch(handle: NotificationSourceBatch,
+  request: NotificationRecurringSourceRequest): Promise<NotificationSourceHandle> {
+  const batch = batchData(handle), r = structuredClone(request), io = batch.io, s = r.scope;
+  validateRequest(r, io.locationId(), Date.now());
+  if (r.version !== 2 || s.locationId !== batch.locationId || sha(r.identityCoveragePolicy) !== sha(batch.policy) ||
+      instant(r.expiresAt) > instant(batch.expiresAt)) throw new Error("Recurring request differs from original population batch");
+  const resolved = resolveNotificationBatchOwner(handle, s.jobberClientId);
+  if (resolved.contactId !== s.contactId) throw new Error("Recurring selected contact is unresolved or mismatched");
+  const cacheObservedAt = new Date(Date.now()).toISOString(), current = await io.customer(s.jobberClientId);
+  const owner = batch.customers.find(row => row.jobberClientId === s.jobberClientId)!;
+  if (!current || customerIdentityKey([current]) !== customerIdentityKey([owner])) throw new Error("Exact cached recurring owner changed");
+  const quarantineCountsObservedAt = new Date(Date.now()).toISOString(), ids = batch.policy.quarantine.map(row => row.jobberClientId);
+  const counts = await io.quarantineCounts(ids);
+  if (!Array.isArray(counts) || counts.length !== 2 || new Set(counts.map(row => row.jobberClientId)).size !== 2 ||
+      counts.some(row => !ids.includes(row.jobberClientId) || row.jobs !== 0 || row.invoices !== 0))
+    throw new Error("Recurring quarantine links changed or unverified");
+  const exactOwnerObservedAt = new Date(Date.now()).toISOString();
+  const coverage = await bindReviewedIdentityInvoice(batch.coverage, s, io.query);
+  const contactObservedAt = new Date(Date.now()).toISOString(), contact = structuredClone(await io.contact(s.contactId));
+  const oldContact = batch.contacts.find(row => row.id === s.contactId)!;
+  if (contact?.locationId !== batch.locationId || contact.id !== s.contactId ||
+      contactIdentityKey([contact], batch.locationId) !== contactIdentityKey([oldContact], batch.locationId))
+    throw new Error("Exact recurring contact identity changed");
+  batchData(handle);
+  const tags = contact.tags;
+  const contactTags: NotificationWorklistTagSnapshot | null = Array.isArray(tags) && tags.length <= 1000 && tags.every(id)
+    ? freezeTree({ kind: "complete-ghl-contact-tags", accountId: batch.policy.accountId, locationId: batch.locationId,
+      contactId: s.contactId, tags: [...tags], observedAt: contactObservedAt,
+      expiresAt: new Date(Math.min(instant(contactObservedAt) + 60000, instant(batch.expiresAt), instant(r.expiresAt))).toISOString(),
+      sourceRef: `notification-exact-contact-tags:${sha([batch.sourceRef, s.contactId, tags, contactObservedAt])}` }) : null;
+  return readAndIssueSource({ request: r, io, batch: handle, contactTags, customers: batch.customers, identities: batch.identities,
+    contacts: batch.contacts, coverage, homeownerEmail: emailKey(owner.email), homeownerPhone: canonicalPhone(owner.phone),
+    contactEmail: emailKey(contact.email), contactPhone: canonicalPhone(contact.phone) }, {
+    identityObservedAt: batch.observedAt, identityExpiresAt: new Date(Math.min(instant(batch.expiresAt), instant(r.expiresAt))).toISOString(),
+    identitySourceRef: batch.sourceRef,
+    ownerRevision: sha([batch.sourceRef, s]), cacheObservedAt, quarantineCountsObservedAt, exactOwnerObservedAt,
+    contactObservedAt, coverageReused: true });
+}
+
+/** Tags from the SAME exact authenticated contact read, never the discovery search projection.
+ * Missing/malformed tags stay null and cannot block independent common Day10 source work. */
+export function inspectNotificationSourceContactTags(handle: NotificationSourceHandle): NotificationWorklistTagSnapshot | null {
+  return owned(handle).contactTags ?? null;
+}
+
+/** Private application projection, not a public report or channel authorization. Only a
+ * current genuine source can expose matching Jobber/cache/GHL primary destinations.
+ * Missing, mismatched or syntactically invalid channels stay unavailable independently. */
+export function inspectNotificationSourceDestinations(handle: NotificationSourceHandle): Readonly<{
+  sms: string | null; email: string | null;
+}> {
+  const data = owned(handle);
+  const phone = data.homeownerPhone, email = data.homeownerEmail;
+  return Object.freeze({
+    sms: phone && phone === data.contactPhone && /^\+[1-9]\d{7,14}$/.test(phone) &&
+      (!phone.startsWith("+1") || /^\+1[2-9]\d{2}[2-9]\d{6}$/.test(phone)) ? phone : null,
+    email: email && email === data.contactEmail && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ? email : null,
+  });
 }
 
 /** Missing metadata is explicit: existing invoice query has no currency/category fields.
@@ -350,8 +499,9 @@ function freezeTree<T>(value: T): T {
  * JobberReader must be supplied from a separately authorized read-only caller. Do NOT pass
  * application jobberGraphQL: its getValidAccessToken path can refresh and write auth tokens.
  * The cache/GHL reads are reused without adding a card/stage or mutation prerequisite. */
+export type NotificationCacheRead = <T>(read: (tx: Prisma.TransactionClient) => Promise<T>) => Promise<T>;
 export async function deployedNotificationSourceReadBindings(reader: Pick<JobberReader, "query">,
-  options: Readonly<{ fetch?: typeof fetch }> = {}): Promise<NotificationSourceIO> {
+  options: Readonly<{ fetch?: typeof fetch; cacheRead?: NotificationCacheRead }> = {}): Promise<NotificationSourceIO> {
   const prismaModule = await import("./prisma");
   // The deployed tsx/CJS bridge may expose these under default. Validate without a query.
   const prisma: typeof import("./prisma").prisma = (prismaModule as any).prisma ?? (prismaModule as any).default?.prisma;
@@ -359,13 +509,14 @@ export async function deployedNotificationSourceReadBindings(reader: Pick<Jobber
       typeof GhlReadonlyReader !== "function" || typeof readAllContacts !== "function" || typeof reader?.query !== "function")
     throw new Error("Notification read-only deployed module binding unavailable");
   const locationId = process.env.GHL_LOCATION_ID, apiKey = process.env.GHL_API_KEY, fetcher = options.fetch;
+  const cacheRead: NotificationCacheRead = options.cacheRead ?? (read => read(prisma));
   return Object.freeze({
     locationId: () => process.env.GHL_LOCATION_ID,
-    customers: () => prisma.customer.findMany({ select: { jobberClientId: true, email: true, phone: true } }),
-    storedInvoices: (ownerId: string) => prisma.invoiceRecord.findMany({ where: { customer: { jobberClientId: ownerId } }, select: { jobberInvoiceId: true } }),
-    quarantineCounts: async (ids: string[]) => (await prisma.customer.findMany({
+    customers: () => cacheRead(tx => tx.customer.findMany({ select: { jobberClientId: true, email: true, phone: true } })),
+    storedInvoices: (ownerId: string) => cacheRead(tx => tx.invoiceRecord.findMany({ where: { customer: { jobberClientId: ownerId } }, select: { jobberInvoiceId: true } })),
+    quarantineCounts: async (ids: string[]) => (await cacheRead(tx => tx.customer.findMany({
       where: { jobberClientId: { in: ids } }, select: { jobberClientId: true, _count: { select: { jobs: true, invoices: true } } },
-    })).map(c => ({ jobberClientId: c.jobberClientId, jobs: c._count.jobs, invoices: c._count.invoices })),
+    }))).map(c => ({ jobberClientId: c.jobberClientId, jobs: c._count.jobs, invoices: c._count.invoices })),
     contacts: async () => {
       if (process.env.GHL_LOCATION_ID !== locationId || process.env.GHL_API_KEY !== apiKey)
         throw new Error("Notification GHL read configuration changed");

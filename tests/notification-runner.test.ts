@@ -175,8 +175,8 @@ for (const kind of ["paid", "unknown category", "missing currency", "stale", "hi
     if (kind === "bad approval") f.data.badReview = true;
     if (kind === "extra invoice") f.data.extraInvoice = true;
     if (kind === "wrong owner") f.data.wrongOwner = true;
-    if (kind === "unknown category") { const p = f.deps.prepare; (f.deps as any).prepare = async (s: any) => {
-      const value = await p(s); return { ...value, event: { ...value.event, dayPastDue: 20, claimedFacts: ["recurring_late_fee_policy"] } };
+    if (kind === "unknown category") { const p = f.deps.prepare; (f.deps as any).prepare = async (s: any, handle: any) => {
+      const value = await p(s, handle); return { ...value, event: { ...value.event, dayPastDue: 20, claimedFacts: ["recurring_late_fee_policy"] } };
     }; }
     const out = await f.runner().runOne(); assert.equal(out.state, "held", JSON.stringify(out));
     assert.equal(f.db.rows.size, 0); assert.ok(f.db.operations.every(op => op === "history")); assert.equal(f.data.postCalls, 0);
