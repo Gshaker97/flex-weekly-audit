@@ -1,4 +1,5 @@
 /** Local integration candidate. No ambient credentials, environment enable switch or production callsite. */
+import { notificationModuleFunctions } from "./notification-module-interop";
 import { createHash } from "node:crypto";
 import { addInvoiceCalendarDays, invoiceCalendarDate } from "./invoice-reminder-clock";
 import { eventKey, immutableEvent, planNotification, type Event, type Evidence, type Proof } from "./notification-gate";
@@ -103,8 +104,8 @@ export function createNotificationRunner(options: Readonly<{
         const transport = createGhlOneAttemptTransport({ ...d.transport, mode: "reviewed-one-attempt", ledger, now });
         // The source module transitively initializes legacy production clients. Keep that
         // import out of the disabled/readiness path; no deployed source bindings are invoked.
-        const { readNotificationSource, refreshNotificationSource, inspectNotificationSource, inspectRecurringNotificationSource, composeNotificationEvidence } =
-          await import("./notification-source");
+        const { readNotificationSource, refreshNotificationSource, inspectNotificationSource, inspectRecurringNotificationSource, composeNotificationEvidence } = notificationModuleFunctions(await import("./notification-source"),
+          ["readNotificationSource", "refreshNotificationSource", "inspectNotificationSource", "inspectRecurringNotificationSource", "composeNotificationEvidence"]);
         phase = "initial_source";
         let handle: NotificationSourceHandle;
         if (d.recurringSource !== undefined) {

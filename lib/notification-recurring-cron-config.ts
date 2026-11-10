@@ -1,4 +1,5 @@
 /** Private deployment installation boundary. No route, command arguments or caller policy. */
+import { notificationModuleFunctions } from "./notification-module-interop";
 import { createHash } from "node:crypto";
 import type { RecurringDay10Policy } from "./notification-recurring-day10";
 
@@ -40,7 +41,8 @@ export async function loadInstalledRecurringDay10CronService(mode: "read-only" |
   // not supplied by a route/caller. No new file mount, volume or startup script.
   const input = validateRecurringDay10CronInstallation(original.FLEXX_RECURRING_DAY10_POLICY_JSON!, original, mode);
   assertUnchanged();
-  const { installRecurringDay10Policy, createRecurringDay10Service, deployedRecurringDay10Runtime } = await import("./notification-recurring-day10");
+  const { installRecurringDay10Policy, createRecurringDay10Service, deployedRecurringDay10Runtime } = notificationModuleFunctions(await import("./notification-recurring-day10"),
+    ["installRecurringDay10Policy", "createRecurringDay10Service", "deployedRecurringDay10Runtime"]);
   const policy = installRecurringDay10Policy(input);
   return createRecurringDay10Service({ mode, policy, runtime: async scope => {
     assertUnchanged();

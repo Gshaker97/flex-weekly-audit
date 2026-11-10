@@ -1,4 +1,5 @@
 /** Disabled service binding. No route, scheduler, environment enable switch or ambient clients. */
+import { notificationModuleFunctions } from "./notification-module-interop";
 import { createHash } from "node:crypto";
 import { ORIGINAL_DAY10_SMS_BODY } from "./notification-copy-policy";
 import { eventKey, immutableEvent, type Event } from "./notification-gate";
@@ -104,7 +105,8 @@ export function createRecurringDay10Service(options: Readonly<{
       const scope: RecurringNotificationReadScope = freeze({ version: 1, accountId: p.accountId, locationId: p.locationId,
         reviewRef: saved.sourceRef, expiresAt, identityCoveragePolicy: { accountId: p.accountId, reviewRef: saved.sourceRef,
           reviewedAt: new Date(began).toISOString(), expiresAt, quarantine: structuredClone(p.quarantine) } });
-      const { inspectRecurringReadScope } = await import("./notification-recurring-coordinator");
+      const { inspectRecurringReadScope } = notificationModuleFunctions(await import("./notification-recurring-coordinator"),
+        ["inspectRecurringReadScope"]);
       if (!bootstrap || inspectRecurringReadScope(scope).length || scope.accountId !== p.accountId || scope.locationId !== p.locationId)
         return freeze(result("held", ["matching_current_read_scope_and_runtime_required"]));
       const started = Date.now(), wall = performance.now(), deadline = Math.min(started + 300000, instant(scope.expiresAt), instant(p.validUntil));
@@ -144,8 +146,10 @@ export function createRecurringDay10Service(options: Readonly<{
           } else if (init?.method !== "GET") throw new Error("Unexpected service HTTP operation");
           return r.fetch(url, init);
         };
-        const { readNotificationInventory, inspectNotificationInventory, planNotificationInventory, readDiscoveredNotificationSource } = await import("./notification-inventory");
-        const { readNotificationSourceBatch, inspectNotificationSourceDestinations, inspectRecurringNotificationSource } = await import("./notification-source");
+        const { readNotificationInventory, inspectNotificationInventory, planNotificationInventory, readDiscoveredNotificationSource } = notificationModuleFunctions(await import("./notification-inventory"),
+          ["readNotificationInventory", "inspectNotificationInventory", "planNotificationInventory", "readDiscoveredNotificationSource"]);
+        const { readNotificationSourceBatch, inspectNotificationSourceDestinations, inspectRecurringNotificationSource } = notificationModuleFunctions(await import("./notification-source"),
+          ["readNotificationSourceBatch", "inspectNotificationSourceDestinations", "inspectRecurringNotificationSource"]);
         const inventory = await readNotificationInventory(scope, inventoryIO), scan = inspectNotificationInventory(inventory);
         output.invoices = scan.rows.map((_, i) => ({ ordinal: i + 1, result: null, holds: ["not_current_day10"] }));
         if (scan.coverage !== "complete-account-invoices") { output.state = "held"; output.reasons = [...scan.holds]; return; }
@@ -283,6 +287,7 @@ export async function deployedRecurringDay10Runtime(handle: InstalledRecurringDa
   const { policy } = owned(handle, mode);
   if (scope.accountId !== policy.accountId || scope.locationId !== policy.locationId ||
       JSON.stringify(scope.identityCoveragePolicy.quarantine) !== JSON.stringify(policy.quarantine)) throw new Error("Runtime policy scope mismatch");
-  const { bootstrapRecurringDay10Runtime } = await import("./notification-recurring-runtime");
+  const { bootstrapRecurringDay10Runtime } = notificationModuleFunctions(await import("./notification-recurring-runtime"),
+    ["bootstrapRecurringDay10Runtime"]);
   return bootstrapRecurringDay10Runtime({ ...structuredClone(scope), expiresAt: new Date(Math.min(instant(scope.expiresAt), instant(policy.validUntil))).toISOString() }, mode);
 }

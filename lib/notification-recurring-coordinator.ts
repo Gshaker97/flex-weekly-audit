@@ -1,4 +1,5 @@
 /** Explicit READ-ONLY orchestration. Import/default run never initializes application clients. */
+import { notificationModuleFunctions } from "./notification-module-interop";
 import type { ReviewedOmissionPolicy } from "./ghl-identity-coverage";
 import type { NotificationInventoryIO } from "./notification-inventory";
 import type { NotificationRecurringSourceIO } from "./notification-source";
@@ -140,11 +141,14 @@ export function createRecurringNotificationCoordinator(options: Readonly<{
           query: guard(r.sourceIO.query.bind(r.sourceIO)) };
         const historyIO: NotificationHistoryIO = { ...r.history, now: () => new Date(Date.now()),
           get: guard(r.history.get.bind(r.history)), select: guard(r.history.select.bind(r.history)) };
-        const { readNotificationInventory, inspectNotificationInventory, planNotificationInventory, readDiscoveredNotificationSource } =
-          await import("./notification-inventory");
-        const { readNotificationSourceBatch, inspectNotificationSource, inspectNotificationSourceDestinations } = await import("./notification-source");
-        const { createGhlReadOnlyReader } = await import("./notification-ghl-contract");
-        const { readNotificationHistory, inspectNotificationHistory } = await import("./notification-history");
+        const { readNotificationInventory, inspectNotificationInventory, planNotificationInventory, readDiscoveredNotificationSource } = notificationModuleFunctions(await import("./notification-inventory"),
+          ["readNotificationInventory", "inspectNotificationInventory", "planNotificationInventory", "readDiscoveredNotificationSource"]);
+        const { readNotificationSourceBatch, inspectNotificationSource, inspectNotificationSourceDestinations } = notificationModuleFunctions(await import("./notification-source"),
+          ["readNotificationSourceBatch", "inspectNotificationSource", "inspectNotificationSourceDestinations"]);
+        const { createGhlReadOnlyReader } = notificationModuleFunctions(await import("./notification-ghl-contract"),
+          ["createGhlReadOnlyReader"]);
+        const { readNotificationHistory, inspectNotificationHistory } = notificationModuleFunctions(await import("./notification-history"),
+          ["readNotificationHistory", "inspectNotificationHistory"]);
         const contact = createGhlReadOnlyReader({ ...r.contact, fetch: guard(r.contact.fetch), now: () => new Date(Date.now()) });
         verify(); const inventory = await readNotificationInventory(scope, inventoryIO), scan = inspectNotificationInventory(inventory);
         result.inventory = { coverage: scan.coverage === "complete-account-invoices" ? "exhausted-query-result" : "partial-held",

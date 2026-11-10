@@ -1,4 +1,5 @@
 /** Explicit deployment bootstrap. Import is inert; invoking bootstrap performs authorized reads. */
+import { notificationModuleFunctions } from "./notification-module-interop";
 import type { Day10PilotRuntime } from "./notification-day10-pilot";
 import type { NotificationLedgerDatabase } from "./notification-ledger";
 
@@ -33,8 +34,10 @@ export async function bootstrapDay10PilotRuntime(scope: Readonly<{
   const prismaModule = await import("./prisma");
   const prisma: typeof import("./prisma").prisma = (prismaModule as any).prisma ?? (prismaModule as any).default?.prisma;
   if (typeof prisma?.$transaction !== "function") throw new Error("existing_database_binding_unavailable");
-  const { Budget, JobberReader, requireTokenRunCoverage } = await import("../scripts/source-audit/transport");
-  const { deployedNotificationSourceReadBindings } = await import("./notification-source");
+  const { Budget, JobberReader, requireTokenRunCoverage } = notificationModuleFunctions(await import("../scripts/source-audit/transport"),
+    ["Budget", "JobberReader", "requireTokenRunCoverage"]);
+  const { deployedNotificationSourceReadBindings } = notificationModuleFunctions(await import("./notification-source"),
+    ["deployedNotificationSourceReadBindings"]);
   const auth = await prisma.$transaction(async tx => {
     await tx.$executeRawUnsafe("SET TRANSACTION READ ONLY");
     await tx.$executeRawUnsafe("SET LOCAL statement_timeout = '10000ms'");

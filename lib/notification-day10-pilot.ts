@@ -1,4 +1,5 @@
 /** Explicit one-invoice pilot composition. Import/readiness/default execution are inert. */
+import { notificationModuleFunctions } from "./notification-module-interop";
 import { createHash } from "node:crypto";
 import { ORIGINAL_DAY10_SMS_BODY } from "./notification-copy-policy";
 import { addInvoiceCalendarDays, invoiceCalendarDate } from "./invoice-reminder-clock";
@@ -254,7 +255,8 @@ export async function deployedDay10PilotRuntime(handle: ReviewedDay10Pilot, acti
   const saved = configHandles.get(handle);
   if (!saved || Date.now() >= instant(saved.config.expiresAt) || (action === "one-attempt" && saved.review.action !== "one-attempt"))
     throw new Error("current_reviewed_config_and_action_required");
-  const { bootstrapDay10PilotRuntime } = await import("./notification-day10-runtime");
+  const { bootstrapDay10PilotRuntime } = notificationModuleFunctions(await import("./notification-day10-runtime"),
+    ["bootstrapDay10PilotRuntime"]);
   return bootstrapDay10PilotRuntime({ accountId: saved.config.source.identityCoveragePolicy.accountId,
     locationId: saved.config.source.scope.locationId, action, expiresAt: saved.config.expiresAt });
 }

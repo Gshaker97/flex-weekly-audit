@@ -1,4 +1,5 @@
 /** Inert deployment bindings. Read-only inspection and explicitly installed Day10 service remain separate. */
+import { notificationModuleFunctions } from "./notification-module-interop";
 import type { RecurringNotificationReadRuntime, RecurringNotificationReadScope } from "./notification-recurring-coordinator";
 import type { RecurringDay10Runtime } from "./notification-recurring-day10";
 import type { NotificationLedgerDatabase } from "./notification-ledger";
@@ -42,8 +43,10 @@ async function bootstrapRecurringRuntime(scope: RecurringNotificationReadScope, 
   // Register immediately after acquisition, before auth reads or any later failing guard.
   // The standalone owner retains this cleanup even when no complete runtime is returned.
   lifecycle.registerCleanup?.(() => prisma.$disconnect());
-  const { Budget, JobberReader, requireTokenRunCoverage } = await import("../scripts/source-audit/transport");
-  const { deployedNotificationInventoryReadBindings } = await import("./notification-inventory");
+  const { Budget, JobberReader, requireTokenRunCoverage } = notificationModuleFunctions(await import("../scripts/source-audit/transport"),
+    ["Budget", "JobberReader", "requireTokenRunCoverage"]);
+  const { deployedNotificationInventoryReadBindings } = notificationModuleFunctions(await import("./notification-inventory"),
+    ["deployedNotificationInventoryReadBindings"]);
   const auth = await prisma.$transaction(async tx => {
     await tx.$executeRawUnsafe("SET TRANSACTION READ ONLY");
     await tx.$executeRawUnsafe("SET LOCAL statement_timeout = '10000ms'");
@@ -57,7 +60,8 @@ async function bootstrapRecurringRuntime(scope: RecurringNotificationReadScope, 
     if (init?.method !== "GET" || init.redirect !== "error") throw new Error("recurring_read_only_http_required");
     return fetch(input, init);
   };
-  const { assertReadOnlyRequest } = await import("../scripts/ghl-preview/transport");
+  const { assertReadOnlyRequest } = notificationModuleFunctions(await import("../scripts/ghl-preview/transport"),
+    ["assertReadOnlyRequest"]);
   const sourceFetch: typeof fetch = (input, init) => {
     verify();
     const url = new URL(String(input)), method = init?.method ?? "";

@@ -1,4 +1,5 @@
 /** Standalone sync hook. Import and the disabled branch never load policy or clients. */
+import { notificationModuleFunctions } from "./notification-module-interop";
 import type { SyncEntrypoint } from "./sync-writer-control";
 import type { RecurringDay10Result } from "./notification-recurring-day10";
 import { log, logError } from "./log";
@@ -68,7 +69,8 @@ export function createRecurringDay10CronHook(deps: Dependencies) {
 
 export const runConfiguredRecurringDay10 = createRecurringDay10CronHook({
   mode: () => process.env.FLEXX_RECURRING_DAY10_MODE,
-  load: async mode => (await import("./notification-recurring-cron-config")).loadInstalledRecurringDay10CronService(mode),
+  load: async mode => notificationModuleFunctions(await import("./notification-recurring-cron-config"),
+    ["loadInstalledRecurringDay10CronService"]).loadInstalledRecurringDay10CronService(mode),
   report: result => {
     const write = recurringDay10SyncIssue(result) === null ? log : logError;
     write(`[sync] recurringDay10: state=${result.state} code=${result.code} invoices=${result.invoices} ` +

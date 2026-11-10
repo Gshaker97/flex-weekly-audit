@@ -1,4 +1,5 @@
 /** Default/local readiness is inert. Explicit read-only mode is an operator action, never cron activation. */
+import { notificationModuleFunctions } from "../lib/notification-module-interop";
 import { constants } from "node:fs";
 import { open } from "node:fs/promises";
 import { createHash } from "node:crypto";
@@ -30,7 +31,8 @@ async function main() {
     }
     // The separately supplied hash/ref pin reviewed bytes; they do not authenticate the operator
     // or grant permission. Never expose this as an arbitrary user-request endpoint.
-    const { bootstrapRecurringNotificationReadRuntime } = await import("../lib/notification-recurring-runtime");
+    const { bootstrapRecurringNotificationReadRuntime } = notificationModuleFunctions(await import("../lib/notification-recurring-runtime"),
+      ["bootstrapRecurringNotificationReadRuntime"]);
     let acquiring: Promise<RecurringNotificationReadRuntime> | undefined, cleanup: (() => Promise<void>) | undefined;
     try {
       const result = await createRecurringNotificationCoordinator({ mode: "read-only", scope,
