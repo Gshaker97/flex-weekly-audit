@@ -460,3 +460,20 @@ export async function getOutboundSms(contactId: string): Promise<GhlOutboundSms[
   out.sort((a, b) => b.dateAdded.getTime() - a.dateAdded.getTime());
   return out;
 }
+
+
+/** Exactly one attempt. A 200 succeeded acknowledgment is NOT terminal proof. */
+export async function removeContactFromWorkflowOnce(contactId: string, workflowId: string): Promise<{ httpStatus: 200; succeeded: true }> {
+  if (![contactId,workflowId].every(id => typeof id === "string" && /^[A-Za-z0-9_-]{1,512}$/.test(id)))
+    throw new Error("Invalid exact workflow removal target");
+  const controller = new AbortController(), timer = setTimeout(() => controller.abort(), GHL_FETCH_TIMEOUT_MS);
+  try {
+    const response = await fetch(`${GHL_API_URL}/contacts/${encodeURIComponent(contactId)}/workflow/${encodeURIComponent(workflowId)}`, {
+      method: "DELETE", headers: {...ghlHeaders(),Version:"v3"}, body:"{}", signal:controller.signal, redirect:"error",
+    });
+    if (response.status !== 200) throw new Error("Workflow removal outcome requires review");
+    const result = await response.json();
+    if (result?.succeeded !== true) throw new Error("Workflow removal acknowledgment is unverified");
+    return {httpStatus:200,succeeded:true};
+  } finally { clearTimeout(timer); }
+}

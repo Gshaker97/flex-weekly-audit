@@ -1,6 +1,8 @@
+import { createHash } from "node:crypto";
+import { readConfiguredStandingIdentityPolicy } from "../lib/ghl-standing-identity";
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readReviewedIdentityCoverage, coveragePermitsOmissions, coveragePermitsExactInvoice, type ReviewedOmissionPolicy } from "../lib/ghl-identity-coverage";
+import { readReviewedIdentityCoverage, coveragePermitsOmissions, coveragePermitsExactInvoice, type ReviewedOmissionPolicy, type StandingOmissionPolicy, standingOmissionScopeHash, omissionAuthorizationExpiry } from "../lib/ghl-identity-coverage";
 import { verifyFreshGhlIdentity } from "../lib/ghl-write-identity";
 function fixture() {
   const owner={jobberClientId:"owner",email:"owner@example.test",phone:"+16025550100"};
@@ -96,4 +98,33 @@ test("explicit scopes paginate independently; repeated cursors and account drift
     if(kind==="ok")await readReviewedIdentityCoverage(f.policy,f.customers,f.scope,f.counts,q);
     else await assert.rejects(readReviewedIdentityCoverage(f.policy,f.customers,f.scope,f.counts,q));
   }
+});
+
+function standing(f:ReturnType<typeof fixture>):StandingOmissionPolicy {
+ const p:StandingOmissionPolicy={kind:"explicit_standing",approvalId:"synthetic-explicit-grant",approvalRef:"synthetic-user-approval-reference",approvedAt:"2025-01-01T00:00:00Z",validity:"until_revoked",accountId:f.policy.accountId,quarantine:f.policy.quarantine,scopeSha256:""};
+ p.scopeSha256=standingOmissionScopeHash(p);return p;
+}
+test("separate standing authorization keeps original approval date but still mints only five-minute evidence",async()=>{
+ const f=fixture(),p=standing(f),real=Date.now;let at=real();Date.now=()=>at;
+ try {const original=JSON.stringify(p);const r=await readReviewedIdentityCoverage(p,f.customers,f.scope,f.counts,f.query);
+ assert.equal(JSON.stringify(p),original);assert.equal(coveragePermitsExactInvoice(r.evidence,f.customers,r.identities,f.scope),true);
+ at+=300000;assert.equal(coveragePermitsExactInvoice(r.evidence,f.customers,r.identities,f.scope),false);assert.equal(JSON.stringify(p),original);
+ }finally{Date.now=real;}
+});
+for(const kind of ["missing-ref","missing-approval","wrong-scope-hash","new-account","new-omission","reappeared-owner","linked-record","overlap"]){test(`standing scope preserves ${kind} hold`,async()=>{
+ const f=fixture(),p=standing(f);if(kind==="missing-ref")p.approvalRef="";if(kind==="missing-approval")p.approvalId="";if(kind==="wrong-scope-hash")p.scopeSha256="0".repeat(64);if(kind==="new-account")p.accountId="other";
+ if(kind==="new-omission")f.customers.push({jobberClientId:"new",email:null,phone:null} as any);
+ if(kind==="overlap"){f.missing[0].email=f.owner.email;p.scopeSha256=standingOmissionScopeHash(p);}
+ const query:any=async(q:string,v:any)=>{const d=await f.query(q,v);return kind==="reappeared-owner" && q.includes("VerifyQuarantinedIdentity")?{...d,client:{id:v.id}}:d;};
+ const counts=async()=>{const rows=await f.counts();if(kind==="linked-record")rows[0].jobs=1;return rows;};
+ if(kind==="overlap"){const r=await readReviewedIdentityCoverage(p,f.customers,f.scope,counts,query);assert.match(verifyFreshGhlIdentity(f.owner,f.customers,[f.contact],"contact",r.identities,r.evidence)!,/another Jobber customer/);}
+ else await assert.rejects(readReviewedIdentityCoverage(p,f.customers,f.scope,counts,query));
+});}
+test("standing loader requires separately pinned exact authorization; absent/revoked stays disabled",()=>{
+ const p=standing(fixture()),raw=JSON.stringify(p),env={GHL_STANDING_IDENTITY_ENABLED:"true",GHL_STANDING_IDENTITY_APPROVAL_ID:p.approvalId,GHL_STANDING_IDENTITY_POLICY:raw,GHL_STANDING_IDENTITY_POLICY_SHA256:createHash("sha256").update(raw).digest("hex")};
+ assert.deepEqual(readConfiguredStandingIdentityPolicy(env),p);assert.equal(readConfiguredStandingIdentityPolicy({}),undefined);
+ assert.equal(readConfiguredStandingIdentityPolicy({...env,GHL_STANDING_IDENTITY_ENABLED:"false"}),undefined);
+ assert.throws(()=>readConfiguredStandingIdentityPolicy({...env,GHL_STANDING_IDENTITY_APPROVAL_ID:"other"}));
+ assert.throws(()=>readConfiguredStandingIdentityPolicy({...env,GHL_STANDING_IDENTITY_POLICY:raw+" "}));
+ const temporary=fixture().policy;temporary.expiresAt=new Date(Date.now()+2*86400000).toISOString();assert.throws(()=>omissionAuthorizationExpiry(temporary));
 });

@@ -91,15 +91,13 @@ test("contact snapshot requires completeness; opportunity requires single open c
     mock([contact], rows); assert.equal(await findSinglePhoneOpportunity(contact.id, "pipeline"), null);
   }
 });
-test("sync phone-only overdue updates one existing card, never Paid/create/delete", async () => {
+test("sync phone-only overdue stays held while recurring date integration is disabled", async () => {
   database(); mock(); await syncGhlInvoicePipeline();
-  assert.equal(writes.length, 1);
-  assert.equal(writes[0].method, "PUT"); assert.equal(writes[0].body.pipelineStageId, "overdue");
-  assert.equal(writes[0].body.monetaryValue, 100);
+  assert.equal(writes.length, 0);
 });
-test("awaiting with elapsed due date stays Overdue through cleanup", async () => {
+test("awaiting with elapsed due date stays held without reviewed date-before-stage activation", async () => {
   database([customer], "awaiting_payment"); mock(); await syncGhlInvoicePipeline();
-  assert.deepEqual(writes.map(w => w.body.pipelineStageId), ["overdue"]);
+  assert.deepEqual(writes, []);
 });
 test("unknown or failed phone preflight aborts before any writes", async () => {
   for (const phone of ["5550100", "+16025550199"]) {
@@ -215,9 +213,9 @@ test("email/phone ownership conflict blocks both paths before writes", async () 
   database([customer, { id: "local-b", jobberClientId: "jobber-b", email: "owner@example.test", phone: null }]);
   mock([{ ...contact, email: "owner@example.test" }]); await syncGhlInvoicePipeline(); assert.equal(writes.length, 0);
 });
-test("email-only baseline still updates its existing card", async () => {
-  database([{ ...customer, email: "owner@example.test", phone: null }]); mock([{ ...contact, email: "owner@example.test" }]);
-  await syncGhlInvoicePipeline(); assert.equal(writes[0].body.pipelineStageId, "overdue");
+test("email-only baseline still exits its paid existing card", async () => {
+  database([{ ...customer, email: "owner@example.test", phone: null }], "paid"); mock([{ ...contact, email: "owner@example.test" }]);
+  await syncGhlInvoicePipeline(); assert.equal(writes[0].body.pipelineStageId, "paid");
 });
 test("phone write failure does not fall through to Paid", async () => {
   database(); mock(); const fetch = globalThis.fetch;
@@ -228,16 +226,16 @@ test("phone write failure does not fall through to Paid", async () => {
 });
 test("archived unsupported phone without relevant invoices does not gate email sync", async () => {
   const emailCustomer = { ...customer, id: "email-id", jobberClientId: "email-owner", email: "owner@example.test", phone: null };
-  database([emailCustomer]); const findInvoices = prisma.invoiceRecord.findMany;
+  database([emailCustomer], "paid"); const findInvoices = prisma.invoiceRecord.findMany;
   (prisma.customer as any).findMany = async () => [emailCustomer, { ...customer, phone: "5550199" }];
   (prisma.invoiceRecord as any).findMany = async (args: any) => args.where?.customerId ? [] : findInvoices(args);
   mock([{ ...contact, email: "owner@example.test" }]); await syncGhlInvoicePipeline();
-  assert.equal(writes[0].body.pipelineStageId, "overdue");
+  assert.equal(writes[0].body.pipelineStageId, "paid");
 });
 test("exact no-match does not gate unrelated email sync", async () => {
-  database([customer, { ...customer, id: "email-id", jobberClientId: "email-owner", email: "owner@example.test", phone: null }]);
+  database([customer, { ...customer, id: "email-id", jobberClientId: "email-owner", email: "owner@example.test", phone: null }], "paid");
   mock([{ ...contact, phone: "+16025550199", email: "owner@example.test" }]);
-  await syncGhlInvoicePipeline(); assert.equal(writes[0].body.pipelineStageId, "overdue");
+  await syncGhlInvoicePipeline(); assert.equal(writes[0].body.pipelineStageId, "paid");
 });
 test("phone payment exit uses explicit fresh paid evidence", async () => {
   database([customer], "paid"); mock([contact], [{ ...opportunity, pipelineStageId: "overdue" }]);
@@ -259,16 +257,15 @@ test("payment predicate rejects empty, omitted, partial, unknown, old, zero and 
   ]) assert.equal(decide([paidEvidence(), { ...paidEvidence(), id: "other", ...patch }], ["jobber-inv-0", "other"]), null);
 });
 test("paid after previously aggregated phone overdue exits once with same exact owner", async () => {
-  database(); mock(); await syncGhlInvoicePipeline(); assert.equal(writes[0].body.pipelineStageId, "overdue");
-  const aggregate = { ...opportunity, pipelineStageId: "overdue", name: writes[0].body.name };
+  const aggregate = { ...opportunity, pipelineStageId: "overdue", name: "Synthetic — 2 overdue invoices" };
   database([customer], "paid"); mock([contact], [aggregate]); await syncGhlInvoicePipeline();
   assert.deepEqual(writes.map(w => w.body.pipelineStageId), ["paid"]);
 });
-test("remaining future invoice moves aggregate Overdue to Sent, not Paid", async () => {
+test("remaining future invoice leaves existing Overdue cycle held for execution review", async () => {
   database([customer], "paid");
   sourceEvidence.push({ ...paidEvidence(), id: "future", invoiceStatus: "awaiting_payment", amounts: { total: 200, invoiceBalance: 50 }, dueDate: "2099-01-01" });
   mock([contact], [{ ...opportunity, pipelineStageId: "overdue", name: "Synthetic — 1 overdue invoice" }]);
-  await syncGhlInvoicePipeline(); assert.deepEqual(writes.map(w => w.body.pipelineStageId), ["sent"]);
+  await syncGhlInvoicePipeline(); assert.deepEqual(writes, []);
 });
 test("fresh outstanding or unknown debt prevents cached paid exit", async () => {
   for (const patch of [{ invoiceStatus: "past_due", amounts: { total: 100, invoiceBalance: 5 } }, { invoiceStatus: "unknown" }, { invoiceStatus: "void" }, { issuedDate: "2025-01-01", invoiceStatus: "past_due" }]) {
@@ -332,13 +329,13 @@ test("possible seven-digit shared owner is held before email contact creation", 
   database([customer, { ...customer, id: "email-id", jobberClientId: "email-owner", email: "different@example.test", phone: "5550100" }]);
   mock(); await syncGhlInvoicePipeline(); assert.equal(writes.length, 0);
 });
-test("same unique open Paid card re-enters only with fresh positive source debt", async () => {
+test("Paid to Overdue reentry is held; existing non-enrollment Sent path remains unchanged", async () => {
   for (const [status, due, target] of [["past_due", "2026-06-01", "overdue"], ["awaiting_payment", "2099-01-01", "sent"]]) {
     database([customer], "paid"); sourceEvidence.push({ ...paidEvidence(), id: "new-work", invoiceStatus: status,
       dueDate: due, amounts: { total: 150, invoiceBalance: 75 } });
     mock([contact], [{ ...opportunity, pipelineStageId: "paid" }]); await syncGhlInvoicePipeline();
-    assert.deepEqual(writes.map(w => w.body.pipelineStageId), [target]);
-    assert.equal(writes[0].body.monetaryValue, 75);
+    assert.deepEqual(writes.map(w => w.body.pipelineStageId), target === "overdue" ? [] : [target]);
+    if (target === "sent") assert.equal(writes[0].body.monetaryValue, 75);
   }
 });
 test("stale cached debt cannot reopen Paid, nor can closed or special-stage cards", async () => {

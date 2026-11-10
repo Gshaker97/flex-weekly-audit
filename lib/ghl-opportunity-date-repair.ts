@@ -32,7 +32,7 @@ export function readDueDateField(metadata: unknown, card: GhlOpportunity, locati
     currentValueKnown: true, currentValue: value ? value.fieldValue : null };
 }
 
-function cardScopeMatches(s: DateRepairSnapshot): boolean {
+export function cardScopeMatches(s: DateRepairSnapshot): boolean {
   const c = s.currentCard, b = s.binding;
   if (c.customFields !== undefined && !Array.isArray(c.customFields)) return false;
   const field = (c.customFields ?? []).filter(v => v.id === s.field.id);
@@ -41,7 +41,7 @@ function cardScopeMatches(s: DateRepairSnapshot): boolean {
     && c.status === s.card.status && moneyCents(c.monetaryValue) === s.card.amountCents
     && (field.length === 1 ? field[0].fieldValue === s.field.currentValue : field.length === 0 && s.field.currentValue === null);
 }
-function journalIntent(s: DateRepairSnapshot, approvalId: string): GhlWriteIntent | null {
+export function dateJournalIntent(s: DateRepairSnapshot, approvalId: string): GhlWriteIntent | null {
   const plan = planOpportunityDueDate(s);
   if (plan.state !== "repair_candidate" || !plan.intent || !cardScopeMatches(s)) return null;
   const i = plan.intent;
@@ -96,7 +96,7 @@ export async function repairOpportunityDueDate(input: {
     if (plan.state !== "repair_candidate" || !plan.intent) return hold(`date_plan_${plan.state}`);
     if (!approvedGhlCards(env).has(plan.intent.opportunityId)) return hold("outside_approved_card_cohort");
     if (sha(plan.intent) !== a.intentSha256) return hold("approved_intent_changed");
-    const intent = journalIntent(first, a.approvalId);
+    const intent = dateJournalIntent(first, a.approvalId);
     if (!intent) return hold("fresh_card_scope_unverified");
     started = true;
     const writeId = await input.writer.prepare(intent);

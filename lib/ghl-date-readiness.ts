@@ -1,7 +1,7 @@
 /** Trusted read-only adapter for exact opportunity date preparation.
  * No provider mutation, sync invocation, workflow edit or identity bypass.
  */
-import { coveragePermitsExactInvoice, readReviewedIdentityCoverage, type ReviewedOmissionPolicy } from "./ghl-identity-coverage";
+import { coveragePermitsExactInvoice, readReviewedIdentityCoverage, type IdentityOmissionPolicy } from "./ghl-identity-coverage";
 import { createHash } from "node:crypto";
 import { prisma } from "./prisma";
 import { jobberGraphQL } from "./jobber";
@@ -75,7 +75,26 @@ export type DateReadinessScope = { locationId: string; opportunityId: string; co
  * account coverage and exact source reads; no request/env toggle sets approval.
  * Direct user-confirmed bindings still need a separately reviewed adapter.
  */
-export async function readVerifiedDateRepairSnapshot(scope: DateReadinessScope, deps = live, now = () => new Date(), coveragePolicy?: ReviewedOmissionPolicy): Promise<DateRepairSnapshot> {
+// Non-serializable proof keeps the original branded token and its deadline.
+// Cloning must explicitly preserve this validator; it never remints evidence.
+const snapshotCoverage = new WeakMap<DateRepairSnapshot, () => void>();
+export function assertSnapshotIdentityCoverage(snapshot: DateRepairSnapshot): void {
+  snapshotCoverage.get(snapshot)?.();
+}
+export function assertSnapshotWriteFreshness(snapshot: DateRepairSnapshot, now: Date): void {
+  assertSnapshotIdentityCoverage(snapshot);
+  const at=now.getTime();
+  if (!Number.isFinite(at) || [snapshot.source.observedAt,snapshot.card.observedAt].some(value=>{
+    const observed=Date.parse(value);
+    return !Number.isFinite(observed) || observed>at || at-observed>15*60_000;
+  })) throw new Error("Source/card evidence expired before mutation");
+}
+export function cloneVerifiedSnapshot(snapshot: DateRepairSnapshot): DateRepairSnapshot {
+  const copy = structuredClone(snapshot), check = snapshotCoverage.get(snapshot);
+  if (check) snapshotCoverage.set(copy, check);
+  return copy;
+}
+async function readVerifiedInvoiceSnapshot(scope: DateReadinessScope, deps = live, now = () => new Date(), coveragePolicy?: IdentityOmissionPolicy, authorizationCurrent?: () => boolean): Promise<DateRepairSnapshot> {
   scope = structuredClone(scope);
   coveragePolicy = coveragePolicy === undefined ? undefined : structuredClone(coveragePolicy);
   if (!scope || !Object.values(scope).every(safeId) || Object.keys(scope).length !== 5
@@ -125,10 +144,28 @@ export async function readVerifiedDateRepairSnapshot(scope: DateReadinessScope, 
       amountCents, observedAt: begun },
     stageIds: { sent: refs.stageIdByName["invoice sent"], overdue: refs.stageIdByName["invoice overdue"] }, field, currentCard,
   };
+  if (covered) {
+    const evidence = covered.evidence;
+    const frozenCustomers = structuredClone(customers), frozenIdentities = structuredClone(identities);
+    snapshotCoverage.set(snapshot, () => {
+      if (authorizationCurrent && !authorizationCurrent())
+        throw new Error("Reviewed identity authorization changed before mutation");
+      if (!coveragePermitsExactInvoice(evidence, frozenCustomers, frozenIdentities, scope))
+        throw new Error("Reviewed identity coverage expired or changed before mutation");
+    });
+    assertSnapshotIdentityCoverage(snapshot);
+  }
+  return snapshot;
+}
+export async function readVerifiedDateRepairSnapshot(scope: DateReadinessScope, deps = live, now = () => new Date(), coveragePolicy?: IdentityOmissionPolicy, authorizationCurrent?: () => boolean): Promise<DateRepairSnapshot> {
+  const snapshot = await readVerifiedInvoiceSnapshot(scope, deps, now, coveragePolicy, authorizationCurrent);
   const plan = planOpportunityDueDate(snapshot);
   if (plan.state === "held") throw new Error(`Exact date preparation held: ${plan.reasons.join("; ")}`);
   return snapshot;
 }
+/** Same strict identity/source/card reader; reset eligibility is validated by
+ * the journal-owned reset operation, never by bypassing identity coverage. */
+export const readVerifiedCycleResetSnapshot = readVerifiedInvoiceSnapshot;
 
 export async function verifyCurrentWorkflowPauses(locationId: string, expected: WorkflowPauseExpectation[]): Promise<boolean> {
   if (locationId !== process.env.GHL_LOCATION_ID) return false;

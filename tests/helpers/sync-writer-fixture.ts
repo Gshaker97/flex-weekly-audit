@@ -10,6 +10,7 @@ export function writerFixture(initial = true) {
   const matches = (row: any, where: any = {}) => Object.entries(where).every(([key, value]) =>
     value && typeof value === "object" && "in" in value ? (value.in as unknown[]).includes(row[key]) : row[key] === value);
   const model = {
+    findMany: async () => structuredClone(rows.filter(row => row.errorMessage?.startsWith("FLEX_GHL_WRITE_JOURNAL_V1:"))),
     findFirst: async ({ where }: any) => rows.find(row => matches(row, where)) ?? null,
     findUniqueOrThrow: async ({ where }: any) => { const row = rows.find(row => matches(row, where)); if (!row) throw new Error("Synthetic missing run"); return structuredClone(row); },
     create: async ({ data }: any) => { const row = { id: `run-${++serial}`, status: "running", errorMessage: null, startedAt: new Date(), completedAt: null, ...data }; rows.push(row); return structuredClone(row); },

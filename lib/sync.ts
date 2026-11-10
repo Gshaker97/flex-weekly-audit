@@ -1,9 +1,16 @@
+import { cancelPaidOwnedInvoiceCycle } from "./ghl-paid-cycle-cancellation";
+import { syncExistingOverdueBootstrap } from "./ghl-bootstrap-operation";
+import { readPrePaidDateWitness, readPaidDateReadback } from "./ghl-paid-date-witness";
+import { readConfiguredStandingIdentityPolicy, readStandingIdentityInventory } from "./ghl-standing-identity";
+import { inspectReviewedIdentityInventory, reviewedIdentityOwnerEvidence } from "./ghl-identity-coverage";
 import { prisma } from "./prisma";
-import { admitSyncRun, SyncEntrypoint, SyncRunWriter, SyncWriterBlockedError } from "./sync-writer-control";
+import { latestCycleOwner, admitSyncRun, SyncEntrypoint, SyncRunWriter, SyncWriterBlockedError } from "./sync-writer-control";
 import { buildGhlWriteIntent, approvedGhlCards } from "./ghl-write-intent";
 import { verifyFreshGhlIdentity, readFreshJobberIdentities, strictGhlIdentityHold, validGhlContactIdentity } from "./ghl-write-identity";
 import { refreshOpenInvoiceStatuses } from "./open-invoice-status-refresh";
 import { runConfiguredPaidCycle } from "./ghl-paid-cycle";
+import { resetJournalOwnedInvoiceCycle } from "./ghl-cycle-reset";
+import { syncRecurringDueDateBeforeStage } from "./ghl-recurring-due-date";
 import { runConfiguredDateRepair } from "./ghl-date-repair-operation";
 import { runConfiguredRecurringDay10, recurringDay10SyncIssue } from "./notification-recurring-cron";
 import {
@@ -648,7 +655,7 @@ export interface GhlInvoiceReview {
 export async function syncGhlInvoicePipeline(opts: {
   mode?: GhlInvoiceWriteMode;
   report?: (entry: GhlInvoiceReview) => void;
-  writer?: Pick<SyncRunWriter, "prepare" | "assertPending" | "confirm" | "block">;
+  writer?: Pick<SyncRunWriter, "prepare" | "assertPending" | "confirm" | "block"> & Partial<Pick<SyncRunWriter, "readCycleHistory">>;
 } = {}): Promise<number> {
   const mode = opts.mode ?? process.env.GHL_INVOICE_WRITE_MODE ?? "paid_only";
   if (!["review", "paid_only", "sync"].includes(mode)) throw new Error("Invalid GHL_INVOICE_WRITE_MODE");
@@ -688,6 +695,8 @@ export async function syncGhlInvoicePipeline(opts: {
   const processedCustomers = new Set<string>();
   let source: ReturnType<typeof readPhoneInvoiceEvidence> | undefined;
   let freshIdentities: ReturnType<typeof readFreshJobberIdentities> | undefined;
+  let standingInventory: ReturnType<typeof readStandingIdentityInventory> | undefined;
+  let standingInventoryPolicy: string | undefined;
   let sourceObservedAt: string | undefined;
   let applied = 0;
   let writesHalted = false;
@@ -765,7 +774,13 @@ export async function syncGhlInvoicePipeline(opts: {
       const label = ownInvoices[0]?.clientName ?? customer.companyName ?? customer.name ?? customer.jobberClientId;
       const to = { stageId, monetaryValue: plan.total,
         ...(paid ? {} : { name: `${label} — ${plan.count} ${plan.stage === GHL_STAGE_OVERDUE ? "overdue" : "unpaid"} invoice${plan.count === 1 ? "" : "s"}` }) };
-      if (card.pipelineStageId === stageId && (paid || (card.monetaryValue === to.monetaryValue && card.name === to.name))) {
+      const cancellationCandidate = !paid && card.pipelineStageId!==paidId && process.env.GHL_DIRECT_WORKFLOW_REMOVAL_ENABLED==="true"
+        && process.env.GHL_CYCLE_OWNERSHIP_ENABLED==="true" && process.env.GHL_RECURRING_DUE_DATE_ENABLED==="true";
+      const bootstrapOverdue = !paid && card.pipelineStageId === overdueId && process.env.GHL_EXISTING_OVERDUE_BOOTSTRAP_ENABLED === "true";
+      if (!paid && card.pipelineStageId === overdueId && !cancellationCandidate && !bootstrapOverdue) {
+        report({ ...context, to, action: "hold", reason: "Existing Overdue cycle requires execution review; no re-enrollment or clock restart" }); return;
+      }
+      if (!cancellationCandidate && !bootstrapOverdue && card.pipelineStageId === stageId && (paid || (card.monetaryValue === to.monetaryValue && card.name === to.name))) {
         report({ ...context, to, action: "unchanged", reason: "Already matches verified source" }); return;
       }
       const blocked = writesHalted ? "Earlier GHL write outcome unconfirmed; remaining writes halted" :
@@ -776,32 +791,162 @@ export async function syncGhlInvoicePipeline(opts: {
         !approvedCards.has(card.id) ? "Card is outside the explicitly approved write cohort; Paid exits are also held" : null;
       report({ ...context, to, action: blocked ? "hold" : "planned", reason: blocked ?? "Fresh complete Jobber source verified" });
       if (blocked) return;
-      freshIdentities ??= readFreshJobberIdentities();
-      const identityReason = verifyFreshGhlIdentity(customer, customers, contacts, contactId, await freshIdentities);
+      const standingPolicy = readConfiguredStandingIdentityPolicy();
+      let identityReason: string | null;
+      let standingHandle: Awaited<ReturnType<typeof readStandingIdentityInventory>> | undefined;
+      let standingEvidence: ReturnType<typeof reviewedIdentityOwnerEvidence> | undefined;
+      if (standingPolicy) {
+        const policyKey = JSON.stringify(standingPolicy);
+        if (standingInventoryPolicy !== policyKey) { standingInventory = undefined; standingInventoryPolicy = policyKey; }
+        standingInventory ??= readStandingIdentityInventory(standingPolicy, customers);
+        standingHandle = await standingInventory;
+        const inventory = inspectReviewedIdentityInventory(standingHandle);
+        standingEvidence = reviewedIdentityOwnerEvidence(standingHandle, customer.jobberClientId);
+        identityReason = verifyFreshGhlIdentity(customer, customers, contacts, contactId, inventory.identities, standingEvidence);
+      } else {
+        freshIdentities ??= readFreshJobberIdentities();
+        identityReason = verifyFreshGhlIdentity(customer, customers, contacts, contactId, await freshIdentities);
+      }
       if (identityReason) { report({ ...context, to, action: "hold", reason: identityReason }); return; }
+      const standingHold = (): string | null => {
+        if (!standingPolicy) return null;
+        try {
+          if (JSON.stringify(readConfiguredStandingIdentityPolicy()) !== JSON.stringify(standingPolicy))
+            return "Standing identity authorization changed before write";
+          if (!standingHandle || !standingEvidence) return "Standing identity evidence unavailable";
+          const inventory = inspectReviewedIdentityInventory(standingHandle);
+          // Reuse the SAME bounded handle and owner proof: never refresh either
+          // its observation time or authorization just to get past a slow read.
+          return verifyFreshGhlIdentity(customer, customers, contacts, contactId, inventory.identities, standingEvidence);
+        } catch { return "Standing identity evidence expired or changed before write"; }
+      };
       const current = await readOpportunity(card.id);
+      const currentObservedAt = new Date().toISOString();
       if (current.pipelineId !== refs.pipelineId || current.contactId !== contactId || current.status !== "open") {
         report({ ...context, to, action: "hold", reason: "Card ownership/status changed before write" }); return;
       }
-      if (current.pipelineStageId === stageId && (paid || (current.monetaryValue === to.monetaryValue && current.name === to.name))) {
+      if (!cancellationCandidate && !bootstrapOverdue && current.pipelineStageId === stageId && (paid || (current.monetaryValue === to.monetaryValue && current.name === to.name))) {
         report({ ...context, to, action: "unchanged", reason: "Fresh GHL read already matches target; no repeated PUT" }); return;
       }
       if (current.pipelineStageId !== card.pipelineStageId || current.name !== card.name || current.monetaryValue !== card.monetaryValue) {
         report({ ...context, to, action: "hold", reason: "Card changed since preflight; replan on a fresh run" }); return;
       }
+      const postReadStandingHold = standingHold();
+      if (postReadStandingHold) { report({ ...context, to, action: "hold", reason: postReadStandingHold }); return; }
+      if(cancellationCandidate){
+        if(!opts.writer!.readCycleHistory){report({...context,to,action:"hold",reason:"Cancellation requires durable cycle history"});return;}
+        mutationStarted=true;
+        const cancelled=await cancelPaidOwnedInvoiceCycle({
+          scope:{locationId:process.env.GHL_LOCATION_ID??"",opportunityId:card.id,contactId,jobberClientId:customer.jobberClientId},
+          expectedCard:current,mode,phoneOwner:!email,writer:{
+            prepare:opts.writer!.prepare.bind(opts.writer),assertPending:opts.writer!.assertPending.bind(opts.writer),
+            confirm:opts.writer!.confirm.bind(opts.writer),block:opts.writer!.block.bind(opts.writer),
+            readCycleHistory:opts.writer!.readCycleHistory.bind(opts.writer)},
+        });
+        if(cancelled.state==="cancelled"){
+          if(!cancelled.reused)applied+=1;
+          report({...context,to,action:cancelled.reused?"hold":"applied",
+            reason:"Owned paid invoice workflow removal acknowledged; aggregate card unchanged and successor entry held"});
+          return;
+        }
+        if(cancelled.state==="held"){report({...context,to,action:"hold",reason:cancelled.reason});return;}
+        if(current.pipelineStageId===overdueId && !bootstrapOverdue){
+          report({...context,to,action:"hold",reason:"Existing Overdue cycle requires execution review; no re-enrollment or clock restart"});return;
+        }
+      }
+      if (bootstrapOverdue) {
+        const unpaid = evidence.filter(i => i.client?.id === customer.jobberClientId &&
+          (i.invoiceStatus?.toLowerCase() !== "paid" || i.amounts?.invoiceBalance !== 0));
+        if (unpaid.length !== 1 || !opts.writer!.readCycleHistory) {
+          report({ ...context, to, action:"hold", reason:"Bootstrap requires unique unpaid source and durable complete history" }); return;
+        }
+        mutationStarted=true;
+        const result=await syncExistingOverdueBootstrap({
+          scope:{locationId:process.env.GHL_LOCATION_ID??"",opportunityId:card.id,contactId,
+            jobberClientId:customer.jobberClientId,invoiceId:unpaid[0].id},
+          expectedCard:current,target:to,mode,phoneOwner:!email,writer:{
+            prepare:opts.writer!.prepare.bind(opts.writer),assertPending:opts.writer!.assertPending.bind(opts.writer),
+            confirm:opts.writer!.confirm.bind(opts.writer),block:opts.writer!.block.bind(opts.writer),
+            readCycleHistory:opts.writer!.readCycleHistory.bind(opts.writer)},
+        });
+        if(result.state==="applied")applied+=1;
+        report({...context,to,action:result.state==="applied"?"applied":"hold",
+          reason:result.state==="applied"?"Reviewed existing-overdue cycle entered with source date and past milestones skipped":result.reason});
+        return;
+      }
+      if (!paid && process.env.GHL_CYCLE_OWNERSHIP_ENABLED === "true" && current.pipelineStageId === paidId) {
+        const unpaid = evidence.filter(i => i.client?.id === customer.jobberClientId &&
+          (i.invoiceStatus?.toLowerCase() !== "paid" || i.amounts?.invoiceBalance !== 0));
+        if (unpaid.length !== 1 || !opts.writer!.readCycleHistory) {
+          report({ ...context, to, action: "hold", reason: "Cycle reset requires unique unpaid source and durable cycle history" }); return;
+        }
+        mutationStarted = true;
+        const result = await resetJournalOwnedInvoiceCycle({ scope: { locationId: process.env.GHL_LOCATION_ID ?? "", opportunityId: card.id,
+          contactId, jobberClientId: customer.jobberClientId, invoiceId: unpaid[0].id }, expectedCard: current, name: to.name,
+          writer: { prepare: opts.writer!.prepare.bind(opts.writer), assertPending: opts.writer!.assertPending.bind(opts.writer),
+            confirm: opts.writer!.confirm.bind(opts.writer), block: opts.writer!.block.bind(opts.writer), readCycleHistory: opts.writer!.readCycleHistory.bind(opts.writer) },
+          mode, phoneOwner: !email });
+        if (result.state === "applied") applied += 1;
+        report({ ...context, action: result.state === "applied" ? "applied" : "hold",
+          reason: result.state === "applied" ? "Journal-owned next invoice reset to Sent after reviewed cleanup evidence; no enrollment claimed" : result.reason });
+        return;
+      }
+      // Every possible Overdue enrollment goes through date-before-stage. When
+      // disabled or effects are unverified, HOLD rather than fall back to the
+      // legacy stage PUT. Existing Paid exit gates are unchanged.
+      if (!paid && (stageId === overdueId || process.env.GHL_RECURRING_DUE_DATE_ENABLED === "true")) {
+        const unpaid = evidence.filter(i => i.client?.id === customer.jobberClientId &&
+          (i.invoiceStatus?.toLowerCase() !== "paid" || i.amounts?.invoiceBalance !== 0));
+        if (unpaid.length !== 1) {
+          report({ ...context, to, action: "hold", reason: "Recurring date binding requires exactly one unpaid owner invoice" }); return;
+        }
+        // The helper owns durable claims and blocks on any uncertain outcome.
+        // Mark locally too, so an exception halts subsequent cards this run.
+        mutationStarted = true;
+        const result = await syncRecurringDueDateBeforeStage({
+          scope: { locationId: process.env.GHL_LOCATION_ID ?? "", opportunityId: card.id,
+            contactId, jobberClientId: customer.jobberClientId, invoiceId: unpaid[0].id },
+          expectedCard: current, target: to, mode, phoneOwner: !email, writer: opts.writer!,
+        });
+        if (result.state === "applied") applied += 1;
+        report({ ...context, to, action: result.state === "applied" ? "applied" : "hold",
+          reason: result.state === "applied" ? "Due date read back before fresh verified stage transition; delivery not asserted" : result.reason });
+        return;
+      }
       const intent = buildGhlWriteIntent({ current, to, jobberClientId: customer.jobberClientId,
         source: evidence, storedInvoiceIds: ownInvoices.map(inv => inv.jobberInvoiceId), observedAt: sourceObservedAt });
       if (!intent) { report({ ...context, to, action: "hold", reason: "Immutable card/source evidence is unavailable" }); return; }
+      if (paid && process.env.GHL_CYCLE_OWNERSHIP_ENABLED === "true" && opts.writer!.readCycleHistory) {
+        const history = await opts.writer!.readCycleHistory();
+        const owned = latestCycleOwner(history, { ...intent, locationId: process.env.GHL_LOCATION_ID ?? "" });
+        // Keep the original owned card date as history; the actual paid source
+        // may have edited its due date. Never misattribute a reset successor to
+        // an older enrollment or repeat an already recorded Paid claim.
+        const alreadyPaid = owned?.intent.cycle && history.some(w => w.intent.cycle?.phase === "paid"
+          && w.intent.cycle.locationId === owned.intent.cycle!.locationId && w.intent.cycle.workflowId === owned.intent.cycle!.workflowId
+          && w.intent.cycle.invoiceId === owned.intent.cycle!.invoiceId && w.intent.jobberClientId === intent.jobberClientId);
+        if (owned?.intent.cycle && !alreadyPaid) {
+          intent.cycle = { ...owned.intent.cycle, phase: "paid" };
+          const witness = await readPrePaidDateWitness({ current, owner: owned, observedAt: currentObservedAt });
+          if (witness) intent.cycle.paidDateWitness = witness;
+        }
+      }
+      const preAdmissionStandingHold = standingHold();
+      if (preAdmissionStandingHold) {
+        report({ ...context, to, action: "hold", reason: preAdmissionStandingHold }); return;
+      }
       // A failure anywhere after attempting the durable claim halts this writer.
       mutationStarted = true;
       const intentId = await opts.writer!.prepare(intent);
       await opts.writer!.assertPending(intentId);
+      const preMutationStandingHold = standingHold();
+      if (preMutationStandingHold) throw new Error(preMutationStandingHold);
       await moveOpportunityToStage(card.id, stageId, plan.total, to.name);
       const accepted = await readOpportunity(card.id);
       if (accepted.pipelineId !== current.pipelineId || accepted.contactId !== current.contactId || accepted.status !== "open"
           || accepted.pipelineStageId !== stageId || accepted.monetaryValue !== plan.total
           || accepted.name !== (to.name ?? current.name)) throw new Error("Post-write card state not confirmed");
-      await opts.writer!.confirm(intentId);
+      await opts.writer!.confirm(intentId, await readPaidDateReadback(intent, accepted));
       applied += 1;
       report({ ...context, to, action: "applied", reason: "GHL accepted update; downstream workflow effects not verified" });
     } catch (err: any) {

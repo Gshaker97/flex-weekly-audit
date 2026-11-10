@@ -1,4 +1,5 @@
 /** Opt-in, read-only coverage evidence. No policy IDs, activation or writes live here. */
+import { createHash } from "node:crypto";
 import { jobberGraphQL } from "./jobber";
 import type { FreshJobberIdentity } from "./ghl-write-identity";
 type Customer = { jobberClientId: string; email?: string | null; phone?: string | null };
@@ -7,6 +8,31 @@ export type ReviewedOmissionPolicy = {
   accountId: string; reviewRef: string; reviewedAt: string; expiresAt: string;
   quarantine: readonly [Customer, Customer];
 };
+/** Separate standing authorization, never a renewed temporary review. The
+ * deployment loader must pin its bytes and match the explicit approval ID. */
+export type StandingOmissionPolicy = {
+  kind: "explicit_standing"; approvalId: string; approvalRef: string; approvedAt: string;
+  validity: "until_revoked"; accountId: string; scopeSha256: string;
+  quarantine: readonly [Customer, Customer];
+};
+export type IdentityOmissionPolicy = ReviewedOmissionPolicy | StandingOmissionPolicy;
+export const standingOmissionScopeHash = (p: Pick<StandingOmissionPolicy,"accountId"|"quarantine">) =>
+  createHash("sha256").update(JSON.stringify([p.accountId,customerKey([...p.quarantine])])).digest("hex");
+export function omissionAuthorizationExpiry(policy: IdentityOmissionPolicy, started = Date.now()): number {
+  if ("kind" in policy) {
+    const p = policy as StandingOmissionPolicy, approved = Date.parse(p.approvedAt);
+    if (p.kind !== "explicit_standing" || p.validity !== "until_revoked" || !id(p.approvalId) || !id(p.approvalRef)
+        || !Number.isFinite(approved) || approved > started || !id(p.accountId)
+        || !Array.isArray(p.quarantine) || p.quarantine.length !== 2 || new Set(p.quarantine.map(c=>c?.jobberClientId)).size !== 2
+        || p.quarantine.some(c=>!id(c?.jobberClientId) || [c.email,c.phone].some(v=>v!=null && typeof v!=="string")) || !/^[a-f0-9]{64}$/.test(p.scopeSha256)
+        || standingOmissionScopeHash(p) !== p.scopeSha256) throw new Error("Invalid explicit standing omission authorization");
+    return Infinity; // Authorization only; every observation still expires in five minutes.
+  }
+  const reviewed=Date.parse(policy?.reviewedAt),expires=Date.parse(policy?.expiresAt);
+  if (!id(policy?.reviewRef) || !Number.isFinite(reviewed) || !Number.isFinite(expires)
+      || reviewed>started || expires<=started || expires-reviewed>86400000) throw new Error("Invalid or expired reviewed omission policy");
+  return expires;
+}
 export type ExactIdentityScope = { jobberClientId: string; invoiceId: string };
 export type CachedLinkCounts = { jobberClientId: string; jobs: number; invoices: number };
 declare const coverageBrand: unique symbol;
@@ -36,13 +62,12 @@ export function coveragePermitsExactInvoice(evidence: IdentityCoverageEvidence |
     && issued.get(evidence!)?.invoiceId === scope.invoiceId;
 }
 /** Fetches both explicit scopes; mints non-serializable evidence only after exact reads and fresh local link counts. */
-export async function readReviewedIdentityCoverage(policy: ReviewedOmissionPolicy, customers: Customer[], scope: ExactIdentityScope,
+export async function readReviewedIdentityCoverage(policy: IdentityOmissionPolicy, customers: Customer[], scope: ExactIdentityScope,
   counts: () => Promise<CachedLinkCounts[]>, query: Query = jobberGraphQL): Promise<{ identities: FreshJobberIdentity[]; evidence: IdentityCoverageEvidence }> {
   policy = structuredClone(policy);
   scope = { ...scope };
-  const started = Date.now(), reviewed = Date.parse(policy?.reviewedAt), expires = Date.parse(policy?.expiresAt);
-  if (!id(policy?.accountId) || !id(policy?.reviewRef) || !Number.isFinite(reviewed) || !Number.isFinite(expires)
-    || reviewed > started || expires <= started || expires - reviewed > 86400000
+  const started = Date.now(), expires = omissionAuthorizationExpiry(policy, started);
+  if (!id(policy?.accountId)
     || !Array.isArray(policy.quarantine) || policy.quarantine.length !== 2
     || new Set(policy.quarantine.map(c=>c.jobberClientId)).size !== 2
     || policy.quarantine.some(c=>!id(c.jobberClientId)) || !id(scope.jobberClientId) || !id(scope.invoiceId)
@@ -89,7 +114,7 @@ export async function readReviewedIdentityCoverage(policy: ReviewedOmissionPolic
 /** Shared population evidence. It is neither invoice association nor send authority. */
 declare const inventoryBrand: unique symbol;
 export type ReviewedIdentityInventory = Readonly<{ [inventoryBrand]: true }>;
-type InventoryData = { policy: ReviewedOmissionPolicy; customers: Customer[]; identities: FreshJobberIdentity[];
+type InventoryData = { policy: IdentityOmissionPolicy; customers: Customer[]; identities: FreshJobberIdentity[];
   observedAt: number; expiresAt: number };
 const inventories = new WeakMap<ReviewedIdentityInventory, InventoryData>();
 function inventoryData(handle: ReviewedIdentityInventory): InventoryData {
@@ -100,12 +125,11 @@ function inventoryData(handle: ReviewedIdentityInventory): InventoryData {
 }
 /** Scan active AND archived populations once. Exact-null quarantine and zero-link counts
  * remain mandatory. No caller-supplied complete/verified flag is accepted. */
-export async function readReviewedIdentityInventory(policy: ReviewedOmissionPolicy, customers: Customer[],
+export async function readReviewedIdentityInventory(policy: IdentityOmissionPolicy, customers: Customer[],
   counts: () => Promise<CachedLinkCounts[]>, query: Query): Promise<ReviewedIdentityInventory> {
   policy = structuredClone(policy); customers = structuredClone(customers);
-  const started = Date.now(), reviewed = Date.parse(policy?.reviewedAt), expires = Date.parse(policy?.expiresAt);
-  if (!id(policy?.accountId) || !id(policy.reviewRef) || !Number.isFinite(reviewed) || !Number.isFinite(expires) ||
-      reviewed > started || expires <= started || expires - reviewed > 86400000 ||
+  const started = Date.now(), expires = omissionAuthorizationExpiry(policy, started);
+  if (!id(policy?.accountId) ||
       !Array.isArray(policy.quarantine) || policy.quarantine.length !== 2 ||
       policy.quarantine.some(c => !id(c.jobberClientId)) || new Set(policy.quarantine.map(c => c.jobberClientId)).size !== 2 ||
       !Array.isArray(customers) || customers.some(c => !id(c?.jobberClientId)) ||
