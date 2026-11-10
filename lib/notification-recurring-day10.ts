@@ -122,7 +122,11 @@ export function createRecurringDay10Service(options: Readonly<{
         const guard = <A extends unknown[], R>(fn: (...args: A) => R) => (...args: A): R => { verify(); return fn(...args); };
         const inventoryIO: NotificationInventoryIO = { locationId: guard(r.inventoryIO.locationId.bind(r.inventoryIO)),
           tokenExpiresAt: guard(r.inventoryIO.tokenExpiresAt.bind(r.inventoryIO)), query: guard(r.inventoryIO.query.bind(r.inventoryIO)) };
-        const sourceIO: NotificationRecurringSourceIO = { locationId: guard(r.sourceIO.locationId.bind(r.sourceIO)), query: guard(r.sourceIO.query.bind(r.sourceIO)),
+        const sourceIO: NotificationRecurringSourceIO = { locationId: guard(r.sourceIO.locationId.bind(r.sourceIO)),
+          query: async <T = any>(statement: string, variables?: Record<string, any>, readOptions?: Readonly<{ deadlineAt?: number }>): Promise<T> => {
+            verify(); const value = await r.sourceIO.query<T>(statement, variables,
+              { deadlineAt: Math.min(deadline, readOptions?.deadlineAt ?? Infinity) }); verify(); return value;
+          },
           customers: guard(r.sourceIO.customers.bind(r.sourceIO)), contacts: guard(r.sourceIO.contacts.bind(r.sourceIO)),
           customer: guard(r.sourceIO.customer.bind(r.sourceIO)), contact: guard(r.sourceIO.contact.bind(r.sourceIO)),
           quarantineCounts: guard(r.sourceIO.quarantineCounts.bind(r.sourceIO)), storedInvoices: guard(r.sourceIO.storedInvoices.bind(r.sourceIO)) };
@@ -150,7 +154,7 @@ export function createRecurringDay10Service(options: Readonly<{
           ["readNotificationInventory", "inspectNotificationInventory", "planNotificationInventory", "readDiscoveredNotificationSource"]);
         const { readNotificationSourceBatch, inspectNotificationSourceDestinations, inspectRecurringNotificationSource } = notificationModuleFunctions(await import("./notification-source"),
           ["readNotificationSourceBatch", "inspectNotificationSourceDestinations", "inspectRecurringNotificationSource"]);
-        const inventory = await readNotificationInventory(scope, inventoryIO), scan = inspectNotificationInventory(inventory);
+        const inventory = await readNotificationInventory({ ...scope, expiresAt: new Date(deadline).toISOString() }, inventoryIO), scan = inspectNotificationInventory(inventory);
         output.invoices = scan.rows.map((_, i) => ({ ordinal: i + 1, result: null, holds: ["not_current_day10"] }));
         if (scan.coverage !== "complete-account-invoices") { output.state = "held"; output.reasons = [...scan.holds]; return; }
         const batch = await readNotificationSourceBatch(scope.identityCoveragePolicy, sourceIO);

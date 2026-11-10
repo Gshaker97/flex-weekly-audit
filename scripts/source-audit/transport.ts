@@ -46,28 +46,94 @@ export async function boundedJson(response: Response, budget: Budget, controller
     throw error;
   } finally { reader.releaseLock(); }
 }
+type NotificationCost = {
+  requestedQueryCost: number; actualQueryCost: number;
+  maximumAvailable: number; currentlyAvailable: number; restoreRate: number;
+};
+/** Jobber's cost extension is the only pacing authority. Never infer a bucket from
+ * page counts, HTTP status, error text, or the documented default account limits. */
+function notificationCost(payload: Record<string, unknown>): NotificationCost {
+  const cost = object(payload.extensions) && object(payload.extensions.cost) ? payload.extensions.cost : null;
+  const status = cost && object(cost.throttleStatus) ? cost.throttleStatus : null;
+  const numeric = (n: unknown): n is number => typeof n === 'number' && Number.isFinite(n) && n >= 0 && n <= Number.MAX_SAFE_INTEGER;
+  if (!cost || !status || !numeric(cost.requestedQueryCost) || cost.requestedQueryCost <= 0 ||
+      !numeric(status.maximumAvailable) || status.maximumAvailable <= 0 ||
+      !numeric(status.currentlyAvailable) || status.currentlyAvailable > status.maximumAvailable ||
+      !numeric(status.restoreRate) || status.restoreRate <= 0 ||
+      !(numeric(cost.actualQueryCost) && cost.actualQueryCost <= cost.requestedQueryCost))
+    throw new AuditFailure('SOURCE_RATE_LIMIT_METADATA_INVALID');
+  const result = { requestedQueryCost: cost.requestedQueryCost,
+    actualQueryCost: cost.actualQueryCost,
+    maximumAvailable: status.maximumAvailable, currentlyAvailable: status.currentlyAvailable, restoreRate: status.restoreRate };
+  if (result.requestedQueryCost > result.maximumAvailable) throw new AuditFailure('SOURCE_RATE_LIMIT_UNRECOVERABLE', result);
+  return result;
+}
+export type JobberQueryOptions = {
+  maxAttempts?: number; deadlineAt?: number;
+  /** Explicit trusted notification-read binding only; never enabled by default. */
+  notificationReadRateLimit?: true;
+};
 export class JobberReader {
+  private notificationRate?: { cost: NotificationCost; observedAt: number };
+  private readonly notificationCosts = new Map<string, number>();
   constructor(private readonly token: string, private readonly expiresAt: Date, readonly budget: Budget, private readonly fetcher: typeof fetch = fetch) {}
-  async query(query: string, variables: Record<string, unknown> = {}, options: { maxAttempts?: number; deadlineAt?: number } = {}) {
+  private observeNotificationCost(query: string, cost: NotificationCost) {
+    this.notificationRate = { cost, observedAt: Date.now() };
+    this.notificationCosts.set(query, Math.max(this.notificationCosts.get(query) ?? 0, cost.requestedQueryCost));
+  }
+  private notificationBoundary(deadlineAt: number, now = Date.now()) {
+    if (now < this.budget.startedAt || now >= deadlineAt) throw new AuditFailure('PROBE_TIME_LIMIT');
+    this.budget.check(); requireToken(this.expiresAt, now);
+  }
+  private async paceNotification(query: string, deadlineAt: number) {
+    this.notificationBoundary(deadlineAt);
+    const requested = this.notificationCosts.get(query);
+    if (!this.notificationRate || requested === undefined) return; // A new query shape has no invented cost.
+    const { cost, observedAt } = this.notificationRate, now = Date.now();
+    if (now < observedAt) throw new AuditFailure('PROBE_TIME_LIMIT');
+    if (requested > cost.maximumAvailable) throw new AuditFailure('SOURCE_RATE_LIMIT_UNRECOVERABLE', { ...cost, requestedQueryCost: requested });
+    const available = Math.min(cost.maximumAvailable, cost.currentlyAvailable + (now - observedAt) * cost.restoreRate / 1000);
+    const waitMs = Math.ceil(Math.max(0, requested - available) * 1000 / cost.restoreRate);
+    // Check the anticipated wake before sleeping, and the actual wake afterwards.
+    // An overlong wait holds instead of truncating it and issuing another request.
+    if (!Number.isSafeInteger(waitMs)) throw new AuditFailure('SOURCE_RATE_LIMIT_UNRECOVERABLE', cost);
+    this.notificationBoundary(deadlineAt, now + waitMs);
+    if (waitMs > 0) await this.budget.pause(waitMs);
+    this.notificationBoundary(deadlineAt);
+  }
+  async query(query: string, variables: Record<string, unknown> = {}, options: JobberQueryOptions = {}) {
     if (!/^\s*query\b/.test(query)) throw new AuditFailure('NON_READ_QUERY_REJECTED');
+    const notification = options.notificationReadRateLimit === true;
+    if (notification && !Number.isFinite(options.deadlineAt)) throw new AuditFailure('SOURCE_RATE_LIMIT_SCOPE_INVALID');
+    // A logical read, including its waits and retries, gets at most the existing three request
+    // windows (75 seconds), always clamped to the caller/coordinator and run deadlines.
+    const deadlineAt = notification ? Math.min(options.deadlineAt!, Date.now() + LIMITS.maxAttempts * LIMITS.requestMs,
+      this.budget.startedAt + LIMITS.runMs) : options.deadlineAt;
+    const notificationBody = notification ? JSON.stringify({ query, variables }) : undefined;
+    if (!notification) this.notificationRate = undefined;
     const maxAttempts = Math.min(LIMITS.maxAttempts, options.maxAttempts ?? LIMITS.maxAttempts);
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      if (options.deadlineAt !== undefined && Date.now() >= options.deadlineAt) throw new AuditFailure('PROBE_TIME_LIMIT');
+      if (notification) await this.paceNotification(query, deadlineAt!);
+      if (deadlineAt !== undefined && Date.now() >= deadlineAt) throw new AuditFailure('PROBE_TIME_LIMIT');
       this.budget.check(); requireToken(this.expiresAt);
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), Math.max(1, Math.min(LIMITS.requestMs, (options.deadlineAt ?? Infinity) - Date.now())));
+      const timer = setTimeout(() => controller.abort(), Math.max(1, Math.min(LIMITS.requestMs, (deadlineAt ?? Infinity) - Date.now())));
       let retry = false;
       try {
+        if (notification && attempt > 0) this.budget.retries++;
         this.budget.requests++;
         const response = await this.fetcher(JOBBER_ENDPOINT, { method: 'POST', redirect: 'error',
           headers: { Authorization: `Bearer ${this.token}`, 'Content-Type': 'application/json', 'X-JOBBER-GRAPHQL-VERSION': JOBBER_VERSION },
-          body: JSON.stringify({ query, variables }), signal: controller.signal });
+          body: notificationBody ?? JSON.stringify({ query, variables }), signal: controller.signal });
         if (response.status === 401 || response.status === 403) {
           await response.body?.cancel();
           throw new AuditFailure('EXISTING_CONNECTION_AUTHORIZATION_FAILED', { httpStatus: response.status, expiryRemainingMinutes: expiryMinutes(this.expiresAt) });
         }
         if (response.status === 429 || response.status >= 500) {
-          await response.body?.cancel(); retry = true;
+          await response.body?.cancel();
+          // Notification retries require the documented GraphQL cost contract, not HTTP guesses.
+          if (notification) throw new AuditFailure('SOURCE_RETRIES_EXHAUSTED', { httpStatus: response.status });
+          retry = true;
         } else {
           if (!response.ok) { await response.body?.cancel(); throw new AuditFailure('SOURCE_HTTP_ERROR', { httpStatus: response.status }); }
           const payload = await boundedJson(response, this.budget, controller);
@@ -75,10 +141,19 @@ export class JobberReader {
           if (payload.errors !== undefined && !Array.isArray(payload.errors)) throw new AuditFailure('SOURCE_ERRORS_MALFORMED');
           if (Array.isArray(payload.errors) && payload.errors.length) {
             const allThrottled = payload.errors.every(e => object(e) && object(e.extensions) && e.extensions.code === 'THROTTLED');
-            if (allThrottled) retry = true;
+            if (allThrottled) {
+              if (notification) this.observeNotificationCost(query, notificationCost(payload));
+              retry = true;
+            }
             else throw new AuditFailure('SOURCE_GRAPHQL_ERROR', { graphqlErrorCount: payload.errors.length });
           } else if (!object(payload.data)) throw new AuditFailure('SOURCE_DATA_MISSING');
-          else return payload.data;
+          else {
+            if (notification) {
+              this.observeNotificationCost(query, notificationCost(payload));
+              this.notificationBoundary(deadlineAt!);
+            }
+            return payload.data;
+          }
         }
       } catch (error) {
         if (error instanceof AuditFailure) throw error;
@@ -86,11 +161,11 @@ export class JobberReader {
         // Never print raw errors, body text, headers, URLs or credentials.
         throw new AuditFailure('SOURCE_NETWORK_ERROR');
       } finally { controller.abort(); clearTimeout(timer); }
-      if (retry && attempt < maxAttempts - 1) {
+      if (!notification && retry && attempt < maxAttempts - 1) {
         this.budget.retries++; await this.budget.pause(1500 * (attempt + 1));
       }
     }
-    throw new AuditFailure('SOURCE_RETRIES_EXHAUSTED');
+    throw new AuditFailure('SOURCE_RETRIES_EXHAUSTED', notification && this.notificationRate ? { ...this.notificationRate.cost, attempts: maxAttempts } : {});
   }
   page(after: string | null) { return this.query(INVOICE_QUERY, { after }); }
 }

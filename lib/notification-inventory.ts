@@ -1,6 +1,7 @@
 /** Bounded READ-ONLY account discovery. Never sends, schedules or mints identity from JSON. */
 import { createHash } from "node:crypto";
-import { INVOICE_QUERY, LIMITS, paginate, type Invoice } from "../scripts/source-audit/core";
+import { types as utilTypes } from "node:util";
+import { AuditFailure, INVOICE_QUERY, LIMITS, paginate, type Invoice } from "../scripts/source-audit/core";
 import { requireTokenRunCoverage, type JobberReader } from "../scripts/source-audit/transport";
 import { GhlReadonlyReader } from "../scripts/ghl-preview/transport";
 import { validGhlContactIdentity } from "./ghl-write-identity";
@@ -18,6 +19,47 @@ const freeze = <T>(value: T): T => {
   if (value && typeof value === "object") { Object.values(value).forEach(freeze); Object.freeze(value); }
   return value;
 };
+const inventoryFailureCodes = ["SOURCE_PAGE_LIMIT", "SOURCE_RECORD_LIMIT", "SOURCE_CONNECTION_MISSING",
+  "SOURCE_PAGE_MALFORMED", "SOURCE_PAGE_OVERSIZE", "SOURCE_EMPTY_CONTINUATION", "SOURCE_CURSOR_MISSING",
+  "SOURCE_EMPTY_CURSOR_INVALID", "SOURCE_CURSOR_REPEATED", "INVALID_SOURCE_INVOICE_ID", "SOURCE_ID_REPEATED",
+  "RUN_TIME_LIMIT", "EXISTING_TOKEN_EXPIRED_OR_NEAR_EXPIRY", "EXISTING_TOKEN_INSUFFICIENT_RUN_COVERAGE",
+  "RESPONSE_BYTE_LIMIT", "EMPTY_RESPONSE_BODY", "INVALID_JSON_RESPONSE", "NON_READ_QUERY_REJECTED",
+  "PROBE_TIME_LIMIT", "EXISTING_CONNECTION_AUTHORIZATION_FAILED", "SOURCE_HTTP_ERROR",
+  "SOURCE_RESPONSE_MALFORMED", "SOURCE_ERRORS_MALFORMED", "SOURCE_GRAPHQL_ERROR", "SOURCE_DATA_MISSING",
+  "SOURCE_REQUEST_TIMEOUT", "SOURCE_NETWORK_ERROR", "SOURCE_RETRIES_EXHAUSTED",
+  "SOURCE_RATE_LIMIT_METADATA_INVALID", "SOURCE_RATE_LIMIT_UNRECOVERABLE", "SOURCE_RATE_LIMIT_SCOPE_INVALID",
+  "INVENTORY_SCOPE_OR_DEADLINE", "INVENTORY_ACCOUNT_CHANGED"] as const;
+const inventoryFailureFactKeys = ["pages", "invoices", "bytes", "httpStatus", "expiryRemainingMinutes",
+  "requiredMinutes", "graphqlErrorCount"] as const;
+const inventoryCostFactKeys = ["requestedQueryCost", "actualQueryCost", "maximumAvailable", "currentlyAvailable", "restoreRate", "attempts"] as const;
+type InventoryFailureFactKey = typeof inventoryFailureFactKeys[number] | typeof inventoryCostFactKeys[number];
+export type NotificationInventoryFailure = Readonly<{
+  code: typeof inventoryFailureCodes[number] | "INVENTORY_UNEXPECTED_FAILURE";
+  facts: Readonly<Partial<Record<InventoryFailureFactKey, number | boolean>>>;
+}>;
+/** Diagnostics only, never authority. ESM/CJS copies of AuditFailure can have different
+ * constructors. Read only native Errors' own data fields, never text, accessors or response data. */
+export function notificationInventoryFailure(error: unknown): NotificationInventoryFailure {
+  const unknown = (): NotificationInventoryFailure => freeze({ code: "INVENTORY_UNEXPECTED_FAILURE", facts: {} });
+  try {
+    if (!utilTypes.isNativeError(error)) return unknown();
+    const own = (key: string): unknown => Object.getOwnPropertyDescriptor(error, key)?.value;
+    const code = own("code"), rawFacts = own("facts");
+    if (own("name") !== "AuditFailure" || typeof code !== "string" ||
+        !inventoryFailureCodes.includes(code as typeof inventoryFailureCodes[number]) ||
+        !rawFacts || typeof rawFacts !== "object" || Array.isArray(rawFacts) || utilTypes.isProxy(rawFacts)) return unknown();
+    const facts: Partial<Record<InventoryFailureFactKey, number | boolean>> = {};
+    for (const key of inventoryFailureFactKeys) {
+      const value: unknown = Object.getOwnPropertyDescriptor(rawFacts, key)?.value;
+      if (typeof value === "boolean" || typeof value === "number" && Number.isFinite(value)) facts[key] = value;
+    }
+    for (const key of inventoryCostFactKeys) {
+      const value: unknown = Object.getOwnPropertyDescriptor(rawFacts, key)?.value;
+      if (typeof value === "number" && Number.isFinite(value)) facts[key] = value;
+    }
+    return freeze({ code: code as typeof inventoryFailureCodes[number], facts });
+  } catch { return unknown(); }
+}
 export const NOTIFICATION_INVENTORY_QUERY = INVOICE_QUERY.replace("AuditInvoices", "NotificationInventoryInvoices")
   .replace("{\n", "{\n  account { id }\n");
 export type NotificationInventoryRequest = Readonly<{
@@ -33,6 +75,7 @@ export type NotificationInventorySnapshot = Readonly<{
   observedAt: string; completedAt: string; expiresAt: string; sourceRef: string;
   coverage: "complete-account-invoices" | "partial-held"; terminalPageObserved: boolean;
   pages: number; invoiceCount: number; rows: readonly NotificationInventoryRow[]; holds: readonly string[];
+  failure?: NotificationInventoryFailure;
   identityVerified: false; productionSendCapability: false;
 }>;
 export type NotificationInventoryIO = Readonly<{
@@ -75,20 +118,22 @@ export async function readNotificationInventory(request: NotificationInventoryRe
   requireTokenRunCoverage(io.tokenExpiresAt(), begun); // Established 900-second startup guard, never refresh.
   const deadlineAt = Math.min(expires, begun + LIMITS.runMs), rawRows: Invoice[] = [];
   let pages = 0, terminalPageObserved = false, holds: string[] = [];
+  let failure: NotificationInventoryFailure | undefined;
   try {
     const result = await paginate(async after => {
-      if (Date.now() >= deadlineAt || io.locationId() !== r.locationId) throw new Error("inventory_scope_or_deadline");
-      const data = await io.query(NOTIFICATION_INVENTORY_QUERY, { after }, { maxAttempts: 1, deadlineAt });
+      if (Date.now() >= deadlineAt || io.locationId() !== r.locationId) throw new AuditFailure("INVENTORY_SCOPE_OR_DEADLINE");
+      const data = await io.query(NOTIFICATION_INVENTORY_QUERY, { after }, { maxAttempts: LIMITS.maxAttempts, deadlineAt,
+        notificationReadRateLimit: true });
       pages++;
-      if (data?.account && (data.account as any).id !== r.accountId || !data?.account) throw new Error("inventory_account_changed");
-      if (Date.now() >= deadlineAt || io.locationId() !== r.locationId) throw new Error("inventory_scope_or_deadline");
+      if (data?.account && (data.account as any).id !== r.accountId || !data?.account) throw new AuditFailure("INVENTORY_ACCOUNT_CHANGED");
+      if (Date.now() >= deadlineAt || io.locationId() !== r.locationId) throw new AuditFailure("INVENTORY_SCOPE_OR_DEADLINE");
       return data;
     }, { maxPages: LIMITS.maxPages, maxRecords: LIMITS.maxRecords });
     rawRows.push(...result.records); terminalPageObserved = result.terminalPageObserved;
-  } catch {
-    // Never publish the first N pages as a successful all-account source. Failure details
-    // are intentionally fixed rather than including provider errors or response data.
+  } catch (error) {
+    // Never publish the first N pages. Only allowlisted metadata survives, not provider text.
     holds = ["account_invoice_inventory_incomplete_or_unverified"];
+    failure = notificationInventoryFailure(error);
   }
   const rows = rawRows.map(row => sourceRow(row, Date.now())).sort((a, b) => a.invoiceId.localeCompare(b.invoiceId));
   const sourceRef = `notification-inventory-v1:${createHash("sha256").update(JSON.stringify([r.accountId, r.locationId, rows])).digest("hex")}`;
@@ -96,7 +141,8 @@ export async function readNotificationInventory(request: NotificationInventoryRe
     observedAt: new Date(begun).toISOString(), completedAt: new Date(Date.now()).toISOString(),
     expiresAt: new Date(Math.min(expires, begun + LIMITS.runMs)).toISOString(), sourceRef,
     coverage: terminalPageObserved ? "complete-account-invoices" as const : "partial-held" as const,
-    terminalPageObserved, pages, invoiceCount: rows.length, rows, holds, identityVerified: false as const, productionSendCapability: false as const });
+    terminalPageObserved, pages, invoiceCount: rows.length, rows, holds, ...(failure ? { failure } : {}),
+    identityVerified: false as const, productionSendCapability: false as const });
   const handle = Object.freeze({}) as NotificationInventory; inventories.set(handle, snapshot); return handle;
 }
 export function inspectNotificationInventory(handle: NotificationInventory): NotificationInventorySnapshot { return owned(handle); }
@@ -167,7 +213,7 @@ export async function deployedNotificationInventoryReadBindings(reader: Pick<Job
   options: Readonly<{ tokenExpiresAt: Date; fetch?: typeof fetch; cacheRead?: import("./notification-source").NotificationCacheRead }>): Promise<Readonly<{
     inventoryIO: NotificationInventoryIO; sourceIO: NotificationRecurringSourceIO;
   }>> {
-  const base = await deployedNotificationSourceReadBindings(reader, options);
+  const base = await deployedNotificationSourceReadBindings(reader, { ...options, notificationReadRateLimit: true });
   const prismaModule = await import("./prisma");
   const prisma: typeof import("./prisma").prisma = (prismaModule as any).prisma ?? (prismaModule as any).default?.prisma;
   if (typeof prisma?.customer?.findMany !== "function") throw new Error("Recurring cache read binding unavailable");

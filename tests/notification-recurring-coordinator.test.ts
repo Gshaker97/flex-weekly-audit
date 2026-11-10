@@ -83,7 +83,8 @@ function fixture() {
 
 test("default path is exact no-op, including throwing dependency getters", async () => {
   const options = Object.defineProperties({}, { scope: { get() { throw Error("scope accessed"); } }, runtime: { get() { throw Error("runtime accessed"); } } });
-  assert.equal((await createRecurringNotificationCoordinator(options).run()).state, "disabled");
+  const result = await createRecurringNotificationCoordinator(options).run();
+  assert.equal(result.state, "disabled"); assert.equal(Object.hasOwn(result.inventory, "failure"), false);
   assert.equal(recurringCoordinatorReadiness().sendCapable, false);
 });
 test("transitive imports and actual readiness CLI do not initialize ambient Prisma", () => {
@@ -174,6 +175,7 @@ test("all inventory pages exhaust and all same-contact/day invoices and Angie me
   const f = fixture(); f.data.invoices = Array.from({ length: 26 }, (_, i) => f.invoice(`invoice-${i}`)); f.data.stored = [];
   const result = await f.run();
   assert.equal(result.inventory.pages, 2); assert.equal(result.invoices.length, 26); assert.equal(result.internalDigests[0].invoiceOrdinals.length, 26);
+  assert.equal(Object.hasOwn(result.inventory, "failure"), false);
   assert.ok(result.invoices.every(row => row.milestones.find(m => m.dayPastDue === 10)!.planningHolds.includes("homeowner_contact_day_conflict")));
   assert.equal(f.counts.customers, 1); assert.equal(f.counts.contacts, 1);
 }));
@@ -189,7 +191,24 @@ for (const kind of ["paid", "void", "missing-date", "partial-inventory", "source
     const result = await f.run();
     assert.equal(result.attempts, 0); assert.equal(result.reservationsCreated, 0); assert.equal(JSON.stringify(result).includes("secret"), false);
     assert.equal(result.invoices.some(row => row.source === "verified_at_observation"), false);
+    if (kind === "partial-inventory") {
+      assert.deepEqual(result.inventory.failure, { code: "INVENTORY_UNEXPECTED_FAILURE", facts: {} });
+      assert.equal(result.inventory.coverage, "partial-held"); assert.equal(result.inventory.invoices, 0);
+      assert.equal(f.counts.customers, 0); assert.equal(f.counts.contacts, 0); assert.equal(f.http.length, 0); assert.equal(f.sql.length, 0);
+    }
   }));
+for (const remaining of [NaN, 30000, 899999]) test(`inventory preflight failure keeps not_read and safe token facts at ${remaining}`, () => clock(async () => {
+  const f = fixture(); f.data.tokenRemaining = remaining;
+  const result = await f.run();
+  assert.equal(result.state, "held"); assert.equal(result.inventory.coverage, "not_read");
+  assert.deepEqual(result.holds, ["inventory_population_or_runtime_unavailable"]);
+  assert.deepEqual(result.inventory.failure, remaining === 899999
+    ? { code: "EXISTING_TOKEN_INSUFFICIENT_RUN_COVERAGE", facts: { expiryRemainingMinutes: 14, requiredMinutes: 15 } }
+    : { code: "EXISTING_TOKEN_EXPIRED_OR_NEAR_EXPIRY", facts: { expiryRemainingMinutes: Number.isNaN(remaining) ? -1 : 0 } });
+  assert.equal(f.calls.length, 0); assert.equal(f.counts.customers, 0); assert.equal(f.http.length, 0); assert.equal(f.sql.length, 0);
+  assert.deepEqual(result.invoices, []); assert.equal(result.attempts, 0); assert.equal(result.reservationsCreated, 0);
+  assert.equal(result.sendCapable, false); assert.equal(result.rolloutReady, false);
+}));
 for (const ms of [899999, 900000]) test(`unchanged time gate at +${ms}ms`, () => clock(async advance => {
   const f = fixture(); advance(ms); f.data.tokenRemaining = 1000000; f.scope.expiresAt = new Date(Date.now()+900000).toISOString();
   f.policy.expiresAt = f.scope.expiresAt;
@@ -266,7 +285,9 @@ test("read-only bootstrap uses existing auth with 900-second guard, and creates 
 test("fake bootstrap through actual deployed readers exhausts inventory and source contacts without permitting message POST", () => {
   const script = `
     const { default: assert } = await import('node:assert/strict');
-    const at = Date.parse('2026-11-10T16:00:00.000Z'); Date.now = () => at;
+    let at = Date.parse('2026-11-10T16:00:00.000Z'); Date.now = () => at;
+    const transport = await import('./scripts/source-audit/transport.ts');
+    (transport.Budget ?? transport.default.Budget).prototype.pause = async ms => { at += ms; };
     Object.assign(process.env, { RAILWAY_SERVICE_ID:'ed22ce04-2e5d-47d1-98ed-ce63c99d3d9f', RAILWAY_ENVIRONMENT_ID:'bc72bc2d-9a4c-494d-8bee-9ca782db1240',
       RAILWAY_PROJECT_ID:'5d7858db-0443-4891-8a95-1eb1261d3e61', RAILWAY_DEPLOYMENT_ID:'synthetic', DATABASE_URL:'synthetic', GHL_API_KEY:'synthetic',
       GHL_LOCATION_ID:'location', GHL_INVOICE_WRITE_MODE:'review', GHL_PHONE_WRITES_ENABLED:'false', SYNC_ADMISSION_MODE:'cron_only', GHL_NOTIFICATIONS_ENABLED:'false' });
@@ -275,7 +296,7 @@ test("fake bootstrap through actual deployed readers exhausts inventory and sour
     const fresh = {id:'owner',emails:[{address:owner.email,primary:true}],phones:[{number:owner.phone,primary:true}]};
     const invoice = {id:'invoice',invoiceNumber:'001',invoiceStatus:'past_due',amounts:{total:137,invoiceBalance:137},issuedDate:'2026-10-20',dueDate:'2026-10-31',client:{id:'owner'}};
     const contact = {id:'contact',locationId:'location',email:owner.email,phone:owner.phone,tags:['irrigation'],dndSettings:{SMS:{status:'inactive'},Email:{status:'inactive'}}};
-    const sql = [], calls = [];
+    const sql = [], calls = [], jobberBodies = []; let throttled = false;
     const tx = { $executeRawUnsafe:async s => sql.push(s), jobberAuth:{findFirst:async()=>({accessToken:'synthetic',expiresAt:new Date(at+910000)})},
       $queryRawUnsafe:async s => {sql.push(s);assert.match(s,/^\\/\\* notification-history:read-only \\*\\/\\s*SELECT/);return [];} };
     globalThis.prisma = { $transaction:async fn=>fn(tx), customer:{findMany:async q=>q.select._count ? quarantine.map(x=>({...x,_count:{jobs:0,invoices:0}})) : q.where ? [owner] : [owner,...quarantine]}, invoiceRecord:{findMany:async()=>[{jobberInvoiceId:'invoice'}]} };
@@ -285,13 +306,17 @@ test("fake bootstrap through actual deployed readers exhausts inventory and sour
       const url=String(input);calls.push([url,init.method,init.redirect]); let value;
       if(url==='https://api.getjobber.com/api/graphql') {
         assert.equal(init.method,'POST'); const {query:q,variables:v}=JSON.parse(init.body);assert.match(q,/^query/);
+        jobberBodies.push(init.body);
+        if(q.includes('VerifyExplicitIdentityCoverage') && !throttled) {
+          throttled=true; return new Response(JSON.stringify({errors:[{extensions:{code:'THROTTLED'}}],extensions:{cost:{requestedQueryCost:1000,actualQueryCost:0,throttleStatus:{maximumAvailable:10000,currentlyAvailable:0,restoreRate:500}}}}));
+        }
         let data;
         if(q.includes('NotificationInventoryInvoices')) data={invoices:page([invoice])};
         else if(q.includes('VerifyExplicitIdentityCoverage')) data={clients:page(q.includes('isArchived: false')?[fresh]:[])};
         else if(q.includes('VerifyQuarantinedIdentity')) data={client:null};
         else if(q.includes('VerifyDateOwnerInvoices')) data={client:{id:'owner',invoices:page([invoice])}};
         else data={client:fresh,invoice};
-        value={data:{account:{id:'account'},...data}};
+        value={data:{account:{id:'account'},...data},extensions:{cost:{requestedQueryCost:1000,actualQueryCost:1000,throttleStatus:{maximumAvailable:10000,currentlyAvailable:9000,restoreRate:500}}}};
       } else if(url==='https://services.leadconnectorhq.com/contacts/search') {
         assert.equal(init.method,'POST');assert.equal(init.redirect,'manual');assert.equal(JSON.parse(init.body).locationId,'location');value={contacts:[contact],total:1};
       } else if(url==='https://services.leadconnectorhq.com/contacts/contact') {
@@ -307,6 +332,7 @@ test("fake bootstrap through actual deployed readers exhausts inventory and sour
     const result=await coordinator({mode:'read-only',scope,runtime:()=>bootstrap(scope)}).run();
     assert.equal(result.state,'read_only_report',JSON.stringify(result));assert.equal(result.invoices[0].source,'verified_at_observation',JSON.stringify(result));
     assert.equal(result.invoices[0].channels.sms.readEligibility,'checks_passed_at_observation');assert.equal(result.invoices[0].channels.email.readEligibility,'checks_passed_at_observation');
+    assert.equal(throttled,true);assert.equal(jobberBodies[1],jobberBodies[2]);
     assert.equal(calls.filter(c=>c[0].endsWith('/contacts/search')).length,1);assert.ok(calls.some(c=>c[0].endsWith('/contacts/contact')&&c[2]==='manual'));
     assert.equal(calls.some(c=>c[0].includes('/conversations/messages')&&c[1]==='POST'),false);assert.equal(result.reservationsCreated,0);assert.equal(result.attempts,0);
   `;

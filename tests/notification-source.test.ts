@@ -158,10 +158,10 @@ test("39-second reads keep original identity time and distinct honest source/con
 
 test("final reread may replace stale source within original coverage but never renew at five minutes", () => withClock(async clock => {
   const f = fixture(), first = await f.read(), a = inspectNotificationSource(first);
-  clock.advance(61000); assert.throws(() => inspectNotificationSource(first), /expired/);
+  clock.advance(61000); assert.throws(() => inspectNotificationSource(first), /expired|PROBE_TIME_LIMIT/);
   const second = await refreshNotificationSource(first), b = inspectNotificationSource(second);
   assert.equal(b.identityExpiresAt, a.identityExpiresAt); assert.equal(b.identityObservedAt, a.identityObservedAt);
-  clock.advance(239000); await assert.rejects(refreshNotificationSource(second), /expired/);
+  clock.advance(239000); await assert.rejects(refreshNotificationSource(second), /expired|PROBE_TIME_LIMIT/);
 }));
 
 for (const phase of ["coverage", "source", "contact", "exact owner", "policy during read", "policy during refresh"]) test(`slow/expired ${phase} cannot launder old evidence`, () => withClock(async clock => {
@@ -172,13 +172,13 @@ for (const phase of ["coverage", "source", "contact", "exact owner", "policy dur
   if (phase === "policy during read") (f.io as any).storedInvoices = async () => { clock.advance(600000); return f.data.stored; };
   if (phase === "policy during refresh") {
     (f.request as any).expiresAt = new Date(NOW + 45000).toISOString(); f.request.identityCoveragePolicy.expiresAt = new Date(NOW + 45000).toISOString();
-    const h = await f.read(); clock.advance(45000); await assert.rejects(refreshNotificationSource(h), /expired/); return;
+    const h = await f.read(); clock.advance(45000); await assert.rejects(refreshNotificationSource(h), /expired|PROBE_TIME_LIMIT/); return;
   }
   if (phase === "exact owner") {
     (f.io as any).query = async (s: string, v: any) => { if (s.includes("VerifyNotificationExactOwner")) clock.advance(60000); return q(s, v); };
-    const h = await f.read(); clock.advance(1); await assert.rejects(refreshNotificationSource(h), /expired/); return;
+    const h = await f.read(); clock.advance(1); await assert.rejects(refreshNotificationSource(h), /expired|PROBE_TIME_LIMIT/); return;
   }
-  await assert.rejects(f.read(), /expired/);
+  await assert.rejects(f.read(), /expired|PROBE_TIME_LIMIT/);
 }));
 
 for (const kind of ["owner", "invoice owner", "invoice id", "account", "contacts", "paid", "new invoice", "due"]) test(`final ${kind} drift holds before composition`, () => withClock(async clock => {
@@ -371,12 +371,12 @@ for (const kind of ["cache", "counts"]) test(`slow final ${kind} read holds desp
   if (kind === "cache") (f.io as any).customers = async () => { if (slow) clock.advance(60000); return f.data.customers; };
   if (kind === "counts") (f.io as any).quarantineCounts = async () => { if (slow) clock.advance(60000); return f.data.counts; };
   const h = await f.read(); slow = true; clock.advance(1);
-  await assert.rejects(refreshNotificationSource(h), /cacheObservedAt.*expired|quarantineCountsObservedAt.*expired/);
+  await assert.rejects(refreshNotificationSource(h), /cacheObservedAt.*expired|quarantineCountsObservedAt.*expired|PROBE_TIME_LIMIT/);
 }));
 
 test("slow original cache read cannot be stamped fresh by later complete identity coverage", () => withClock(async clock => {
   const f = fixture(); (f.io as any).customers = async () => { clock.advance(60000); return f.data.customers; };
-  await assert.rejects(f.read(), /cacheObservedAt.*expired/);
+  await assert.rejects(f.read(), /cacheObservedAt.*expired|PROBE_TIME_LIMIT/);
 }));
 
 test("composing later cannot hide aged cache/count checks behind a younger source observation", () => withClock(async clock => {
@@ -384,7 +384,7 @@ test("composing later cannot hide aged cache/count checks behind a younger sourc
   (f.io as any).query = async (s: string, v: any) => { if (s.includes("VerifyExplicitIdentityCoverage") && s.includes("isArchived: false")) clock.advance(39000); return q(s, v); };
   const h = await f.read(), e = eventFor(inspectNotificationSource(h));
   clock.advance(21000);
-  assert.throws(() => composeNotificationEvidence(h, e, externalFor(e)), /expired/);
+  assert.throws(() => composeNotificationEvidence(h, e, externalFor(e)), /expired|PROBE_TIME_LIMIT/);
 }));
 
 async function withGhlConfig(run: () => Promise<void>) {

@@ -148,7 +148,7 @@ test("installed read-only cron traverses concrete config, service and runtime th
       if(url==='https://api.getjobber.com/api/graphql') {
         assert.equal(init.method,'POST'); const {query:q}=JSON.parse(init.body); assert.match(q,/^query/);
         const data = q.includes('NotificationInventoryInvoices') ? {invoices:page} : q.includes('VerifyExplicitIdentityCoverage') ? {clients:page} : {client:null};
-        value={data:{account:{id:'account'},...data}};
+        value={data:{account:{id:'account'},...data},extensions:{cost:{requestedQueryCost:357,actualQueryCost:357,throttleStatus:{maximumAvailable:10000,currentlyAvailable:9643,restoreRate:500}}}};
       } else if(url==='https://services.leadconnectorhq.com/contacts/search') {
         assert.equal(init.method,'POST'); assert.equal(init.redirect,'manual'); value={contacts:[],total:0};
       } else throw Error('unexpected provider operation');

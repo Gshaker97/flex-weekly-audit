@@ -1,7 +1,7 @@
 /** Explicit READ-ONLY orchestration. Import/default run never initializes application clients. */
 import { notificationModuleFunctions } from "./notification-module-interop";
 import type { ReviewedOmissionPolicy } from "./ghl-identity-coverage";
-import type { NotificationInventoryIO } from "./notification-inventory";
+import type { NotificationInventory, NotificationInventoryIO, NotificationInventoryFailure } from "./notification-inventory";
 import type { NotificationRecurringSourceIO } from "./notification-source";
 import type { NotificationHistoryIO } from "./notification-history";
 import type { GhlReadOnlyOptions } from "./notification-ghl-contract";
@@ -43,7 +43,8 @@ export type RecurringInvoiceReport = Readonly<{
 export type RecurringNotificationReport = Readonly<{
   state: "disabled" | "read_only_report" | "held"; holds: readonly string[];
   inventory: Readonly<{ coverage: "not_read" | "exhausted-query-result" | "partial-held"; pages: number; invoices: number;
-    defaultStatusScope: "unverified"; cacheOnlyInvoiceCount: null; cacheOnlyEligibility: "unknown_not_evaluated" }>;
+    defaultStatusScope: "unverified"; cacheOnlyInvoiceCount: null; cacheOnlyEligibility: "unknown_not_evaluated";
+    failure?: NotificationInventoryFailure }>;
   invoices: readonly RecurringInvoiceReport[];
   internalDigests: readonly Readonly<{ digestOrdinal: number; timing: NotificationWorklistTiming; invoiceOrdinals: readonly number[];
     holds: readonly string[] }>[];
@@ -138,11 +139,14 @@ export function createRecurringNotificationCoordinator(options: Readonly<{
           customers: guard(r.sourceIO.customers.bind(r.sourceIO)), contacts: guard(r.sourceIO.contacts.bind(r.sourceIO)),
           customer: guard(r.sourceIO.customer.bind(r.sourceIO)), contact: guard(r.sourceIO.contact.bind(r.sourceIO)),
           storedInvoices: guard(r.sourceIO.storedInvoices.bind(r.sourceIO)), quarantineCounts: guard(r.sourceIO.quarantineCounts.bind(r.sourceIO)),
-          query: guard(r.sourceIO.query.bind(r.sourceIO)) };
+          query: async <T = any>(statement: string, variables?: Record<string, any>, readOptions?: Readonly<{ deadlineAt?: number }>): Promise<T> => {
+            verify(); const value = await r.sourceIO.query<T>(statement, variables,
+              { deadlineAt: Math.min(deadline, readOptions?.deadlineAt ?? Infinity) }); verify(); return value;
+          } };
         const historyIO: NotificationHistoryIO = { ...r.history, now: () => new Date(Date.now()),
           get: guard(r.history.get.bind(r.history)), select: guard(r.history.select.bind(r.history)) };
-        const { readNotificationInventory, inspectNotificationInventory, planNotificationInventory, readDiscoveredNotificationSource } = notificationModuleFunctions(await import("./notification-inventory"),
-          ["readNotificationInventory", "inspectNotificationInventory", "planNotificationInventory", "readDiscoveredNotificationSource"]);
+        const { readNotificationInventory, inspectNotificationInventory, planNotificationInventory, readDiscoveredNotificationSource, notificationInventoryFailure } = notificationModuleFunctions(await import("./notification-inventory"),
+          ["readNotificationInventory", "inspectNotificationInventory", "planNotificationInventory", "readDiscoveredNotificationSource", "notificationInventoryFailure"]);
         const { readNotificationSourceBatch, inspectNotificationSource, inspectNotificationSourceDestinations } = notificationModuleFunctions(await import("./notification-source"),
           ["readNotificationSourceBatch", "inspectNotificationSource", "inspectNotificationSourceDestinations"]);
         const { createGhlReadOnlyReader } = notificationModuleFunctions(await import("./notification-ghl-contract"),
@@ -150,10 +154,16 @@ export function createRecurringNotificationCoordinator(options: Readonly<{
         const { readNotificationHistory, inspectNotificationHistory } = notificationModuleFunctions(await import("./notification-history"),
           ["readNotificationHistory", "inspectNotificationHistory"]);
         const contact = createGhlReadOnlyReader({ ...r.contact, fetch: guard(r.contact.fetch), now: () => new Date(Date.now()) });
-        verify(); const inventory = await readNotificationInventory(scope, inventoryIO), scan = inspectNotificationInventory(inventory);
+        verify(); let inventory: NotificationInventory;
+        try { inventory = await readNotificationInventory({ ...scope, expiresAt: new Date(deadline).toISOString() }, inventoryIO); }
+        catch (error) {
+          // Keep preflight failures fail-fast/not_read while retaining only safe diagnostic metadata.
+          result.inventory = { ...result.inventory, failure: notificationInventoryFailure(error) }; throw error;
+        }
+        const scan = inspectNotificationInventory(inventory);
         result.inventory = { coverage: scan.coverage === "complete-account-invoices" ? "exhausted-query-result" : "partial-held",
           pages: scan.pages, invoices: scan.invoiceCount, defaultStatusScope: "unverified", cacheOnlyInvoiceCount: null,
-          cacheOnlyEligibility: "unknown_not_evaluated" };
+          cacheOnlyEligibility: "unknown_not_evaluated", ...(scan.failure ? { failure: scan.failure } : {}) };
         // Preserve every discovered row even if population or any selected read later stalls.
         result.invoices = scan.rows.map((_, i) => pendingInvoice(i + 1));
         if (scan.coverage !== "complete-account-invoices") { result.state = "held"; result.holds = [...scan.holds]; return result; }

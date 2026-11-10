@@ -16,6 +16,7 @@ import type { GhlContact } from "./ghl";
 import type { jobberGraphQL } from "./jobber";
 import type { NotificationWorklistTagSnapshot } from "./notification-worklist";
 import type { JobberReader } from "../scripts/source-audit/transport";
+import { AuditFailure, LIMITS } from "../scripts/source-audit/core";
 import { GhlReadonlyReader } from "../scripts/ghl-preview/transport";
 import { readAllContacts } from "../scripts/ghl-preview/snapshot";
 
@@ -43,8 +44,18 @@ export type NotificationSourceIO = Readonly<{
   storedInvoices(ownerId: string): Promise<{ jobberInvoiceId: string }[]>;
   quarantineCounts(ids: string[]): Promise<CachedLinkCounts[]>;
   contacts(): Promise<GhlContact[]>;
-  query: typeof jobberGraphQL;
+  query: <T = any>(statement: string, variables?: Record<string, any>, options?: Readonly<{ deadlineAt?: number }>) => Promise<T>;
 }>;
+/** Pass the original proof/batch boundary through to the real transport's waits.
+ * The checks around the call also fail closed for injected IO that ignores options. */
+function boundedSourceQuery(query: NotificationSourceIO["query"], deadlineAt: number): NotificationSourceIO["query"] {
+  const begun = Date.now();
+  return async <T = any>(statement: string, variables?: Record<string, any>, options?: Readonly<{ deadlineAt?: number }>): Promise<T> => {
+    const deadline = Math.min(deadlineAt, options?.deadlineAt ?? Infinity);
+    const check = () => { if (!Number.isFinite(deadline) || Date.now() < begun || Date.now() >= deadline) throw new AuditFailure("PROBE_TIME_LIMIT"); };
+    check(); const result = await query<T>(statement, variables, { deadlineAt: deadline }); check(); return result;
+  };
+}
 declare const notificationSourceBrand: unique symbol;
 export type NotificationSourceHandle = Readonly<{ [notificationSourceBrand]: true }>;
 export type NotificationSourceSnapshot = Readonly<{
@@ -186,9 +197,14 @@ type Continuity = Pick<NotificationSourceSnapshot, "identityObservedAt" | "ident
 type Baseline = Omit<PrivateSnapshot, "snapshot">;
 async function readAndIssueSource(data: Baseline, continuity: Continuity): Promise<NotificationSourceHandle> {
   const { request: r, io, customers, identities, coverage } = data, s = r.scope, begun = Date.now();
+  const expires = Math.min(instant(continuity.identityExpiresAt), ...[begun,
+    instant(continuity.contactObservedAt), instant(continuity.exactOwnerObservedAt),
+    instant(continuity.cacheObservedAt), instant(continuity.quarantineCountsObservedAt)]
+    .map(observed => observed + PROPOSAL.maxProofAgeSeconds * 1000));
+  const sourceQuery = boundedSourceQuery(io.query, Math.min(expires, instant(r.expiresAt)));
   // Same trusted pagination as date readiness / paid-cycle, account checked on EVERY page.
   const query: typeof jobberGraphQL = async <T = any>(statement: string, variables?: Record<string, any>): Promise<T> => {
-    const result: any = await io.query(statement.replace("{", "{ account { id }")
+    const result: any = await sourceQuery(statement.replace("{", "{ account { id }")
       .replace("nodes { id invoiceStatus", "nodes { id invoiceNumber invoiceStatus"), variables);
     if (result?.account?.id !== r.identityCoveragePolicy.accountId)
       throw new Error("Notification invoice source account changed or unavailable");
@@ -222,10 +238,6 @@ async function readAndIssueSource(data: Baseline, continuity: Continuity): Promi
   // A retained snapshot must expire when ANY relied-on exact check expires, not only when
   // a caller happens to compose it. The unchanged account-wide proof still keeps its own
   // original five-minute bound; these final checks never extend or relabel that proof.
-  const expires = Math.min(instant(continuity.identityExpiresAt), ...[begun,
-    instant(continuity.contactObservedAt), instant(continuity.exactOwnerObservedAt),
-    instant(continuity.cacheObservedAt), instant(continuity.quarantineCountsObservedAt)]
-    .map(observed => observed + PROPOSAL.maxProofAgeSeconds * 1000));
   const proof = { observedAt: new Date(begun).toISOString(), expiresAt: new Date(expires).toISOString(),
     sourceRef: `notification-source-v1:${sourceRevision}` };
   validateRequest(r, io.locationId(), Date.now());
@@ -322,6 +334,7 @@ function batchData(handle: NotificationSourceBatch): BatchData {
 export async function readNotificationSourceBatch(policy: ReviewedOmissionPolicy, io: NotificationRecurringSourceIO): Promise<NotificationSourceBatch> {
   policy = structuredClone(policy); io = Object.freeze({ ...io });
   const begun = Date.now(), locationId = io.locationId();
+  io = Object.freeze({ ...io, query: boundedSourceQuery(io.query, Math.min(begun + 300000, instant(policy.expiresAt))) });
   if (!id(locationId) || typeof io.customer !== "function" || typeof io.contact !== "function")
     throw new Error("Exact recurring source bindings required");
   const customers = structuredClone(await io.customers()); customerIdentityKey(customers);
@@ -369,7 +382,9 @@ export function notificationBatchPolicy(handle: NotificationSourceBatch): Review
  * witnesses. No repeated full population read, no extension of their five-minute lifetime. */
 export async function readNotificationSourceFromBatch(handle: NotificationSourceBatch,
   request: NotificationRecurringSourceRequest): Promise<NotificationSourceHandle> {
-  const batch = batchData(handle), r = structuredClone(request), io = batch.io, s = r.scope;
+  const batch = batchData(handle), r = structuredClone(request), s = r.scope;
+  const io = Object.freeze({ ...batch.io, query: boundedSourceQuery(batch.io.query,
+    Math.min(instant(batch.expiresAt), instant(r.expiresAt), Date.now() + PROPOSAL.maxProofAgeSeconds * 1000)) });
   validateRequest(r, io.locationId(), Date.now());
   if (r.version !== 2 || s.locationId !== batch.locationId || sha(r.identityCoveragePolicy) !== sha(batch.policy) ||
       instant(r.expiresAt) > instant(batch.expiresAt)) throw new Error("Recurring request differs from original population batch");
@@ -501,7 +516,7 @@ function freezeTree<T>(value: T): T {
  * The cache/GHL reads are reused without adding a card/stage or mutation prerequisite. */
 export type NotificationCacheRead = <T>(read: (tx: Prisma.TransactionClient) => Promise<T>) => Promise<T>;
 export async function deployedNotificationSourceReadBindings(reader: Pick<JobberReader, "query">,
-  options: Readonly<{ fetch?: typeof fetch; cacheRead?: NotificationCacheRead }> = {}): Promise<NotificationSourceIO> {
+  options: Readonly<{ fetch?: typeof fetch; cacheRead?: NotificationCacheRead; notificationReadRateLimit?: true }> = {}): Promise<NotificationSourceIO> {
   const prismaModule = await import("./prisma");
   // The deployed tsx/CJS bridge may expose these under default. Validate without a query.
   const prisma: typeof import("./prisma").prisma = (prismaModule as any).prisma ?? (prismaModule as any).default?.prisma;
@@ -527,7 +542,11 @@ export async function deployedNotificationSourceReadBindings(reader: Pick<Jobber
       return result.contacts.map(c => ({ id: c.id, locationId: ghl.locationId, email: c.email, phone: c.phone,
         additionalEmails: c.additionalEmails.map(email => ({ email })), additionalPhones: c.additionalPhones.map(phone => ({ phone })) }));
     },
-    query: async <T = any>(statement: string, variables?: Record<string, any>): Promise<T> =>
-      await reader.query(statement, variables, { maxAttempts: 1, deadlineAt: Date.now() + PROPOSAL.maxProofAgeSeconds * 1000 }) as T,
+    query: async <T = any>(statement: string, variables?: Record<string, any>, readOptions?: Readonly<{ deadlineAt?: number }>): Promise<T> =>
+      await reader.query(statement, variables, {
+        maxAttempts: options.notificationReadRateLimit ? LIMITS.maxAttempts : 1,
+        deadlineAt: Math.min(readOptions?.deadlineAt ?? Infinity, Date.now() + PROPOSAL.maxProofAgeSeconds * 1000),
+        ...(options.notificationReadRateLimit ? { notificationReadRateLimit: true as const } : {}),
+      }) as T,
   });
 }

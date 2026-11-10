@@ -59,6 +59,7 @@ function fixture() {
 test("full account discovery feeds real planner, preserves multiple invoices and creates genuine exact capabilities", () => clock(async () => {
   const f = fixture(), inventory = await f.scan(), batch = await f.batch(), result = planNotificationInventory(inventory, batch);
   assert.equal(result.inventory.coverage, "complete-account-invoices"); assert.equal(result.inventory.invoiceCount, 3);
+  assert.equal(Object.hasOwn(result.inventory, "failure"), false);
   assert.deepEqual(result.excluded, [{ invoiceId: "old-paid", reasons: ["paid_no_reminder"] }]);
   assert.equal(result.worklist.homeowner.filter(row => row.dayPastDue === 10).length, 2);
   assert.equal(result.worklist.homeowner.every(row => row.dispatchEligible === false), true);
@@ -74,7 +75,11 @@ test("full account discovery feeds real planner, preserves multiple invoices and
   assert.equal(f.counts.customer, 2); assert.equal(f.counts.contact, 2);
   assert.equal(f.calls.filter(row => row.q.includes("VerifyExactCoverageOwnerInvoice")).length, 2);
   assert.equal(f.calls.filter(row => row.q.includes("VerifyDateOwnerInvoices")).length, 2);
-  assert.deepEqual(f.calls[0].options, { maxAttempts: 1, deadlineAt: NOW + 840000 });
+  assert.deepEqual(f.calls[0].options, { maxAttempts: 3, deadlineAt: NOW + 840000, notificationReadRateLimit: true });
+  assert.ok(f.calls.filter(row => row.q.includes("VerifyExplicitIdentityCoverage"))
+    .every(row => row.options.deadlineAt === NOW + 300000));
+  assert.ok(f.calls.filter(row => row.q.includes("VerifyExactCoverageOwnerInvoice") || row.q.includes("VerifyDateOwnerInvoices"))
+    .every(row => row.options.deadlineAt === NOW + 60000));
 }));
 
 test("fresh exact reread retains original population lifetime without full rescans", () => clock(async advance => {
@@ -119,6 +124,12 @@ for (const kind of ["account", "second-page-account", "duplicate-id", "missing-c
     const handle = await f.scan(), snapshot = inspectNotificationInventory(handle);
     assert.equal(snapshot.coverage, "partial-held"); assert.equal(snapshot.terminalPageObserved, false);
     assert.equal(snapshot.rows.length, 0); assert.equal(snapshot.holds.length, 1);
+    const expected: Record<string, string> = { account: "INVENTORY_ACCOUNT_CHANGED", "second-page-account": "INVENTORY_ACCOUNT_CHANGED",
+      "duplicate-id": "SOURCE_ID_REPEATED", "missing-cursor": "SOURCE_CURSOR_MISSING", "repeat-cursor": "SOURCE_CURSOR_REPEATED",
+      "empty-continuation": "SOURCE_EMPTY_CONTINUATION", "missing-pageinfo": "SOURCE_PAGE_MALFORMED", "oversize-page": "SOURCE_PAGE_OVERSIZE",
+      denial: "INVENTORY_UNEXPECTED_FAILURE", deadline: "INVENTORY_SCOPE_OR_DEADLINE", "location-drift": "INVENTORY_SCOPE_OR_DEADLINE" };
+    assert.equal(snapshot.failure?.code, expected[kind]);
+    if (kind === "duplicate-id") assert.deepEqual(snapshot.failure?.facts, { pages: 1, invoices: 25 });
     assert.equal(JSON.stringify(snapshot).includes("private text"), false);
     if (!["deadline", "location-drift"].includes(kind)) {
       const batch = await f.batch(); const result = planNotificationInventory(handle, batch);
@@ -148,6 +159,7 @@ test("source 12500-record ceiling holds overflow instead of certifying complete 
   const f = fixture(); f.data.invoices = Array.from({ length: 12501 }, (_, i) => f.invoice(`invoice-${i}`));
   const result = inspectNotificationInventory(await f.scan());
   assert.equal(result.coverage, "partial-held"); assert.equal(result.rows.length, 0); assert.equal(result.pages, 500);
+  assert.deepEqual(result.failure, { code: "SOURCE_PAGE_LIMIT", facts: { pages: 500, invoices: 12500 } });
 }));
 
 for (const [kind, mutate] of Object.entries({
@@ -239,7 +251,10 @@ test("slow exact reads cannot relabel stale cache/contact evidence or extend pop
   const f = fixture(), inventory = await f.scan(), batch = await f.batch(), original = f.sourceIO.contact;
   // The IO functions were frozen by batch creation; configure the delegate before creating a new batch.
   (f.sourceIO as any).contact = async (id: string) => { advance(60000); return original(id); };
-  const slowBatch = await f.batch(); await assert.rejects(readDiscoveredNotificationSource(inventory, slowBatch, "invoice-a"), /expired/);
+  const slowBatch = await f.batch(), priorOwnerReads = f.calls.filter(row => row.q.includes("VerifyDateOwnerInvoices")).length;
+  await assert.rejects(readDiscoveredNotificationSource(inventory, slowBatch, "invoice-a"), /PROBE_TIME_LIMIT/);
+  assert.equal(f.calls.filter(row => row.q.includes("VerifyDateOwnerInvoices")).length, priorOwnerReads,
+    "expired contact/cache evidence must prevent a later owner-invoice read");
   assert.equal(inspectNotificationSourceBatch(batch).expiresAt, new Date(NOW + 300000).toISOString());
 }));
 test("09:15 boundary is missed without catch-up even with new current source reads", () => clock(async advance => {
