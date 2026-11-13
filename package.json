@@ -8,7 +8,8 @@
     "start": "prisma migrate deploy && TZ=America/Phoenix next start -p ${PORT:-3000}",
     "sync:cron": "TZ=America/Phoenix tsx scripts/sync-cron.ts",
     "lint": "next lint",
-    "postinstall": "prisma generate"
+    "postinstall": "prisma generate",
+    "reminders:evaluate": "TZ=America/Phoenix tsx scripts/reminder-evaluate-cron.ts"
   },
   "dependencies": {
     "@prisma/client": "^5.22.0",

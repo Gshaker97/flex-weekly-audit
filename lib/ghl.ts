@@ -147,6 +147,43 @@ export interface GhlContact {
   additionalPhones?: Array<{ phone: string }> | null;
   email?: string | null;
   phone?: string | null;
+  tags?: string[] | null;
+  dnd?: boolean | null;
+}
+
+const lastTen = (value: string | null | undefined): string =>
+  (value ?? "").replace(/\D/g, "").slice(-10);
+
+/**
+ * Every contact matching this email or phone EXACTLY, de-duplicated by id.
+ *
+ * Read-only. Unlike findContactByEmail this never falls back to the first
+ * fuzzy result, because callers that must detect duplicate records need to see
+ * all of them rather than be handed an arbitrary one. Two or more results is a
+ * real answer: the destination is ambiguous.
+ */
+export async function findExactContactMatches(opts: {
+  email?: string | null;
+  phone?: string | null;
+}): Promise<GhlContact[]> {
+  const found = new Map<string, GhlContact>();
+  const email = (opts.email ?? "").trim();
+  const digits = lastTen(opts.phone);
+  const queries: Array<{ query: string; keep: (c: GhlContact) => boolean }> = [];
+  if (email) {
+    queries.push({ query: email, keep: c => (c.email ?? "").trim().toLowerCase() === email.toLowerCase() });
+  }
+  if (digits.length === 10) {
+    queries.push({ query: `+1${digits}`, keep: c => lastTen(c.phone) === digits });
+  }
+  for (const { query, keep } of queries) {
+    const params = new URLSearchParams({ locationId: ghlLocationId(), query, limit: "20" });
+    const data = await ghlFetch<{ contacts: GhlContact[] }>(`/contacts/?${params.toString()}`);
+    for (const contact of data.contacts ?? []) {
+      if (contact?.id && keep(contact)) found.set(contact.id, contact);
+    }
+  }
+  return [...found.values()];
 }
 
 // Read-only POST search contract, pinned to our 2021-07-28 API version:
