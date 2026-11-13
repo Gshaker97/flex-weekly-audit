@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import {
   evaluateReminders, summarizeReminderEvaluation, withinArizonaWindow, phoenixParts,
+  arizonaWindowPassed, DAY10_OWNED_BY_HOURLY_SENDER,
   type ReminderCandidate, type ReminderEvaluationReaders, type SourceInvoice,
 } from "../lib/reminder-evaluation";
 import { resolveServiceType, serviceTypeIsConfirmed } from "../lib/reminder-service-type";
@@ -240,17 +241,117 @@ for (const [name, exclusions] of Object.entries({
   });
 }
 
-test("exactly two distinct exclusion ids are required, and then day 10 can be eligible", async () => {
-  const plan = await run();
+// Due 2026-10-23 makes today day 21, the internal notice. It is the only
+// milestone this runner both owns and can clear, so it is the positive control.
+const day21 = () => readers({ readInvoice: async () => sourceInvoice({ issuedDate: "2026-10-16T16:04:57Z", dueDate: "2026-10-23T07:00:00Z" }) });
+
+test("exactly two distinct exclusion ids are required, and then an owned milestone can be eligible", async () => {
+  const plan = await run({ readers: day21() });
   assert.equal(plan.exclusionsVerified, true);
   const row = plan.rows[0];
   assert.equal(row.decision, "eligible", row.holds.join("; "));
-  assert.equal(row.milestoneDay, 10);
-  assert.equal(row.audience, "homeowner");
+  assert.equal(row.milestoneDay, 21);
+  assert.equal(row.audience, "internal");
   assert.equal(row.category, "irrigation");
   assert.equal(row.categorySource, "agreed");
   assert.deepEqual(row.holds, []);
   assert.equal(plan.sendsAttempted, 0, "eligible still means nothing was sent");
+});
+
+// --- Interlock: day 10 belongs to the hourly sender in lib/sync.ts ---
+
+test("day 10 is never eligible here, even with everything else verified and in window", async () => {
+  const plan = await run();
+  assert.equal(plan.exclusionsVerified, true, "exclusions are NOT the reason");
+  const row = plan.rows[0];
+  assert.equal(row.milestoneDay, DAY10_OWNED_BY_HOURLY_SENDER);
+  assert.notEqual(row.decision, "eligible");
+  assert.ok(row.holds.some(h => h.includes("owned_by_hourly_sender")), row.holds.join("; "));
+  assert.equal(plan.sendsAttempted, 0);
+});
+
+test("the day 10 interlock does not depend on the window, the flag or the exclusions", async () => {
+  for (const exclusions of [null, ["only-one"], TWO_EXCLUSIONS]) {
+    for (const now of [IN_WINDOW, OUT_OF_WINDOW]) {
+      const plan = await evaluateReminders({
+        candidates: [candidate()], readers: readers(), now,
+        verifiedExclusions: exclusions, ignoreWindow: true,
+      });
+      const row = plan.rows[0];
+      assert.notEqual(row.decision, "eligible", `${now.toISOString()} / ${exclusions}`);
+      assert.ok(row.holds.some(h => h.includes("owned_by_hourly_sender")), row.holds.join("; "));
+    }
+  }
+});
+
+test("the two senders cannot overlap: this runner owns no milestone the hourly sender owns", async () => {
+  // The hourly sender owns exactly day 10. Any row this runner calls eligible
+  // must therefore carry a different milestone day.
+  const plan = await run({ readers: day21() });
+  for (const row of plan.rows.filter(r => r.decision === "eligible")) {
+    assert.notEqual(row.milestoneDay, DAY10_OWNED_BY_HOURLY_SENDER);
+  }
+});
+
+// --- A milestone whose 09:00 window has already closed is skipped outright ---
+
+test("arizonaWindowPassed flips at 09:15 Phoenix and not before", () => {
+  const at = (iso: string) => arizonaWindowPassed(new Date(iso));
+  assert.equal(at("2026-11-13T15:59:59Z"), false, "08:59:59 Phoenix is before the window");
+  assert.equal(at("2026-11-13T16:00:00Z"), false, "09:00 Phoenix is inside it");
+  assert.equal(at("2026-11-13T16:14:59Z"), false, "09:14:59 Phoenix is inside it");
+  assert.equal(at("2026-11-13T16:15:00Z"), true, "09:15 Phoenix has passed");
+  assert.equal(at("2026-11-13T22:48:00Z"), true, "15:48 Phoenix has passed");
+});
+
+test("a review run after 09:15 marks today's milestone skipped, not pending exclusions", async () => {
+  const plan = await evaluateReminders({
+    candidates: [candidate()], readers: readers(), now: OUT_OF_WINDOW,
+    verifiedExclusions: null, ignoreWindow: true,
+  });
+  const row = plan.rows[0];
+  assert.equal(row.decision, "window_passed");
+  assert.equal(row.milestoneDay, 10);
+  assert.ok(row.holds.some(h => h.startsWith("window_passed_today:")), row.holds.join("; "));
+  assert.ok(row.holds.some(h => h.includes("never replayed")), row.holds.join("; "));
+  assert.ok(!row.holds.includes("exclusions_unverified"),
+    "a skipped milestone is not waiting on the exclusions: " + row.holds.join("; "));
+  assert.equal(plan.sendsAttempted, 0);
+});
+
+test("a skipped milestone names the next one instead of rescheduling itself", async () => {
+  const plan = await evaluateReminders({
+    candidates: [candidate()], readers: readers(), now: OUT_OF_WINDOW,
+    verifiedExclusions: TWO_EXCLUSIONS, ignoreWindow: true,
+  });
+  const row = plan.rows[0];
+  assert.equal(row.decision, "window_passed");
+  const next = row.holds.find(h => h.startsWith("next_milestone:"));
+  assert.ok(next, row.holds.join("; "));
+  assert.match(next!, /day 15 on 2026-11-18/);
+  assert.ok(!row.holds.some(h => h.includes("catch")), "no catch-up is proposed");
+});
+
+test("verified exclusions never revive a milestone whose window has closed", async () => {
+  const plan = await evaluateReminders({
+    candidates: [candidate()], readers: day21(), now: OUT_OF_WINDOW,
+    verifiedExclusions: TWO_EXCLUSIONS, ignoreWindow: true,
+  });
+  assert.equal(plan.exclusionsVerified, true);
+  assert.equal(plan.rows[0].decision, "window_passed", "owned, verified, in date - still skipped");
+  assert.equal(summarizeReminderEvaluation(plan).eligible, 0);
+  assert.equal(summarizeReminderEvaluation(plan).windowPassed, 1);
+});
+
+test("the scheduled runner after 09:15 produces no rows at all and no catch-up", async () => {
+  const plan = await evaluateReminders({
+    candidates: [candidate()], readers: readers(), now: OUT_OF_WINDOW,
+    verifiedExclusions: TWO_EXCLUSIONS,
+  });
+  assert.equal(plan.state, "outside_window");
+  assert.deepEqual(plan.rows, []);
+  assert.ok(plan.notes.includes("outside_arizona_window_no_catch_up"));
+  assert.equal(plan.sendsAttempted, 0);
 });
 
 test("a milestone that asserts a fee or policy is held until that evidence exists", async () => {
