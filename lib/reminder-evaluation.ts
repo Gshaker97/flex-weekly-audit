@@ -27,7 +27,7 @@ const OVERDUE_STAGE = "invoice overdue";
 export const ARIZONA_WINDOW_START_HOUR = 9;
 export const ARIZONA_WINDOW_MINUTES = 15;
 
-export type ReminderDecision = "eligible" | "held" | "not_due" | "no_longer_owes";
+export type ReminderDecision = "eligible" | "held" | "not_due" | "no_longer_owes" | "window_passed";
 
 export interface ReminderCandidate {
   jobberInvoiceId: string;
@@ -106,6 +106,20 @@ export function withinArizonaWindow(now: Date): boolean {
   const parts = phoenixParts(now);
   if (!parts) return false;
   return parts.hour === ARIZONA_WINDOW_START_HOUR && parts.minute < ARIZONA_WINDOW_MINUTES;
+}
+
+/**
+ * Day 10 is owned by the hourly sender wired into lib/sync.ts. This daily
+ * runner never sends it, so one milestone can never be sent by two schedules.
+ */
+export const DAY10_OWNED_BY_HOURLY_SENDER = 10;
+
+/** True once 09:15 Phoenix has passed on the current Phoenix day. */
+export function arizonaWindowPassed(now: Date): boolean {
+  const parts = phoenixParts(now);
+  if (!parts) return false;
+  return parts.hour > ARIZONA_WINDOW_START_HOUR ||
+    (parts.hour === ARIZONA_WINDOW_START_HOUR && parts.minute >= ARIZONA_WINDOW_MINUTES);
 }
 
 export async function evaluateReminders(input: {
@@ -239,6 +253,25 @@ export async function evaluateReminders(input: {
 
     row.milestoneDay = today.dayPastDue;
     row.audience = today.audience;
+
+    // Interlock with the hourly sender. Unconditional: not a flag, not a
+    // window, not dependent on either send path being enabled.
+    if (today.dayPastDue === DAY10_OWNED_BY_HOURLY_SENDER) {
+      holds.push(`day_${DAY10_OWNED_BY_HOURLY_SENDER}_owned_by_hourly_sender: this runner never sends it`);
+    }
+
+    // The 09:00 window already closed today. The milestone is skipped
+    // outright. It is not pending exclusions or anything else, and a
+    // later review run must never turn it back into a send.
+    if (arizonaWindowPassed(now)) {
+      holds.push(`window_passed_today: day ${today.dayPastDue} was scheduled for ` +
+        `${today.scheduledOn} 09:00 Phoenix and did not send; skipped, never replayed`);
+      const upcoming = milestones.find(step => step.timing === "future");
+      if (upcoming) holds.push(`next_milestone: day ${upcoming.dayPastDue} on ${upcoming.scheduledOn}`);
+      row.decision = "window_passed";
+      continue;
+    }
+
     if (today.requiredFacts.length) {
       // Day 15 and beyond assert a fee or policy. Those need invoice-bound
       // evidence and approved copy, neither of which this runner has.
@@ -258,7 +291,8 @@ export function summarizeReminderEvaluation(plan: ReminderEvaluationPlan) {
   return {
     state: plan.state, phoenixDate: plan.phoenixDate, candidates: plan.rows.length,
     eligible: count("eligible"), held: count("held"), notDue: count("not_due"),
-    noLongerOwes: count("no_longer_owes"), exclusionsVerified: plan.exclusionsVerified,
+    noLongerOwes: count("no_longer_owes"), windowPassed: count("window_passed"),
+    exclusionsVerified: plan.exclusionsVerified,
     sendsAttempted: plan.sendsAttempted,
   };
 }
