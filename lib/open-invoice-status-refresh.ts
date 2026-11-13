@@ -7,6 +7,16 @@ const KNOWN_STATUSES = new Set([...OPEN_STATUSES, "draft", "paid", "void", "bad_
 const BATCH_SIZE = 25;
 
 type ReadQuery = (query: string, variables: Record<string, string>) => Promise<unknown>;
+
+/**
+ * Second, independent release gate for the paid balance correction alone. Off by
+ * default and off unless the value is exactly "true". While it is off, this
+ * module behaves identically to the previous release, hold reasons included.
+ */
+export interface StatusRefreshOptions { paidBalanceCorrection?: boolean }
+export function paidBalanceCorrectionEnabled(env = process.env): boolean {
+  return env.JOBBER_PAID_BALANCE_CORRECTION_ENABLED === "true";
+}
 export interface OpenInvoiceSnapshot {
   id: string;
   jobberInvoiceId: string;
@@ -59,8 +69,12 @@ function cents(value: unknown): number | null {
  */
 export async function planOpenInvoiceStatusRefresh(
   cached: OpenInvoiceSnapshot[],
-  read: ReadQuery = jobberGraphQL
+  read: ReadQuery = jobberGraphQL,
+  options: StatusRefreshOptions = {}
 ): Promise<StatusRefreshPlan> {
+  // Snapshot the gate once for the whole plan. A batch is never half-corrected
+  // because the environment changed partway through a run.
+  const correctBalance = options.paidBalanceCorrection === true;
   const plan: StatusRefreshPlan = { checked: cached.length, updates: [], holds: [] };
   const ids = new Set<string>();
   const localIds = new Set<string>();
@@ -109,9 +123,14 @@ export async function planOpenInvoiceStatusRefresh(
           (OPEN_STATUSES.includes(source.invoiceStatus) && balance <= 0)) {
         hold("Conflicting or credit balance requires review"); continue;
       }
-      // A changed total means the invoice itself was re-issued or edited. That is
-      // more than this read covers, so it stays the full invoice sync's job.
-      if (total !== cents(invoice.total)) {
+      if (!correctBalance) {
+        // Previous release behaviour, retained verbatim while the gate is off.
+        if (total !== cents(invoice.total) || balance !== cents(invoice.amountDue)) {
+          hold("Amounts changed; requires full invoice sync, not a status-only correction"); continue;
+        }
+      } else if (total !== cents(invoice.total)) {
+        // A changed total means the invoice itself was re-issued or edited. That
+        // is more than this read covers, so it stays the full invoice sync's job.
         hold("Invoice total changed; requires full invoice sync, not a status correction"); continue;
       }
       if (!OPEN_STATUSES.includes(invoice.invoiceStatus ?? "")) {
@@ -124,6 +143,11 @@ export async function planOpenInvoiceStatusRefresh(
       const statusChanged = invoice.invoiceStatus !== source.invoiceStatus;
       const balanceChanged = balance !== cachedBalance;
       if (!statusChanged && !balanceChanged) continue;
+      if (!correctBalance) {
+        // The balance is already known unchanged here, so this is status-only.
+        plan.updates.push({ cached: invoice, invoiceStatus: source.invoiceStatus });
+        continue;
+      }
       // A balance that moved on its own may be a partial payment, a credit or a
       // line-item edit, none of which this narrow read can distinguish.
       if (!statusChanged) {
@@ -166,7 +190,9 @@ export async function refreshOpenInvoiceStatuses(): Promise<StatusRefreshPlan | 
       customer: { select: { jobberClientId: true } }, lastSyncedAt: true,
     },
   });
-  const plan = await planOpenInvoiceStatusRefresh(cached);
+  // Read once per run, before any correction is planned.
+  const correctBalance = paidBalanceCorrectionEnabled();
+  const plan = await planOpenInvoiceStatusRefresh(cached, jobberGraphQL, { paidBalanceCorrection: correctBalance });
   if (plan.updates.length) {
     await prisma.$transaction(async (tx) => {
       for (const correction of plan.updates) {
@@ -196,7 +222,7 @@ export async function refreshOpenInvoiceStatuses(): Promise<StatusRefreshPlan | 
       }
     }, { isolationLevel: "Serializable", timeout: 30000 });
   }
-  log(`[sync] open invoice status refresh: checked=${plan.checked} changed=${plan.updates.length} held=${plan.holds.length}`);
+  log(`[sync] open invoice status refresh: checked=${plan.checked} changed=${plan.updates.length} held=${plan.holds.length} paidBalanceCorrection=${correctBalance}`);
   // IDs/reasons only; no customer contact details or financial values in logs.
   for (const hold of plan.holds) log(`[sync] status refresh held ${hold.jobberInvoiceId}: ${hold.reason}`);
   return plan;
