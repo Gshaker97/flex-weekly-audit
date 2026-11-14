@@ -23,13 +23,14 @@ import type { NotificationLedger, NotificationOutcome } from "./notification-led
 export const PILOT_MILESTONE_DAY = 21;
 export const PILOT_AUDIENCE = "internal" as const;
 export const PILOT_CHANNEL = "email" as const;
-/** One email for the entire pilot. Not per run, not per day. */
+/** One email for the entire pilot. Not per run, not per day. Enforced by the
+ *  single durable allowance row below, not by counting. */
 export const PILOT_TOTAL_SEND_CAP = 1;
 
 export type PilotBlock =
   | "channel_not_email" | "audience_not_internal" | "milestone_not_day_21"
   | "destination_not_the_approved_internal_address" | "destination_is_a_customer_destination"
-  | "pilot_cap_already_used" | "pilot_allowance_lost_to_another_invoice" | "provider_not_fake"
+  | "pilot_allowance_already_spent" | "provider_not_fake"
   | "invoice_not_proven_new" | "day_21_not_due_by_the_jobber_due_date" | "ledger_refused";
 
 export type PilotResult =
@@ -53,23 +54,33 @@ export function assertFakeProvider(provider: unknown): FakeEmailProvider {
 }
 
 /**
- * The pilot's single allowance.
+ * The pilot's single allowance: ONE durable row, shared across every invoice,
+ * worker, contact and date.
  *
- * A plain count-then-reserve loses a race between two workers on DIFFERENT
- * invoices: their reservation keys differ, so the ledger admits both, and both
- * read a count of zero. So the allowance is claimed by arbitration AFTER
- * reserving: every worker reserves its own invoice, then asks which reservation
- * is the pilot's one. Exactly one is told "won"; the others stop before the
- * provider and leave their row at `reserved`, never pending, never sent.
+ * Sorting reservations by (createdAt, id) was not safe. A reservation is
+ * invisible to other transactions until it commits, so a worker that started
+ * earlier can commit later: the second worker reads only its own row, wins, and
+ * sends; then the first commits, sorts itself ahead, wins too, and sends again.
+ *
+ * So the allowance is not derived from the reservations at all. It is a single
+ * row whose primary key is a fixed literal, claimed with
+ * `INSERT ... ON CONFLICT DO NOTHING` in its own committed transaction. The
+ * index decides at commit time, so exactly one claim can ever succeed, whatever
+ * order anything else commits in.
+ *
+ * It is claimed BEFORE the provider is reachable, and once claimed it stays
+ * consumed: there is no update, delete, expiry or release path, so a crash, an
+ * uncertain outcome, or a restart on a later Phoenix date cannot spend it again.
  */
+export const PILOT_ALLOWANCE_KEY = "day21-internal-email-pilot";
+
 export interface PilotAllowance {
-  /** Pilot reservations in any state, for a cheap early exit. null means unreadable. */
-  countPilotReservations(): Promise<number | null>;
   /**
-   * Deterministic across workers: the earliest pilot reservation by
-   * (createdAt, id) wins. "unknown" on any read failure, which blocks.
+   * Must COMMIT before returning. "claimed" means this reservation holds the
+   * pilot's one allowance; "already_claimed" means someone else does; "unknown"
+   * means the claim could not be established, which is treated as not held.
    */
-  arbitrate(reservationId: string): Promise<"won" | "lost" | "unknown">;
+  claim(reservationId: string): Promise<"claimed" | "already_claimed" | "unknown">;
 }
 
 /* ---------- what proves an invoice is genuinely new ---------------------- */
@@ -213,13 +224,8 @@ export async function attemptDay21PilotEmail(input: {
       `day 21 is ${day21.timing} on ${day21.scheduledOn}, not today in Phoenix`);
   }
 
-  // The cap is counted across the whole pilot, in any state, so a reserved,
-  // pending, accepted, rejected or unknown row all use it up.
-  const used = await input.allowance.countPilotReservations();
-  if (used === null) return blocked("pilot_cap_already_used", "pilot reservation count unreadable; treated as used");
-  if (used >= PILOT_TOTAL_SEND_CAP) return blocked("pilot_cap_already_used", `${used} of ${PILOT_TOTAL_SEND_CAP} used`);
-
-  // Reserve BEFORE the provider is called. The unique key is the guarantee.
+  // Reserve BEFORE the provider is called. The unique key is the guarantee
+  // that two workers cannot both act on the SAME invoice and milestone.
   const reservation = await input.ledger.reserve({ event, body: input.body, destination: event.destination,
     channel: PILOT_CHANNEL, contactId: event.contactId, scheduledOn: input.scheduledOn });
   if (reservation.state !== "reserved") return blocked("ledger_refused", reservation.reason);
@@ -227,14 +233,15 @@ export async function attemptDay21PilotEmail(input: {
 
   if (!await input.ledger.assertReserved(handle)) return blocked("ledger_refused", "reservation did not verify");
 
-  // The allowance is decided here, after reserving and before anything can be
-  // sent. Two workers on different invoices both reserve; only one proceeds.
-  // The loser's row stays `reserved` for a person to see and is never advanced.
-  const claim = await input.allowance.arbitrate(handle.id);
-  if (claim !== "won") {
-    return blocked("pilot_allowance_lost_to_another_invoice", claim === "lost"
-      ? "another invoice holds the pilot's single allowance; this reservation stays reserved and unsent"
-      : "the allowance could not be arbitrated; treated as lost");
+  // The one allowance for the whole pilot, claimed and COMMITTED here: after
+  // reserving, before the provider is reachable. Two workers on different
+  // invoices both reserve, and exactly one of them can claim this. The other
+  // leaves its row at `reserved` for a person to see; it is never advanced.
+  const claim = await input.allowance.claim(handle.id);
+  if (claim !== "claimed") {
+    return blocked("pilot_allowance_already_spent", claim === "already_claimed"
+      ? `the pilot's one allowance (${PILOT_ALLOWANCE_KEY}) is already held; this reservation stays reserved and unsent`
+      : "the allowance claim could not be committed; treated as not held");
   }
 
   if (!await input.ledger.markPending(handle)) return blocked("ledger_refused", "could not move to pending");

@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import {
   attemptDay21PilotEmail, assertFakeProvider, invoiceIsProvenNew,
-  PILOT_TOTAL_SEND_CAP, PILOT_MILESTONE_DAY, PILOT_AUDIENCE, PILOT_CHANNEL,
+  PILOT_TOTAL_SEND_CAP, PILOT_MILESTONE_DAY, PILOT_AUDIENCE, PILOT_CHANNEL, PILOT_ALLOWANCE_KEY,
   type CutoverProof, type FakeEmailProvider, type InvoiceNoveltyInput, type PilotAllowance,
 } from "../lib/reminder-day21-pilot";
 import { invoiceReminderMilestones } from "../lib/invoice-reminder-clock";
@@ -71,13 +71,27 @@ const fake = (): FakeEmailProvider => ({ fake: true, name: "fake-email-provider"
   async send(input) { calls.push({ to: input.to, subject: input.subject });
     return { state: "accepted", providerMessageId: "fake-provider-id" }; } });
 
-/** Wins the allowance unless told otherwise. */
-const allowance = (over: Partial<PilotAllowance> = {}, used = 0): PilotAllowance => ({
-  async countPilotReservations() { return used; },
-  async arbitrate() { return "won"; },
-  ...over });
+/**
+ * One durable row, modelled the way the real table behaves: the first claim to
+ * commit wins and nothing can release it. `claims` is shared so several
+ * allowance objects contend over the same row.
+ */
+function sharedAllowance() {
+  const row: { holder: string | null } = { holder: null };
+  return {
+    row,
+    instance: (over: Partial<PilotAllowance> = {}): PilotAllowance => ({
+      async claim(reservationId) {
+        if (row.holder === null) { row.holder = reservationId; return "claimed"; }
+        return row.holder === reservationId ? "claimed" : "already_claimed";
+      },
+      ...over }),
+  };
+}
+const allowance = (over: Partial<PilotAllowance> = {}): PilotAllowance =>
+  sharedAllowance().instance(over);
 
-const attempt = (over: Partial<Parameters<typeof attemptDay21PilotEmail>[0]> = {}, used = 0) => {
+const attempt = (over: Partial<Parameters<typeof attemptDay21PilotEmail>[0]> = {}) => {
   const db = new MemoryDb();
   return attemptDay21PilotEmail({
     event: event(), body: BODY, subject: "Day 21 past due: Invoice #SYNTH-0001",
@@ -85,7 +99,7 @@ const attempt = (over: Partial<Parameters<typeof attemptDay21PilotEmail>[0]> = {
     customerDestinations: ["customer@example.invalid", "+16025550199"],
     novelty: novelty(), cutover: cutover(), now: NOW,
     ledger: createNotificationLedger(db),
-    allowance: allowance({}, used),
+    allowance: allowance(),
     provider: fake(), ...over });
 };
 const blockOf = (result: Awaited<ReturnType<typeof attempt>>) =>
@@ -137,12 +151,16 @@ test("a provider that is not explicitly fake is refused, and nothing is reserved
   assert.throws(() => assertFakeProvider({ name: "mailgun" }), /provider_not_fake/);
 });
 
-test("the cap is one for the whole pilot, and an unreadable count counts as used", async () => {
+test("the allowance is one durable claim for the whole pilot, with no release path", async () => {
   calls = [];
-  assert.equal(blockOf(await attempt({}, PILOT_TOTAL_SEND_CAP)), "pilot_cap_already_used");
-  assert.equal(blockOf(await attempt({}, 7)), "pilot_cap_already_used");
-  assert.equal(blockOf(await attempt({
-    allowance: allowance({ async countPilotReservations() { return null; } }) })), "pilot_cap_already_used");
+  assert.equal(PILOT_ALLOWANCE_KEY, "day21-internal-email-pilot");
+  // Already held by someone else.
+  assert.equal(blockOf(await attempt({ allowance: {
+    async claim() { return "already_claimed"; } } })), "pilot_allowance_already_spent");
+  // Could not be committed: treated as not held, never optimistically assumed.
+  const unknown = await attempt({ allowance: { async claim() { return "unknown"; } } });
+  assert.equal(blockOf(unknown), "pilot_allowance_already_spent");
+  if (unknown.state === "blocked") assert.match(unknown.detail, /could not be committed/);
   assert.equal(calls.length, 0);
 });
 
@@ -285,22 +303,15 @@ test("two different invoices on the same day: the ledger key alone stops the sec
 test("two different invoices the ledger does admit: only one claims the allowance", async () => {
   calls = [];
   const db = new MemoryDb();
+  const shared = sharedAllowance();
   // The internal contact id differs between the two runs - what would happen if
   // the recipient's contact were recreated - so neither unique key catches it
-  // and BOTH reservations succeed. The allowance is the only thing left.
-  const winner: { id: string | null } = { id: null };
-  const arbitrating = (): PilotAllowance => ({
-    async countPilotReservations() { return 0; },           // both start at zero
-    async arbitrate(reservationId) {
-      if (winner.id === null) winner.id = reservationId;      // first to ask wins
-      return winner.id === reservationId ? "won" : "lost";
-    },
-  });
+  // and BOTH reservations succeed. The single allowance row is all that is left.
   const results = await Promise.all([
-    attempt({ ledger: createNotificationLedger(db), allowance: arbitrating(),
+    attempt({ ledger: createNotificationLedger(db), allowance: shared.instance(),
       event: event({ invoiceId: "invoice-a", contactId: "angie-contact-1" }),
       novelty: novelty({ jobberInvoiceId: "invoice-a" }) }),
-    attempt({ ledger: createNotificationLedger(db), allowance: arbitrating(),
+    attempt({ ledger: createNotificationLedger(db), allowance: shared.instance(),
       event: event({ invoiceId: "invoice-b", contactId: "angie-contact-2" }),
       novelty: novelty({ jobberInvoiceId: "invoice-b" }) }),
   ]);
@@ -310,24 +321,46 @@ test("two different invoices the ledger does admit: only one claims the allowanc
     JSON.stringify(results));
   assert.equal(calls.length, 1, "exactly one fake provider call");
   const loser = results.find(result => result.state === "blocked");
-  assert.equal(loser && loser.state === "blocked" ? loser.block : null,
-    "pilot_allowance_lost_to_another_invoice");
-  // The loser's row is left reserved: never pending, never sent.
+  assert.equal(loser && loser.state === "blocked" ? loser.block : null, "pilot_allowance_already_spent");
   assert.equal(db.rows.filter(row => row.state === "pending").length, 0);
   assert.equal(db.rows.filter(row => row.state === "accepted").length, 1);
   assert.equal(db.rows.filter(row => row.state === "reserved").length, 1);
+  assert.ok(shared.row.holder, "the allowance row is held");
 });
 
-test("an allowance that cannot be arbitrated is treated as lost, with no send", async () => {
+test("a late-committing earlier reservation cannot overturn a committed claim", async () => {
   calls = [];
   const db = new MemoryDb();
-  const result = await attempt({ ledger: createNotificationLedger(db),
-    allowance: allowance({ async arbitrate() { return "unknown"; } }) });
-  assert.equal(blockOf(result), "pilot_allowance_lost_to_another_invoice");
-  if (result.state === "blocked") assert.match(result.detail, /could not be arbitrated/);
-  assert.equal(calls.length, 0);
-  assert.equal(db.rows.length, 1);
-  assert.equal(db.rows[0].state, "reserved", "reserved, never advanced");
+  const shared = sharedAllowance();
+  // Worker B commits and claims first. Worker A started earlier and commits
+  // afterwards; under the old (createdAt, id) sort it would have sorted ahead
+  // and sent a second email. The claim row does not care about ordering.
+  const b = await attempt({ ledger: createNotificationLedger(db), allowance: shared.instance(),
+    event: event({ invoiceId: "invoice-b", contactId: "angie-contact-2" }),
+    novelty: novelty({ jobberInvoiceId: "invoice-b" }) });
+  assert.equal(b.state, "sent_to_fake_provider");
+  const a = await attempt({ ledger: createNotificationLedger(db), allowance: shared.instance(),
+    event: event({ invoiceId: "invoice-a", contactId: "angie-contact-1" }),
+    novelty: novelty({ jobberInvoiceId: "invoice-a" }) });
+  assert.equal(blockOf(a), "pilot_allowance_already_spent");
+  assert.equal(calls.length, 1);
+});
+
+test("a later Phoenix date cannot spend the allowance again", async () => {
+  calls = [];
+  const db = new MemoryDb();
+  const shared = sharedAllowance();
+  assert.equal((await attempt({ ledger: createNotificationLedger(db), allowance: shared.instance() })).state,
+    "sent_to_fake_provider");
+  // A different invoice, a different internal contact, and a day 21 a week
+  // later: nothing it shares with the first run except the allowance.
+  const later = await attempt({
+    ledger: createNotificationLedger(db), allowance: shared.instance(),
+    event: event({ invoiceId: "invoice-next-week", contactId: "angie-contact-9", dueDate: "2026-11-30" }),
+    novelty: novelty({ jobberInvoiceId: "invoice-next-week" }),
+    scheduledOn: "2026-12-21", now: new Date("2026-12-21T16:05:00Z") });
+  assert.equal(blockOf(later), "pilot_allowance_already_spent");
+  assert.equal(calls.length, 1, "still exactly one fake provider call");
 });
 
 test("the allowance is decided after reserving and before the provider is called", async () => {
@@ -336,12 +369,40 @@ test("the allowance is decided after reserving and before the provider is called
   const db = new MemoryDb();
   await attempt({
     ledger: createNotificationLedger(db),
-    allowance: { async countPilotReservations() { order.push("count"); return 0; },
-      async arbitrate() { order.push("arbitrate"); return "won"; } },
+    allowance: { async claim() { order.push("claim"); return "claimed"; } },
     provider: { fake: true, name: "fake-email-provider",
       async send() { order.push("provider"); calls.push({ to: APPROVED, subject: "x" });
         return { state: "accepted", providerMessageId: "fake-provider-id" }; } },
   });
-  assert.deepEqual(order, ["count", "arbitrate", "provider"]);
+  assert.deepEqual(order, ["claim", "provider"], "the allowance commits before the provider is reachable");
   assert.equal(calls.length, 1);
+});
+
+test("the allowance migration is a local candidate with no release path", () => {
+  const migration = readFileSync(new URL(
+    "../prisma/migrations/20261114000000_day21_pilot_allowance_candidate/migration.sql", import.meta.url), "utf8");
+  assert.match(migration, /LOCAL CANDIDATE\. DO NOT DEPLOY/);
+  assert.match(migration, /CREATE TABLE "Day21PilotAllowance"/);
+  assert.match(migration, /PRIMARY KEY \("id"\)/);
+  // One row, ever: the key is a fixed literal shared by every worker.
+  assert.match(migration, /CHECK \("id" = 'day21-internal-email-pilot'\)/);
+  assert.equal(migration.includes(PILOT_ALLOWANCE_KEY), true);
+  // No way for code to give it back. Comments are stripped first, so the
+  // check is about statements, not about prose describing them.
+  const statements = migration.replace(/^\s*--.*$/gm, "");
+  for (const forbidden of [/\bDELETE\s+FROM\b/i, /\bUPDATE\s+"/i, /\bTRUNCATE\b/i,
+    /\bDROP\b/i, /expiresAt/i, /releasedAt/i, /\bON DELETE\b/i])
+    assert.equal(forbidden.test(statements), false, String(forbidden));
+});
+
+test("the pilot module exposes nothing that could release the allowance", () => {
+  const source = readFileSync(new URL("../lib/reminder-day21-pilot.ts", import.meta.url), "utf8");
+  // Strip comments: the module explains that there is no release path, and the
+  // word appearing in that explanation is not a release path.
+  const code = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+  for (const forbidden of [/\bDELETE\b/i, /\bUPDATE\b/i, /\bTRUNCATE\b/i,
+    /\brelease\s*\(/i, /\breset\s*\(/i, /\bexpire\s*\(/i, /\breopen\s*\(/i])
+    assert.equal(forbidden.test(code), false, String(forbidden));
+  // The allowance interface has exactly one method, and it only ever claims.
+  assert.match(code, /interface PilotAllowance \{\s*claim\(reservationId: string\)[^}]*\}/);
 });
