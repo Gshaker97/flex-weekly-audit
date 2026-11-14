@@ -19,6 +19,13 @@ import { resolveServiceType, serviceTypeIsConfirmed, type ServiceTypeResolution 
  *  - Two or more exactly-matching destination contacts hold. Nothing is merged.
  *  - The two reviewed exclusions must be verified before anything is reported as
  *    sendable, independently of every other check.
+ *  - A reminder GoHighLevel already sent is suppressed per channel, keyed on the
+ *    exact triple (this invoice, today's milestone day, channel). Attribution is
+ *    stated by the reader, never inferred from due-date arithmetic. A reminder
+ *    for a different invoice suppresses nothing. Ambiguous attribution, an
+ *    unconfirmed attempt, an unknown channel or milestone, history that could
+ *    not be read in full, and history that could not be read at all all hold.
+ *    Missing history is unknown history, never "nothing was sent".
  */
 const OPEN_STATUSES = new Set(["awaiting_payment", "past_due"]);
 const SETTLED_STATUSES = new Set(["paid", "void", "bad_debt"]);
@@ -56,12 +63,46 @@ export interface DestinationContact {
 }
 export interface DestinationCard { id: string; stage: string | null; status: string | null }
 
+export type SendChannel = "email" | "sms";
+
+/**
+ * One message GoHighLevel (or anything else) may already have sent.
+ *
+ * `attribution` is the only thing that ties a message to an invoice, and it is
+ * stated by the reader, never inferred here from due-date arithmetic:
+ *  - "exact"         the enrollment or message evidence names THIS invoice
+ *  - "other_invoice" the evidence names a DIFFERENT invoice; it suppresses nothing
+ *  - "ambiguous"     the evidence cannot be tied to one invoice; it holds
+ * `confirmed` is false when it is not certain the message actually went out.
+ */
+export interface PriorSend {
+  messageId: string;
+  channel: SendChannel | null;
+  milestoneDay: number | null;
+  attribution: "exact" | "other_invoice" | "ambiguous";
+  confirmed: boolean;
+}
+
+/** `complete` false means the history could not be read in full. That holds. */
+export interface SendHistory {
+  complete: boolean;
+  incompleteReason?: string | null;
+  sends: readonly PriorSend[];
+}
+
 export interface ReminderEvaluationReaders {
   /** Fresh single-invoice source read. null means unreadable, which holds. */
   readInvoice(jobberInvoiceId: string): Promise<SourceInvoice | null>;
   /** EVERY exactly-matching contact, so ambiguity is visible rather than guessed away. */
   matchContacts(candidate: ReminderCandidate): Promise<readonly DestinationContact[]>;
   cardsForContact(contactId: string): Promise<readonly DestinationCard[]>;
+  /**
+   * Everything already sent for this invoice's owner. OPTIONAL on the type so
+   * existing callers still compile, but a caller that omits it gets a hold on
+   * every milestone: missing history is treated as unknown history, never as
+   * "nothing was sent".
+   */
+  sendHistory?(candidate: ReminderCandidate): Promise<SendHistory | null>;
 }
 
 export interface ReminderEvaluationRow {
@@ -77,6 +118,8 @@ export interface ReminderEvaluationRow {
   balanceCents: number | null;
   milestoneDay: number | null;
   audience: string | null;
+  /** Per-channel outcome for today's milestone. Empty when no milestone is due. */
+  channels: { channel: SendChannel; decision: "eligible" | "suppressed"; reason: string | null }[];
 }
 export interface ReminderEvaluationPlan {
   mode: "evaluate";
@@ -130,6 +173,11 @@ export async function evaluateReminders(input: {
   verifiedExclusions?: readonly string[] | null;
   /** Only a manual review may ignore the window. The scheduled runner never does. */
   ignoreWindow?: boolean;
+  /**
+   * Which channels a milestone would use. Supplied by the caller on purpose:
+   * this module does not decide channel policy. Absent, null or empty holds.
+   */
+  milestoneChannels?(step: { dayPastDue: number; audience: string }): readonly SendChannel[] | null;
 }): Promise<ReminderEvaluationPlan> {
   const { candidates, readers, now } = input;
   const parts = phoenixParts(now);
@@ -166,6 +214,7 @@ export async function evaluateReminders(input: {
       clientName: candidate.clientName, decision: "held", holds,
       category: null, categorySource: null, categoryEvidence: null,
       daysPastDue: null, balanceCents: null, milestoneDay: null, audience: null,
+      channels: [],
     };
     rows.push(row);
 
@@ -272,6 +321,58 @@ export async function evaluateReminders(input: {
       continue;
     }
 
+    // ----- prior-send suppression -------------------------------------------
+    // Keyed on the exact triple (this invoice, today's milestone day, channel).
+    // A reminder for a DIFFERENT invoice suppresses nothing. Anything the
+    // history cannot state with certainty holds the whole row.
+    const declared = input.milestoneChannels?.({ dayPastDue: today.dayPastDue, audience: today.audience }) ?? null;
+    const channels = Array.isArray(declared)
+      ? [...new Set(declared.filter((value): value is SendChannel => value === "email" || value === "sms"))]
+      : [];
+    if (channels.length === 0) {
+      holds.push("milestone_channels_undeclared: no channel policy supplied for this milestone");
+    }
+
+    const history = readers.sendHistory ? await readers.sendHistory(candidate) : null;
+    if (!history) {
+      holds.push("send_history_unavailable: cannot prove this milestone was not already sent");
+    } else {
+      if (!history.complete) {
+        holds.push(`send_history_incomplete: ${history.incompleteReason || "history could not be read in full"}`);
+      }
+      // "other_invoice" is dropped here and nowhere else: that is the one case
+      // that must never suppress this invoice's reminder.
+      const relevant = history.sends.filter(send => send.attribution !== "other_invoice");
+      for (const send of relevant) {
+        if (send.attribution === "ambiguous") {
+          holds.push(`ambiguous_send_attribution: ${send.messageId} cannot be tied to one invoice`);
+          continue;
+        }
+        if (!send.confirmed) {
+          holds.push(`uncertain_send_attempt: ${send.messageId} may or may not have gone out`);
+          continue;
+        }
+        if (send.channel === null || send.milestoneDay === null) {
+          holds.push(`send_detail_unknown: ${send.messageId} has no ${send.channel === null ? "channel" : "milestone day"}`);
+        }
+      }
+      const suppressing = new Map<SendChannel, string>();
+      for (const send of relevant) {
+        if (send.attribution !== "exact" || !send.confirmed) continue;
+        if (send.channel === null || send.milestoneDay !== today.dayPastDue) continue;
+        if (!suppressing.has(send.channel)) suppressing.set(send.channel, send.messageId);
+      }
+      row.channels = channels.map(channel => suppressing.has(channel)
+        ? { channel, decision: "suppressed" as const,
+            reason: `already_sent_by_ghl: day ${today.dayPastDue} ${channel} as ${suppressing.get(channel)}` }
+        : { channel, decision: "eligible" as const, reason: null });
+      if (channels.length > 0 && row.channels.every(entry => entry.decision === "suppressed")) {
+        holds.push(`already_sent_all_channels: day ${today.dayPastDue} ` +
+          `(${row.channels.map(entry => `${entry.channel}=${suppressing.get(entry.channel)}`).join(", ")})`);
+      }
+    }
+    // ------------------------------------------------------------------------
+
     if (today.requiredFacts.length) {
       // Day 15 and beyond assert a fee or policy. Those need invoice-bound
       // evidence and approved copy, neither of which this runner has.
@@ -292,6 +393,8 @@ export function summarizeReminderEvaluation(plan: ReminderEvaluationPlan) {
     state: plan.state, phoenixDate: plan.phoenixDate, candidates: plan.rows.length,
     eligible: count("eligible"), held: count("held"), notDue: count("not_due"),
     noLongerOwes: count("no_longer_owes"), windowPassed: count("window_passed"),
+    channelsSuppressed: plan.rows.reduce((total, row) =>
+      total + row.channels.filter(entry => entry.decision === "suppressed").length, 0),
     exclusionsVerified: plan.exclusionsVerified,
     sendsAttempted: plan.sendsAttempted,
   };

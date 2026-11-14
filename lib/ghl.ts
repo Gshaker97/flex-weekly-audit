@@ -499,6 +499,60 @@ export async function getOutboundSms(contactId: string): Promise<GhlOutboundSms[
 }
 
 
+export interface GhlOutboundMessage {
+  id: string;
+  channel: "email" | "sms";
+  dateAdded: Date;
+  body: string;
+}
+
+/**
+ * Every outbound email and SMS for a contact, with the message id, plus whether
+ * the history was read IN FULL. `complete: false` means a conversation hit the
+ * page cap or a message was unusable, and the caller must hold rather than
+ * conclude that nothing was sent. Read-only.
+ */
+export async function getOutboundMessages(
+  contactId: string
+): Promise<{ complete: boolean; incompleteReason: string | null; messages: GhlOutboundMessage[] }> {
+  const loc = encodeURIComponent(ghlLocationId());
+  const conv = await ghlFetch<{ conversations: GhlConversation[] }>(
+    `/conversations/search?locationId=${loc}&contactId=${encodeURIComponent(contactId)}`
+  );
+  const messages: GhlOutboundMessage[] = [];
+  const reasons: string[] = [];
+  const PAGE_CAP = 10;
+
+  for (const c of conv.conversations ?? []) {
+    let lastMessageId: string | undefined;
+    let page = 0;
+    for (; page < PAGE_CAP; page += 1) {
+      const qs = lastMessageId ? `?lastMessageId=${encodeURIComponent(lastMessageId)}` : "";
+      const data = await ghlFetch<{
+        messages: { messages: (GhlMessage & { id?: string })[]; nextPage?: boolean; lastMessageId?: string };
+      }>(`/conversations/${encodeURIComponent(c.id)}/messages${qs}`);
+      const block = data.messages;
+      for (const m of block?.messages ?? []) {
+        if (m.direction !== "outbound") continue;
+        const channel = m.messageType === "TYPE_SMS" ? "sms"
+          : m.messageType === "TYPE_EMAIL" ? "email" : null;
+        if (!channel) continue;
+        const when = m.dateAdded ? new Date(m.dateAdded) : null;
+        if (!m.id || !when || Number.isNaN(when.getTime())) {
+          reasons.push(`unusable outbound message in conversation ${c.id}`);
+          continue;
+        }
+        messages.push({ id: m.id, channel, dateAdded: when, body: m.body ?? "" });
+      }
+      if (!block?.nextPage || !block?.lastMessageId) break;
+      lastMessageId = block.lastMessageId;
+    }
+    if (page >= PAGE_CAP) reasons.push(`conversation ${c.id} reached the ${PAGE_CAP}-page read cap`);
+  }
+  messages.sort((a, b) => b.dateAdded.getTime() - a.dateAdded.getTime());
+  return { complete: reasons.length === 0, incompleteReason: reasons.length ? reasons.join("; ") : null, messages };
+}
+
 /** Exactly one attempt. A 200 succeeded acknowledgment is NOT terminal proof. */
 export async function removeContactFromWorkflowOnce(contactId: string, workflowId: string): Promise<{ httpStatus: 200; succeeded: true }> {
   if (![contactId,workflowId].every(id => typeof id === "string" && /^[A-Za-z0-9_-]{1,512}$/.test(id)))

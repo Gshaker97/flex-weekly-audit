@@ -5,6 +5,7 @@ import {
   evaluateReminders, summarizeReminderEvaluation, withinArizonaWindow, phoenixParts,
   arizonaWindowPassed, DAY10_OWNED_BY_HOURLY_SENDER,
   type ReminderCandidate, type ReminderEvaluationReaders, type SourceInvoice,
+  type PriorSend, type SendChannel,
 } from "../lib/reminder-evaluation";
 import { resolveServiceType, serviceTypeIsConfirmed } from "../lib/reminder-service-type";
 
@@ -33,11 +34,22 @@ function readers(patch: Partial<ReminderEvaluationReaders> = {}): ReminderEvalua
     readInvoice: async () => sourceInvoice(),
     matchContacts: async () => [{ id: "synthetic-contact", tags: ["irrigation"], dnd: false, phone: "+14805550100", email: "synthetic@example.test" }],
     cardsForContact: async () => [{ id: "synthetic-card", stage: "invoice overdue", status: "open" }],
+    // Default: history read in full, nothing sent. Overridden per test.
+    sendHistory: async () => ({ complete: true, sends: [] }),
     ...patch,
   };
 }
+
+/** Day 21 is the one milestone that uses two channels in the live ladder. */
+const CHANNELS = (step: { dayPastDue: number; audience: string }): readonly SendChannel[] =>
+  step.dayPastDue === 21 ? ["email", "sms"] : ["sms"];
+function priorSend(patch: Partial<PriorSend> = {}): PriorSend {
+  return { messageId: "synthetic-message", channel: "email", milestoneDay: 21,
+    attribution: "exact", confirmed: true, ...patch };
+}
 const run = (opts: Partial<Parameters<typeof evaluateReminders>[0]> = {}) => evaluateReminders({
-  candidates: [candidate()], readers: readers(), now: IN_WINDOW, verifiedExclusions: TWO_EXCLUSIONS, ...opts,
+  candidates: [candidate()], readers: readers(), now: IN_WINDOW, verifiedExclusions: TWO_EXCLUSIONS,
+  milestoneChannels: CHANNELS, ...opts,
 });
 
 // --- The 09:00 America/Phoenix window, and no catch-up ---
@@ -407,4 +419,176 @@ test("every run is recorded, including one that evaluated nothing", async () => 
   assert.equal(summary.state, "outside_window");
   assert.equal(summary.candidates, 0);
   assert.equal(summary.phoenixDate, "2026-11-13", "the date is still recorded so an absent row means it did not run");
+});
+
+// --- Prior-send suppression -------------------------------------------------
+// Each case is separate on purpose. The key is the exact triple
+// (this invoice, today's milestone day, channel). Nothing here infers a match
+// from due-date arithmetic.
+
+const hold = (row: { holds: string[] }, prefix: string) =>
+  row.holds.find(entry => entry.startsWith(prefix)) ?? null;
+
+test("complete history with no matching send lets an otherwise eligible invoice through", async () => {
+  const plan = await run({ readers: readers({
+    ...day21(),
+    sendHistory: async () => ({ complete: true, sends: [] }) }) });
+  const row = plan.rows[0];
+  assert.equal(row.decision, "eligible", row.holds.join("; "));
+  assert.deepEqual(row.holds, []);
+  assert.deepEqual(row.channels, [
+    { channel: "email", decision: "eligible", reason: null },
+    { channel: "sms", decision: "eligible", reason: null },
+  ]);
+  assert.equal(summarizeReminderEvaluation(plan).channelsSuppressed, 0);
+  assert.equal(plan.sendsAttempted, 0);
+});
+
+test("a confirmed Day 21 EMAIL already sent suppresses the email and leaves the SMS", async () => {
+  const plan = await run({ readers: readers({
+    ...day21(),
+    sendHistory: async () => ({ complete: true, sends: [priorSend({ channel: "email", messageId: "FkwjbLJWmbn7USYDJ7fP" })] }) }) });
+  const row = plan.rows[0];
+  assert.deepEqual(row.channels, [
+    { channel: "email", decision: "suppressed",
+      reason: "already_sent_by_ghl: day 21 email as FkwjbLJWmbn7USYDJ7fP" },
+    { channel: "sms", decision: "eligible", reason: null },
+  ]);
+  assert.equal(hold(row, "already_sent_all_channels"), null, "the SMS is still open");
+  assert.equal(plan.sendsAttempted, 0);
+});
+
+test("a confirmed Day 21 SMS already sent suppresses the SMS and leaves the email", async () => {
+  const plan = await run({ readers: readers({
+    ...day21(),
+    sendHistory: async () => ({ complete: true, sends: [priorSend({ channel: "sms", messageId: "synthetic-sms-1" })] }) }) });
+  const row = plan.rows[0];
+  assert.deepEqual(row.channels, [
+    { channel: "email", decision: "eligible", reason: null },
+    { channel: "sms", decision: "suppressed",
+      reason: "already_sent_by_ghl: day 21 sms as synthetic-sms-1" },
+  ]);
+  assert.equal(hold(row, "already_sent_all_channels"), null);
+});
+
+test("both channels already sent holds the whole row", async () => {
+  const plan = await run({ readers: readers({
+    ...day21(),
+    sendHistory: async () => ({ complete: true, sends: [
+      priorSend({ channel: "email", messageId: "synthetic-email-1" }),
+      priorSend({ channel: "sms", messageId: "synthetic-sms-1" })] }) }) });
+  const row = plan.rows[0];
+  assert.equal(row.decision, "held");
+  assert.equal(hold(row, "already_sent_all_channels"),
+    "already_sent_all_channels: day 21 (email=synthetic-email-1, sms=synthetic-sms-1)");
+  assert.equal(summarizeReminderEvaluation(plan).channelsSuppressed, 2);
+  assert.equal(summarizeReminderEvaluation(plan).eligible, 0);
+});
+
+test("a different invoice's reminder suppresses nothing", async () => {
+  const plan = await run({ readers: readers({
+    ...day21(),
+    sendHistory: async () => ({ complete: true, sends: [
+      // Same owner, same milestone day, same channels - but a DIFFERENT invoice.
+      priorSend({ channel: "email", messageId: "other-email", attribution: "other_invoice" }),
+      priorSend({ channel: "sms", messageId: "other-sms", attribution: "other_invoice" })] }) }) });
+  const row = plan.rows[0];
+  assert.equal(row.decision, "eligible", row.holds.join("; "));
+  assert.deepEqual(row.holds, []);
+  assert.deepEqual(row.channels.map(entry => entry.decision), ["eligible", "eligible"]);
+});
+
+test("a send for a different milestone day does not suppress today's", async () => {
+  const plan = await run({ readers: readers({
+    ...day21(),
+    sendHistory: async () => ({ complete: true, sends: [priorSend({ milestoneDay: 15, channel: "sms" })] }) }) });
+  const row = plan.rows[0];
+  assert.equal(row.decision, "eligible", row.holds.join("; "));
+  assert.deepEqual(row.channels.map(entry => entry.decision), ["eligible", "eligible"]);
+});
+
+test("ambiguous attribution holds, and never suppresses silently", async () => {
+  const plan = await run({ readers: readers({
+    ...day21(),
+    sendHistory: async () => ({ complete: true, sends: [priorSend({ attribution: "ambiguous", messageId: "amb-1" })] }) }) });
+  const row = plan.rows[0];
+  assert.equal(row.decision, "held");
+  assert.equal(hold(row, "ambiguous_send_attribution"),
+    "ambiguous_send_attribution: amb-1 cannot be tied to one invoice");
+  assert.deepEqual(row.channels.map(entry => entry.decision), ["eligible", "eligible"],
+    "an ambiguous message is not treated as proof of a send either way");
+});
+
+test("an uncertain send attempt holds", async () => {
+  const plan = await run({ readers: readers({
+    ...day21(),
+    sendHistory: async () => ({ complete: true, sends: [priorSend({ confirmed: false, messageId: "maybe-1" })] }) }) });
+  const row = plan.rows[0];
+  assert.equal(row.decision, "held");
+  assert.equal(hold(row, "uncertain_send_attempt"),
+    "uncertain_send_attempt: maybe-1 may or may not have gone out");
+  assert.equal(row.channels.find(entry => entry.channel === "email")?.decision, "eligible",
+    "an unconfirmed attempt is not counted as a send");
+});
+
+test("incomplete history holds and names the reason", async () => {
+  const plan = await run({ readers: readers({
+    ...day21(),
+    sendHistory: async () => ({ complete: false, incompleteReason: "conversations search paged out at 100", sends: [] }) }) });
+  const row = plan.rows[0];
+  assert.equal(row.decision, "held");
+  assert.equal(hold(row, "send_history_incomplete"),
+    "send_history_incomplete: conversations search paged out at 100");
+});
+
+test("history that cannot be read at all holds", async () => {
+  for (const history of [null, undefined]) {
+    const base = day21();
+    const plan = await run({ readers: history === undefined
+      ? { readInvoice: base.readInvoice, matchContacts: base.matchContacts, cardsForContact: base.cardsForContact }
+      : readers({ ...base, sendHistory: async () => null }) });
+    const row = plan.rows[0];
+    assert.equal(row.decision, "held", String(history));
+    assert.equal(hold(row, "send_history_unavailable"),
+      "send_history_unavailable: cannot prove this milestone was not already sent",
+      String(history));
+  }
+});
+
+test("a send with no channel or no milestone day holds rather than guessing", async () => {
+  for (const [patch, expected] of [
+    [{ channel: null }, "send_detail_unknown: synthetic-message has no channel"],
+    [{ milestoneDay: null }, "send_detail_unknown: synthetic-message has no milestone day"],
+  ] as const) {
+    const plan = await run({ readers: readers({
+      ...day21(), sendHistory: async () => ({ complete: true, sends: [priorSend(patch)] }) }) });
+    const row = plan.rows[0];
+    assert.equal(row.decision, "held");
+    assert.equal(hold(row, "send_detail_unknown"), expected);
+  }
+});
+
+test("a milestone with no declared channel policy holds", async () => {
+  for (const channels of [undefined, () => null, () => []] as const) {
+    const plan = await run({ readers: readers(day21()), milestoneChannels: channels });
+    const row = plan.rows[0];
+    assert.equal(row.decision, "held");
+    assert.equal(hold(row, "milestone_channels_undeclared"),
+      "milestone_channels_undeclared: no channel policy supplied for this milestone");
+    assert.deepEqual(row.channels, []);
+  }
+});
+
+test("suppression never turns into a send: sendsAttempted stays 0 in every case", async () => {
+  const histories = [
+    { complete: true, sends: [] },
+    { complete: true, sends: [priorSend()] },
+    { complete: true, sends: [priorSend({ attribution: "ambiguous" })] },
+    { complete: true, sends: [priorSend({ confirmed: false })] },
+    { complete: false, sends: [] },
+  ] as const;
+  for (const history of histories) {
+    const plan = await run({ readers: readers({ ...day21(), sendHistory: async () => history }) });
+    assert.equal(plan.sendsAttempted, 0);
+  }
 });

@@ -1,8 +1,8 @@
 import { jobberGraphQL } from "./jobber";
-import { findExactContactMatches, getInvoicePipelineRefs, searchOpportunities } from "./ghl";
+import { findExactContactMatches, getInvoicePipelineRefs, getOutboundMessages, searchOpportunities } from "./ghl";
 import type {
-  DestinationCard, DestinationContact, ReminderCandidate,
-  ReminderEvaluationReaders, SourceInvoice,
+  DestinationCard, DestinationContact, PriorSend, ReminderCandidate,
+  ReminderEvaluationReaders, SendHistory, SourceInvoice,
 } from "./reminder-evaluation";
 
 /** Read-only queries. No mutation is issued from this module to either provider. */
@@ -69,6 +69,50 @@ export function createReminderEvaluationReaders(): ReminderEvaluationReaders {
         phone: contact.phone ?? null,
         email: contact.email ?? null,
       }));
+    },
+
+    /**
+     * What GoHighLevel already sent this customer.
+     *
+     * Attribution is read off the message itself, never computed from the due
+     * date: a reminder counts as THIS invoice's only when the body names this
+     * invoice number. A body naming a different number is "other_invoice" and
+     * suppresses nothing. Anything else is "ambiguous" and holds.
+     *
+     * `milestoneDay` is left null because nothing in a GoHighLevel message says
+     * which rung of the ladder it was. That is deliberate: a null milestone day
+     * holds the row instead of letting a guess cancel a reminder.
+     */
+    async sendHistory(candidate: ReminderCandidate): Promise<SendHistory | null> {
+      const contacts = await findExactContactMatches({ email: candidate.email, phone: candidate.phone });
+      // One exact contact or no history at all. Several already holds upstream,
+      // and merging their histories would invent an attribution.
+      if (contacts.length !== 1) {
+        return { complete: false, incompleteReason:
+          `history needs exactly one exact contact; found ${contacts.length}`, sends: [] };
+      }
+      const history = await getOutboundMessages(contacts[0].id);
+      const mine = candidate.invoiceNumber?.trim() ?? "";
+      const minePattern = mine ? new RegExp(`(?:^|[^0-9])${mine}(?:[^0-9]|$)`) : null;
+      const anyInvoiceNumber = /#\s?\d{3,6}|invoice\s+#?\s?\d{3,6}/i;
+
+      const sends: PriorSend[] = history.messages.map(message => {
+        const namesMine = minePattern ? minePattern.test(message.body) : false;
+        const namesSome = anyInvoiceNumber.test(message.body);
+        const attribution: PriorSend["attribution"] =
+          namesMine ? "exact" : namesSome ? "other_invoice" : "ambiguous";
+        return {
+          messageId: message.id,
+          channel: message.channel,
+          milestoneDay: null,
+          attribution,
+          // A message present in the conversation log did go out. An attempt
+          // that failed or is still queued does not appear as outbound here;
+          // if that assumption ever breaks, the row must hold, not send.
+          confirmed: true,
+        };
+      });
+      return { complete: history.complete, incompleteReason: history.incompleteReason, sends };
     },
 
     async cardsForContact(contactId: string): Promise<DestinationCard[]> {
