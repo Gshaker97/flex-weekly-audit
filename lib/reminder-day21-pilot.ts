@@ -16,6 +16,7 @@
  *     be any customer destination offered alongside it.
  *   - the pilot cap is one reservation in the ledger, ever.
  */
+import { invoiceReminderMilestones } from "./invoice-reminder-clock";
 import type { Event } from "./notification-gate";
 import type { NotificationLedger, NotificationOutcome } from "./notification-ledger";
 
@@ -28,8 +29,8 @@ export const PILOT_TOTAL_SEND_CAP = 1;
 export type PilotBlock =
   | "channel_not_email" | "audience_not_internal" | "milestone_not_day_21"
   | "destination_not_the_approved_internal_address" | "destination_is_a_customer_destination"
-  | "pilot_cap_already_used" | "provider_not_fake"
-  | "invoice_not_proven_new" | "ledger_refused";
+  | "pilot_cap_already_used" | "pilot_allowance_lost_to_another_invoice" | "provider_not_fake"
+  | "invoice_not_proven_new" | "day_21_not_due_by_the_jobber_due_date" | "ledger_refused";
 
 export type PilotResult =
   | Readonly<{ state: "blocked"; block: PilotBlock; detail: string }>
@@ -51,8 +52,25 @@ export function assertFakeProvider(provider: unknown): FakeEmailProvider {
   return candidate;
 }
 
-/** How many reservations this pilot has ever made, in any state. */
-export interface PilotLedgerCount { countPilotReservations(): Promise<number | null> }
+/**
+ * The pilot's single allowance.
+ *
+ * A plain count-then-reserve loses a race between two workers on DIFFERENT
+ * invoices: their reservation keys differ, so the ledger admits both, and both
+ * read a count of zero. So the allowance is claimed by arbitration AFTER
+ * reserving: every worker reserves its own invoice, then asks which reservation
+ * is the pilot's one. Exactly one is told "won"; the others stop before the
+ * provider and leave their row at `reserved`, never pending, never sent.
+ */
+export interface PilotAllowance {
+  /** Pilot reservations in any state, for a cheap early exit. null means unreadable. */
+  countPilotReservations(): Promise<number | null>;
+  /**
+   * Deterministic across workers: the earliest pilot reservation by
+   * (createdAt, id) wins. "unknown" on any read failure, which blocks.
+   */
+  arbitrate(reservationId: string): Promise<"won" | "lost" | "unknown">;
+}
 
 /* ---------- what proves an invoice is genuinely new ---------------------- */
 
@@ -69,7 +87,10 @@ export interface InvoiceNoveltyInput {
   jobberInvoiceId: string;
   /** Jobber's record-creation timestamp. Server-assigned, carries a real time. */
   createdAt: string | null;
-  /** Jobber's issue date. Operator-settable: measured drift of -2 min to +3 days. */
+  /**
+   * Jobber's issue date. Operator-settable: measured drift of -2 minutes to
+   * +3 days against createdAt. It is NOT the milestone anchor - the due date is.
+   */
   issuedDate: string | null;
 }
 export type NoveltyVerdict =
@@ -93,9 +114,17 @@ const SKEW_MS = 60_000;
  * Novelty needs BOTH of these, and ambiguity holds:
  *   1. `createdAt` strictly after the cutover, by more than clock skew.
  *   2. The invoice id absent from a COMPLETE inventory taken at the cutover.
- * An issue date set before the record was created also holds, because the
- * milestone clock runs off the issue date and a back-dated one could land on
- * day 21 immediately.
+ *
+ * Neither of these touches the milestone. Day 21 is computed by
+ * invoice-reminder-clock from the verified Jobber DUE date in Phoenix, and
+ * nothing here can move it: `createdAt` and the inventory decide only whether
+ * the invoice is new enough to be in the pilot at all.
+ *
+ * An issue date set before the record was created still holds, but not because
+ * it could move a milestone - it cannot. It holds because the dates were
+ * evidently hand-set, which makes every date on the invoice untrustworthy, and
+ * an issue date later than the due date makes the clock refuse the invoice
+ * outright.
  */
 export function invoiceIsProvenNew(input: InvoiceNoveltyInput, proof: CutoverProof): NoveltyVerdict {
   if (!proof.inventoryComplete) {
@@ -138,8 +167,10 @@ export async function attemptDay21PilotEmail(input: {
   customerDestinations: readonly string[];
   novelty: InvoiceNoveltyInput;
   cutover: CutoverProof;
+  /** The Phoenix instant the decision is being made at. */
+  now: Date;
   ledger: NotificationLedger;
-  ledgerCount: PilotLedgerCount;
+  allowance: PilotAllowance;
   provider: unknown;
 }): Promise<PilotResult> {
   const { event } = input;
@@ -167,9 +198,24 @@ export async function attemptDay21PilotEmail(input: {
   const novelty = invoiceIsProvenNew(input.novelty, input.cutover);
   if (!novelty.proven) return blocked("invoice_not_proven_new", novelty.reason);
 
+  // Day 21 comes from the clock, computed off the verified Jobber DUE date in
+  // America/Phoenix. The issue date is not the anchor and neither is createdAt.
+  // The caller's scheduledOn must be the date the clock says, or nothing runs.
+  const milestones = invoiceReminderMilestones(event.category!, event.issuedDate, event.dueDate, input.now);
+  const day21 = milestones?.find(step => step.dayPastDue === PILOT_MILESTONE_DAY);
+  if (!day21) return blocked("day_21_not_due_by_the_jobber_due_date", "the clock produced no day 21 for these dates");
+  if (day21.scheduledOn !== input.scheduledOn) {
+    return blocked("day_21_not_due_by_the_jobber_due_date",
+      `clock says day 21 falls on ${day21.scheduledOn} (due ${event.dueDate}), caller said ${input.scheduledOn}`);
+  }
+  if (day21.timing !== "today") {
+    return blocked("day_21_not_due_by_the_jobber_due_date",
+      `day 21 is ${day21.timing} on ${day21.scheduledOn}, not today in Phoenix`);
+  }
+
   // The cap is counted across the whole pilot, in any state, so a reserved,
   // pending, accepted, rejected or unknown row all use it up.
-  const used = await input.ledgerCount.countPilotReservations();
+  const used = await input.allowance.countPilotReservations();
   if (used === null) return blocked("pilot_cap_already_used", "pilot reservation count unreadable; treated as used");
   if (used >= PILOT_TOTAL_SEND_CAP) return blocked("pilot_cap_already_used", `${used} of ${PILOT_TOTAL_SEND_CAP} used`);
 
@@ -180,6 +226,17 @@ export async function attemptDay21PilotEmail(input: {
   const handle = reservation.reservation;
 
   if (!await input.ledger.assertReserved(handle)) return blocked("ledger_refused", "reservation did not verify");
+
+  // The allowance is decided here, after reserving and before anything can be
+  // sent. Two workers on different invoices both reserve; only one proceeds.
+  // The loser's row stays `reserved` for a person to see and is never advanced.
+  const claim = await input.allowance.arbitrate(handle.id);
+  if (claim !== "won") {
+    return blocked("pilot_allowance_lost_to_another_invoice", claim === "lost"
+      ? "another invoice holds the pilot's single allowance; this reservation stays reserved and unsent"
+      : "the allowance could not be arbitrated; treated as lost");
+  }
+
   if (!await input.ledger.markPending(handle)) return blocked("ledger_refused", "could not move to pending");
 
   // One call. No retry, ever, whatever comes back.
