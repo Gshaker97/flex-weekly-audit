@@ -469,3 +469,122 @@ for (const phase of ["before_commit", "after_commit"] as const) {
     assert.equal(setup.sends(), 1);
   });
 }
+
+// --- Day 21 internal-email pilot shape -------------------------------------
+// The proposed pilot sends ONE message: day 21, audience internal, channel
+// email, to Angie. These tests use that exact shape, with no provider and no
+// sender anywhere in the process.
+
+/** Day 21 internal email on an invoice issued after a cutover. Due 2026-10-19,
+ *  so day 21 is 2026-11-09 — the same scheduledOn the other tests use. */
+function day21Internal(patch: Partial<Event> = {}): NotificationReservationInput {
+  const base = input({
+    invoiceId: "jobber-invoice-encoded-id-post-cutover", dayPastDue: 21, audience: "internal",
+    dueDate: "2026-10-19", issuedDate: "2026-10-12", category: "irrigation",
+    channel: "email", destination: "angie@example.invalid", contactId: "synthetic-angie",
+    recipientId: "synthetic-angie", homeownerContactId: "synthetic-homeowner", ...patch,
+  });
+  return { ...base, destination: base.event.destination, channel: base.event.channel,
+    contactId: base.event.contactId };
+}
+
+test("pilot: the reservation key is the immutable invoice id, milestone and audience", async () => {
+  const db = new FakeDatabase(), request = day21Internal();
+  const handle = await reserve(createNotificationLedger(db), request);
+  const row = db.rows.get(handle.id)!;
+  assert.equal(row.eventKey, JSON.stringify(["notification-v1", "synthetic-account",
+    "jobber-invoice-encoded-id-post-cutover", 21, "internal"]));
+  assert.equal(row.channel, "email");
+  // The invoice id in the key is Jobber's encoded id, which never changes. The
+  // due date, owner, destination and template are deliberately NOT in the key.
+  for (const patch of [{ dueDate: "2026-10-20" }, { ownerId: "another-owner" },
+    { ownerRevision: "owner-9" }, { templateVersion: "9" }, { balanceMinor: 1 }]) {
+    const moved = patch.dueDate
+      ? { ...day21Internal(patch), scheduledOn: "2026-11-10" }
+      : day21Internal(patch);
+    assert.equal((await createNotificationLedger(db).reserve(moved)).state, "held",
+      JSON.stringify(patch));
+  }
+  assert.equal(db.rows.size, 1);
+});
+
+test("pilot: 25 concurrent runs of the same milestone reserve exactly once", async () => {
+  const db = new FakeDatabase();
+  // A separate ledger instance per run, so this is the cross-process case, not
+  // the same-process admission guard.
+  const results = await Promise.all(Array.from({ length: 25 },
+    () => createNotificationLedger(db).reserve(day21Internal())));
+  assert.equal(results.filter(result => result.state === "reserved").length, 1);
+  assert.equal(results.filter(result => result.state === "held").length, 24);
+  for (const result of results) {
+    if (result.state === "held") assert.equal(result.reason, "already_claimed");
+  }
+  assert.equal(db.rows.size, 1);
+  assert.equal(db.queries.filter(query => query.sql.includes("notification-ledger:reserve")).length, 25);
+});
+
+test("pilot: email-only needs no channel in the key, because SMS cannot reserve", async () => {
+  const db = new FakeDatabase();
+  await reserve(createNotificationLedger(db), day21Internal());
+  // Had the Day 21 internal SMS also been on, it would collide on the same key
+  // and be held rather than sent. Email-only is therefore safe without a
+  // migration; turning the SMS on later is what would need the channel added.
+  const sms = day21Internal({ channel: "sms", destination: "+16025550113" });
+  const result = await createNotificationLedger(db).reserve(sms);
+  assert.equal(result.state, "held");
+  if (result.state === "held") assert.equal(result.reason, "already_claimed");
+  assert.equal(db.rows.size, 1);
+  assert.equal(db.rows.get([...db.rows.keys()][0])!.channel, "email");
+});
+
+test("pilot: a timeout after the provider accepted leaves it blocked, with no retry api", async () => {
+  const db = new FakeDatabase(), ledger = createNotificationLedger(db);
+  const handle = await verified(ledger);
+  assert.equal(await ledger.markPending(handle), true);
+
+  // The provider accepted and returned a message id; persisting that outcome
+  // then times out. One provider call happened, and only one.
+  let providerCalls = 0;
+  const accepted = () => { providerCalls += 1; return { state: "accepted" as const, providerMessageId: "mailgun-synthetic-id" }; };
+  db.fault = { operation: "outcome", phase: "before_commit" };
+  assert.equal(await ledger.markOutcome(handle, accepted()), false);
+  assert.equal(providerCalls, 1);
+  assert.equal(db.rows.get(handle.id)?.state, "pending");
+
+  // Nothing can move it. Not this handle, not a fresh ledger, not a new run.
+  assert.equal(await ledger.markOutcome(handle, accepted()), false);
+  assert.equal(await ledger.markPending(handle), false);
+  assert.equal(await ledger.assertReserved(handle), false);
+  assert.equal((await createNotificationLedger(db).reserve(input())).state, "held");
+  assert.equal(providerCalls, 2, "the second call was made by the test, not by a retry");
+  assert.equal(db.rows.get(handle.id)?.state, "pending");
+
+  // And there is no api to release, reset, expire or retry it. Reconciliation
+  // against provider evidence is a separate, deliberate act — not a clear-and-resend.
+  for (const name of ["release", "reset", "expire", "retry", "clear", "unblock", "requeue"])
+    assert.equal(name in (ledger as unknown as Record<string, unknown>), false, name);
+  assert.deepEqual(Object.keys(ledger).sort(), ["assertReserved", "markOutcome", "markPending", "reserve"]);
+});
+
+test("pilot: an unknown outcome is terminal and still blocks every later run", async () => {
+  const db = new FakeDatabase(), ledger = createNotificationLedger(db);
+  const handle = await verified(ledger);
+  assert.equal(await ledger.markPending(handle), true);
+  assert.equal(await ledger.markOutcome(handle, { state: "unknown" }), true);
+  assert.equal(db.rows.get(handle.id)?.state, "unknown");
+  assert.equal(await ledger.markOutcome(handle, { state: "accepted", providerMessageId: "mailgun-synthetic-id" }), false);
+  assert.equal(db.rows.get(handle.id)?.state, "unknown");
+  assert.equal((await createNotificationLedger(db).reserve(input())).state, "held");
+});
+
+test("pilot: two customers hitting day 21 on the same day hold the second, never batch it", async () => {
+  const db = new FakeDatabase();
+  await reserve(createNotificationLedger(db), day21Internal());
+  // Same internal recipient, same scheduled day, different invoice: the
+  // (account, contact, scheduledOn) key holds it for a person to look at.
+  const second = day21Internal({ invoiceId: "jobber-invoice-encoded-id-post-cutover-2" });
+  const result = await createNotificationLedger(db).reserve(second);
+  assert.equal(result.state, "held");
+  if (result.state === "held") assert.equal(result.reason, "already_claimed");
+  assert.equal(db.rows.size, 1);
+});
