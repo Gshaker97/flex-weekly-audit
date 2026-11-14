@@ -147,6 +147,43 @@ export interface GhlContact {
   additionalPhones?: Array<{ phone: string }> | null;
   email?: string | null;
   phone?: string | null;
+  tags?: string[] | null;
+  dnd?: boolean | null;
+}
+
+const lastTen = (value: string | null | undefined): string =>
+  (value ?? "").replace(/\D/g, "").slice(-10);
+
+/**
+ * Every contact matching this email or phone EXACTLY, de-duplicated by id.
+ *
+ * Read-only. Unlike findContactByEmail this never falls back to the first
+ * fuzzy result, because callers that must detect duplicate records need to see
+ * all of them rather than be handed an arbitrary one. Two or more results is a
+ * real answer: the destination is ambiguous.
+ */
+export async function findExactContactMatches(opts: {
+  email?: string | null;
+  phone?: string | null;
+}): Promise<GhlContact[]> {
+  const found = new Map<string, GhlContact>();
+  const email = (opts.email ?? "").trim();
+  const digits = lastTen(opts.phone);
+  const queries: Array<{ query: string; keep: (c: GhlContact) => boolean }> = [];
+  if (email) {
+    queries.push({ query: email, keep: c => (c.email ?? "").trim().toLowerCase() === email.toLowerCase() });
+  }
+  if (digits.length === 10) {
+    queries.push({ query: `+1${digits}`, keep: c => lastTen(c.phone) === digits });
+  }
+  for (const { query, keep } of queries) {
+    const params = new URLSearchParams({ locationId: ghlLocationId(), query, limit: "20" });
+    const data = await ghlFetch<{ contacts: GhlContact[] }>(`/contacts/?${params.toString()}`);
+    for (const contact of data.contacts ?? []) {
+      if (contact?.id && keep(contact)) found.set(contact.id, contact);
+    }
+  }
+  return [...found.values()];
 }
 
 // Read-only POST search contract, pinned to our 2021-07-28 API version:
@@ -461,6 +498,60 @@ export async function getOutboundSms(contactId: string): Promise<GhlOutboundSms[
   return out;
 }
 
+
+export interface GhlOutboundMessage {
+  id: string;
+  channel: "email" | "sms";
+  dateAdded: Date;
+  body: string;
+}
+
+/**
+ * Every outbound email and SMS for a contact, with the message id, plus whether
+ * the history was read IN FULL. `complete: false` means a conversation hit the
+ * page cap or a message was unusable, and the caller must hold rather than
+ * conclude that nothing was sent. Read-only.
+ */
+export async function getOutboundMessages(
+  contactId: string
+): Promise<{ complete: boolean; incompleteReason: string | null; messages: GhlOutboundMessage[] }> {
+  const loc = encodeURIComponent(ghlLocationId());
+  const conv = await ghlFetch<{ conversations: GhlConversation[] }>(
+    `/conversations/search?locationId=${loc}&contactId=${encodeURIComponent(contactId)}`
+  );
+  const messages: GhlOutboundMessage[] = [];
+  const reasons: string[] = [];
+  const PAGE_CAP = 10;
+
+  for (const c of conv.conversations ?? []) {
+    let lastMessageId: string | undefined;
+    let page = 0;
+    for (; page < PAGE_CAP; page += 1) {
+      const qs = lastMessageId ? `?lastMessageId=${encodeURIComponent(lastMessageId)}` : "";
+      const data = await ghlFetch<{
+        messages: { messages: (GhlMessage & { id?: string })[]; nextPage?: boolean; lastMessageId?: string };
+      }>(`/conversations/${encodeURIComponent(c.id)}/messages${qs}`);
+      const block = data.messages;
+      for (const m of block?.messages ?? []) {
+        if (m.direction !== "outbound") continue;
+        const channel = m.messageType === "TYPE_SMS" ? "sms"
+          : m.messageType === "TYPE_EMAIL" ? "email" : null;
+        if (!channel) continue;
+        const when = m.dateAdded ? new Date(m.dateAdded) : null;
+        if (!m.id || !when || Number.isNaN(when.getTime())) {
+          reasons.push(`unusable outbound message in conversation ${c.id}`);
+          continue;
+        }
+        messages.push({ id: m.id, channel, dateAdded: when, body: m.body ?? "" });
+      }
+      if (!block?.nextPage || !block?.lastMessageId) break;
+      lastMessageId = block.lastMessageId;
+    }
+    if (page >= PAGE_CAP) reasons.push(`conversation ${c.id} reached the ${PAGE_CAP}-page read cap`);
+  }
+  messages.sort((a, b) => b.dateAdded.getTime() - a.dateAdded.getTime());
+  return { complete: reasons.length === 0, incompleteReason: reasons.length ? reasons.join("; ") : null, messages };
+}
 
 /** Exactly one attempt. A 200 succeeded acknowledgment is NOT terminal proof. */
 export async function removeContactFromWorkflowOnce(contactId: string, workflowId: string): Promise<{ httpStatus: 200; succeeded: true }> {

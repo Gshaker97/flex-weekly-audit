@@ -284,3 +284,48 @@ model NotificationLedger {
   @@unique([accountId, contactId, scheduledOn])
   @@index([state, createdAt])
 }
+
+/// One evaluate-only reminder run. Records what would have happened. The
+/// evaluate mode never sends a message and never writes to GoHighLevel.
+model ReminderEvaluationRun {
+  id                 String    @id @default(cuid())
+  mode               String
+  phoenixDate        String
+  state              String
+  startedAt          DateTime  @default(now())
+  completedAt        DateTime?
+  candidates         Int       @default(0)
+  eligible           Int       @default(0)
+  held               Int       @default(0)
+  exclusionsVerified Boolean   @default(false)
+  sendsAttempted     Int       @default(0)
+  notes              String?
+
+  rows ReminderEvaluationRow[]
+
+  @@index([startedAt])
+  @@index([phoenixDate])
+}
+
+/// One invoice considered by a run, with every hold reason that applied.
+model ReminderEvaluationRow {
+  id              String  @id @default(cuid())
+  runId           String
+  jobberInvoiceId String
+  invoiceNumber   String?
+  clientName      String?
+  category        String?
+  categorySource  String?
+  categoryEvidence String?
+  daysPastDue     Int?
+  balanceCents    Int?
+  milestoneDay    Int?
+  audience        String?
+  decision        String
+  holds           String
+
+  run ReminderEvaluationRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@index([runId])
+  @@index([jobberInvoiceId])
+}
