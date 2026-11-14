@@ -2,12 +2,12 @@ import test, { beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { prisma } from "../lib/prisma";
-import { planOpenInvoiceStatusRefresh, refreshOpenInvoiceStatuses, OpenInvoiceSnapshot } from "../lib/open-invoice-status-refresh";
+import { planOpenInvoiceStatusRefresh, refreshOpenInvoiceStatuses, paidBalanceCorrectionEnabled, OpenInvoiceSnapshot } from "../lib/open-invoice-status-refresh";
 
 function cached(id = "synthetic-invoice", amount = 100): OpenInvoiceSnapshot {
   return {
     id: `local-${id}`, jobberInvoiceId: id, invoiceStatus: "awaiting_payment",
-    total: amount, amountDue: amount, customerId: "local-owner",
+    total: amount, amountPaid: 0, amountDue: amount, customerId: "local-owner",
     customer: { jobberClientId: "synthetic-owner" }, lastSyncedAt: new Date("2026-11-07T02:12:00Z"),
   };
 }
@@ -27,6 +27,7 @@ let fetches: number;
 let cacheReads: number;
 beforeEach(() => {
   delete process.env.JOBBER_OPEN_STATUS_REFRESH_ENABLED;
+  delete process.env.JOBBER_PAID_BALANCE_CORRECTION_ENABLED;
   records = [cached()]; sourceRows = { [records[0].jobberInvoiceId]: source(records[0]) };
   writes = []; transactions = 0; fetches = 0; cacheReads = 0; response = undefined; failedUpdate = undefined;
   (prisma.invoiceRecord as any).findMany = async (query: any) => {
@@ -166,7 +167,8 @@ test("enabled refresh writes only status and guards every cached snapshot value"
   assert.deepEqual(writes[0].data, { invoiceStatus: "past_due" });
   assert.deepEqual(writes[0].where, {
     id: records[0].id, jobberInvoiceId: records[0].jobberInvoiceId, invoiceStatus: records[0].invoiceStatus,
-    total: records[0].total, amountDue: records[0].amountDue, customerId: records[0].customerId,
+    total: records[0].total, amountPaid: records[0].amountPaid,
+    amountDue: records[0].amountDue, customerId: records[0].customerId,
     customer: { is: { jobberClientId: "synthetic-owner" } }, lastSyncedAt: records[0].lastSyncedAt,
   });
 });
@@ -215,4 +217,231 @@ test("sync integration refreshes before aggregates and GHL without swallowing er
   assert.ok(invocation < sync.indexOf('await step("recomputeCustomerAggregates"'));
   assert.ok(invocation < sync.indexOf("await syncGhlInvoicePipeline({ writer })"));
   assert.equal(sync.slice(sync.lastIndexOf("if (!heavy.ok)", invocation), invocation).includes("catch"), false);
+});
+
+// --- Paid-invoice correction: status and balance from one authoritative read ---
+// Every value below is synthetic. No production invoice, customer or identity.
+
+function settled(id = "synthetic-invoice", amount = 90): OpenInvoiceSnapshot {
+  return { ...cached(id, amount), invoiceStatus: "past_due" };
+}
+/** The paid balance correction is gated; these tests exercise it switched on. */
+const planCorrecting = (rows: OpenInvoiceSnapshot[], read: unknown) =>
+  planOpenInvoiceStatusRefresh(rows, read as never, { paidBalanceCorrection: true });
+
+test("an open invoice paid in full is corrected in a single pass", async () => {
+  const invoice = settled();
+  const plan = await planCorrecting([invoice], reader({
+    [invoice.jobberInvoiceId]: source(invoice, { invoiceStatus: "paid", amounts: { total: 90, invoiceBalance: 0 } }),
+  }));
+  assert.deepEqual(plan.holds, []);
+  assert.equal(plan.updates.length, 1);
+  assert.equal(plan.updates[0].invoiceStatus, "paid");
+  assert.equal(plan.updates[0].amountDue, 0);
+  assert.equal(plan.updates[0].amountPaid, 90, "derived as total minus balance from the same read");
+});
+
+test("the shipped behaviour of holding this case is what changed, and only this case", async () => {
+  // A balance that moves without a status change is still the full sync's job.
+  const invoice = settled();
+  const plan = await planCorrecting([invoice], reader({
+    [invoice.jobberInvoiceId]: source(invoice, { invoiceStatus: "past_due", amounts: { total: 90, invoiceBalance: 45 } }),
+  }));
+  assert.deepEqual(plan.updates, []);
+  assert.match(plan.holds[0].reason, /without a status change/);
+});
+
+for (const [status, invoiceBalance] of [["void", 0], ["bad_debt", 0], ["draft", 0], ["awaiting_payment", 45]] as Array<[string, number]>) {
+  test(`a ${status} transition never carries a balance across`, async () => {
+    const invoice = settled();
+    const plan = await planCorrecting([invoice], reader({
+      [invoice.jobberInvoiceId]: source(invoice, { invoiceStatus: status, amounts: { total: 90, invoiceBalance } }),
+    }));
+    assert.deepEqual(plan.updates, [], "only a settled-to-zero payment may move amounts");
+    assert.match(plan.holds[0].reason, /non-payment transition/);
+  });
+}
+
+test("a status-only correction still writes status alone", async () => {
+  const invoice = settled();
+  const plan = await planCorrecting([invoice], reader({
+    [invoice.jobberInvoiceId]: source(invoice, { invoiceStatus: "awaiting_payment", amounts: { total: 90, invoiceBalance: 90 } }),
+  }));
+  assert.deepEqual(Object.keys(plan.updates[0]).sort(), ["cached", "invoiceStatus"]);
+});
+
+// --- An older read cannot overwrite a newer verified payment ---
+
+test("a stale source read claiming the invoice is still open is held, not applied", async () => {
+  // The cache already holds the newer verified payment; the read is older.
+  const paidAlready: OpenInvoiceSnapshot = { ...cached(), invoiceStatus: "paid", amountDue: 0, amountPaid: 100 };
+  const plan = await planCorrecting([paidAlready], reader({
+    [paidAlready.jobberInvoiceId]: source(paidAlready, { invoiceStatus: "past_due", amounts: { total: 100, invoiceBalance: 100 } }),
+  }));
+  assert.deepEqual(plan.updates, [], "a newer verified payment is never reopened by an older read");
+  assert.match(plan.holds[0].reason, /no longer open/);
+});
+
+test("a stale in-flight correction matches no row and rolls the batch back", async () => {
+  process.env.JOBBER_OPEN_STATUS_REFRESH_ENABLED = "true";
+  process.env.JOBBER_PAID_BALANCE_CORRECTION_ENABLED = "true";
+  records = [settled()];
+  sourceRows = { [records[0].jobberInvoiceId]: source(records[0], { invoiceStatus: "paid", amounts: { total: 90, invoiceBalance: 0 } }) };
+  failedUpdate = 1; // another pass already wrote the verified payment
+  await assert.rejects(refreshOpenInvoiceStatuses(), /rolled back/);
+  assert.equal(transactions, 1);
+  assert.deepEqual(writes, [], "nothing is persisted when the pre-image no longer matches");
+});
+
+test("the write guard pins every amount, so a newer payment blocks a stale correction", async () => {
+  process.env.JOBBER_OPEN_STATUS_REFRESH_ENABLED = "true";
+  process.env.JOBBER_PAID_BALANCE_CORRECTION_ENABLED = "true";
+  records = [settled()];
+  sourceRows = { [records[0].jobberInvoiceId]: source(records[0], { invoiceStatus: "paid", amounts: { total: 90, invoiceBalance: 0 } }) };
+  await refreshOpenInvoiceStatuses();
+  assert.equal(writes.length, 1);
+  assert.deepEqual(writes[0].data, { invoiceStatus: "paid", amountDue: 0, amountPaid: 90 });
+  for (const field of ["invoiceStatus", "total", "amountPaid", "amountDue", "lastSyncedAt"]) {
+    assert.ok(field in writes[0].where, `${field} is part of the optimistic guard`);
+  }
+  assert.equal(writes[0].where.amountDue, 90, "guarded on the pre-payment balance");
+  assert.equal(writes[0].where.amountPaid, 0);
+  assert.equal("paidAt" in writes[0].data, false, "no invented payment timestamp");
+  assert.equal("lastSyncedAt" in writes[0].data, false, "the row was not fully refreshed");
+});
+
+// --- Incomplete or conflicting reads leave the last verified values intact ---
+
+for (const [name, patch] of Object.entries({
+  "paid claimed with a balance still owed": { invoiceStatus: "paid", amounts: { total: 90, invoiceBalance: 90 } },
+  "paid claimed with a partial balance": { invoiceStatus: "paid", amounts: { total: 90, invoiceBalance: 45 } },
+  "paid claimed with a credit balance": { invoiceStatus: "paid", amounts: { total: 90, invoiceBalance: -1 } },
+  "paid claimed with a balance over total": { invoiceStatus: "paid", amounts: { total: 90, invoiceBalance: 91 } },
+  "paid claimed with the total also changed": { invoiceStatus: "paid", amounts: { total: 140, invoiceBalance: 0 } },
+  "paid claimed with no amounts block": { invoiceStatus: "paid", amounts: null },
+  "paid claimed with a null balance": { invoiceStatus: "paid", amounts: { total: 90, invoiceBalance: null } },
+  "paid claimed with a missing balance": { invoiceStatus: "paid", amounts: { total: 90 } },
+  "paid claimed with a string balance": { invoiceStatus: "paid", amounts: { total: 90, invoiceBalance: "0" } },
+  "paid claimed with a sub-cent balance": { invoiceStatus: "paid", amounts: { total: 90, invoiceBalance: 0.001 } },
+  "paid claimed by a different owner": { invoiceStatus: "paid", amounts: { total: 90, invoiceBalance: 0 }, client: { id: "another-owner" } },
+  "paid claimed with no owner": { invoiceStatus: "paid", amounts: { total: 90, invoiceBalance: 0 }, client: null },
+  "unrecognised settled status": { invoiceStatus: "settled", amounts: { total: 90, invoiceBalance: 0 } },
+  "source object unavailable": null,
+})) {
+  test(`${name} holds and leaves the verified values untouched`, async () => {
+    const invoice = settled();
+    const pristine = structuredClone({ ...invoice, lastSyncedAt: invoice.lastSyncedAt.toISOString() });
+    const row = patch === null ? null : source(invoice, patch as Record<string, unknown>);
+    const plan = await planCorrecting([invoice], reader({ [invoice.jobberInvoiceId]: row }));
+    assert.deepEqual(plan.updates, [], "no correction is produced");
+    assert.equal(plan.holds.length, 1);
+    assert.deepEqual(
+      structuredClone({ ...invoice, lastSyncedAt: invoice.lastSyncedAt.toISOString() }), pristine,
+      "the cached snapshot is never mutated, so the last verified values survive"
+    );
+  });
+}
+
+for (const [name, data] of Object.entries({
+  "truncated envelope": {},
+  "null envelope": null,
+  "extra alias": { i0: null, i1: null },
+  "non-object envelope": "paid",
+})) {
+  test(`${name} aborts before any paid correction exists`, async () => {
+    const invoice = settled();
+    await assert.rejects(planCorrecting([invoice], async () => data as unknown));
+    assert.equal(invoice.invoiceStatus, "past_due");
+    assert.equal(invoice.amountDue, 90);
+  });
+}
+
+test("one conflicting row never suppresses a valid correction, and vice versa", async () => {
+  const good = settled("synthetic-good");
+  const bad = settled("synthetic-bad");
+  const plan = await planCorrecting([good, bad], reader({
+    [good.jobberInvoiceId]: source(good, { invoiceStatus: "paid", amounts: { total: 90, invoiceBalance: 0 } }),
+    [bad.jobberInvoiceId]: source(bad, { invoiceStatus: "paid", amounts: { total: 90, invoiceBalance: 90 } }),
+  }));
+  assert.equal(plan.updates.length, 1);
+  assert.equal(plan.updates[0].cached.jobberInvoiceId, good.jobberInvoiceId);
+  assert.equal(plan.holds.length, 1);
+  assert.equal(plan.holds[0].jobberInvoiceId, bad.jobberInvoiceId);
+});
+
+test("the correction reads Jobber only, never GHL, and issues no mutation", async () => {
+  process.env.JOBBER_OPEN_STATUS_REFRESH_ENABLED = "true";
+  process.env.JOBBER_PAID_BALANCE_CORRECTION_ENABLED = "true";
+  records = [settled()];
+  sourceRows = { [records[0].jobberInvoiceId]: source(records[0], { invoiceStatus: "paid", amounts: { total: 90, invoiceBalance: 0 } }) };
+  await refreshOpenInvoiceStatuses();
+  assert.equal(fetches, 1); // the beforeEach fetch stub asserts the Jobber URL and rejects mutations
+});
+
+test("reminder behaviour is untouched by this module", () => {
+  const module = readFileSync(new URL("../lib/open-invoice-status-refresh.ts", import.meta.url), "utf8")
+    .replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
+  for (const term of ["leadconnectorhq", "notification", "reminder", "sendSms", "workflow", "mutation"]) {
+    assert.equal(module.toLowerCase().includes(term.toLowerCase()), false, `${term} must not appear in the status refresh`);
+  }
+});
+
+
+// --- The paid balance correction is a second, independent, default-off gate ---
+
+test("the gate is off unless the value is exactly true", () => {
+  for (const value of [undefined, "", "false", "TRUE", "True", "1", "yes", " true"]) {
+    assert.equal(paidBalanceCorrectionEnabled(value === undefined ? {} : { JOBBER_PAID_BALANCE_CORRECTION_ENABLED: value }), false, `${value} must not enable it`);
+  }
+  assert.equal(paidBalanceCorrectionEnabled({ JOBBER_PAID_BALANCE_CORRECTION_ENABLED: "true" }), true);
+});
+
+test("with the gate off, a paid invoice holds exactly as the previous release did", async () => {
+  const invoice = settled();
+  const row = source(invoice, { invoiceStatus: "paid", amounts: { total: 90, invoiceBalance: 0 } });
+  const off = await planOpenInvoiceStatusRefresh([invoice], reader({ [invoice.jobberInvoiceId]: row }));
+  assert.deepEqual(off.updates, [], "no correction while the gate is off");
+  assert.equal(off.holds[0].reason, "Amounts changed; requires full invoice sync, not a status-only correction",
+    "the previous release's hold reason is retained verbatim");
+  const on = await planCorrecting([settled()], reader({ [invoice.jobberInvoiceId]: row }));
+  assert.equal(on.updates.length, 1, "and the same input is corrected once the gate is on");
+});
+
+test("with the gate off, a changed total keeps the previous hold reason too", async () => {
+  const invoice = settled();
+  const plan = await planOpenInvoiceStatusRefresh([invoice], reader({
+    [invoice.jobberInvoiceId]: source(invoice, { invoiceStatus: "paid", amounts: { total: 140, invoiceBalance: 0 } }),
+  }));
+  assert.equal(plan.holds[0].reason, "Amounts changed; requires full invoice sync, not a status-only correction");
+});
+
+test("with the gate off, a status-only correction still works and writes status alone", async () => {
+  process.env.JOBBER_OPEN_STATUS_REFRESH_ENABLED = "true";
+  delete process.env.JOBBER_PAID_BALANCE_CORRECTION_ENABLED;
+  const result = await refreshOpenInvoiceStatuses();
+  assert.equal(result?.updates.length, 1);
+  assert.deepEqual(writes[0].data, { invoiceStatus: "past_due" }, "unchanged from the previous release");
+});
+
+test("the enabled run reads the gate once and writes status with the balance", async () => {
+  process.env.JOBBER_OPEN_STATUS_REFRESH_ENABLED = "true";
+  process.env.JOBBER_PAID_BALANCE_CORRECTION_ENABLED = "true";
+  records = [settled()];
+  sourceRows = { [records[0].jobberInvoiceId]: source(records[0], { invoiceStatus: "paid", amounts: { total: 90, invoiceBalance: 0 } }) };
+  await refreshOpenInvoiceStatuses();
+  assert.deepEqual(writes[0].data, { invoiceStatus: "paid", amountDue: 0, amountPaid: 90 });
+});
+
+test("flipping the gate off mid-process cannot half-correct a batch", async () => {
+  // The plan is built from one snapshot of the gate, so every row in a batch is
+  // judged by the same rule even if the environment is edited while it runs.
+  const rows = [settled("synthetic-a"), settled("synthetic-b")];
+  const reads = reader(Object.fromEntries(rows.map(r =>
+    [r.jobberInvoiceId, source(r, { invoiceStatus: "paid", amounts: { total: 90, invoiceBalance: 0 } })])));
+  const plan = await planCorrecting(rows, async (q: string, v: Record<string, string>) => {
+    delete process.env.JOBBER_PAID_BALANCE_CORRECTION_ENABLED; // changed mid-read
+    return reads(q, v);
+  });
+  assert.equal(plan.updates.length, 2, "both rows follow the snapshot taken at the start");
+  assert.deepEqual(plan.holds, []);
 });
