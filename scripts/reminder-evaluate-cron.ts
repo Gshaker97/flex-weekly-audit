@@ -8,10 +8,22 @@
 // Default-off. Runs only when FLEXX_REMINDER_EVALUATE_MODE is exactly
 // "evaluate". Pass --ignore-window for a manual review outside 09:00.
 import { prisma } from "../lib/prisma";
-import { evaluateReminders, summarizeReminderEvaluation, withinArizonaWindow, phoenixParts } from "../lib/reminder-evaluation";
+import { evaluateReminders, summarizeReminderEvaluation, withinArizonaWindow, phoenixParts,
+  type SendChannel } from "../lib/reminder-evaluation";
 import { createReminderEvaluationReaders } from "../lib/reminder-evaluation-readers";
 import { recordReminderEvaluation } from "../lib/reminder-evaluation-store";
 import { COLLECTIONS_SINCE } from "../lib/lateInvoices";
+
+/**
+ * Which channels a milestone uses. OBSERVED in the GoHighLevel "Fixed
+ * Automation" workflow on 2026-11-13 - day 21 has both an email step and an
+ * internal SMS step - and NOT approved policy. It is not pinned anywhere and it
+ * cannot cause a send: this entrypoint has no send path. It exists only to key
+ * duplicate suppression per channel, so an email already sent cannot cancel the
+ * SMS and vice versa. Needs confirmation before any cutover.
+ */
+const MILESTONE_CHANNELS = (step: { dayPastDue: number; audience: string }): readonly SendChannel[] =>
+  step.dayPastDue === 21 ? ["email", "sms"] : ["sms"];
 
 /** Exactly two reviewed Jobber client IDs, comma separated. Anything else is unverified. */
 function configuredExclusions(): string[] | null {
@@ -63,6 +75,7 @@ async function main() {
     now,
     verifiedExclusions: configuredExclusions(),
     ignoreWindow,
+    milestoneChannels: MILESTONE_CHANNELS,
   });
 
   const runId = await recordReminderEvaluation(plan, startedAt);
@@ -77,6 +90,7 @@ async function main() {
     console.log(`[reminder-evaluate] #${row.invoiceNumber ?? "?"} ${row.decision}` +
       ` category=${row.category ?? "unresolved"}/${row.categorySource ?? "-"}` +
       ` dpd=${row.daysPastDue ?? "-"} milestone=${row.milestoneDay ?? "-"}` +
+      (row.channels.length ? ` channels=[${row.channels.map(entry => `${entry.channel}:${entry.decision}`).join(",")}]` : "") +
       (row.holds.length ? ` holds=[${row.holds.join("; ")}]` : ""));
   }
   console.log(`[reminder-evaluate] sends attempted: ${plan.sendsAttempted} (this runner has no send path)`);
