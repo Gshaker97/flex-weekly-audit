@@ -9,6 +9,7 @@
 //
 // Invoke with: npm run sync:cron   (tsx scripts/sync-cron.ts)
 
+import { runConfiguredAutomaticReminders } from "../lib/invoice-reminder-automatic-cron";
 import { runFullSync } from "../lib/sync";
 import { prisma } from "../lib/prisma";
 
@@ -22,6 +23,9 @@ async function main() {
     `[cron] sync finished: status=${run.status} id=${run.id} ` +
       `(${Date.now() - startedAt}ms)`
   );
+  if (run.status === "complete") {
+    await runConfiguredAutomaticReminders({ entrypoint: "standalone_cron" });
+  }
 }
 
 main()
