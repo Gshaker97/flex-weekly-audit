@@ -59,6 +59,10 @@ export type Evidence = Readonly<{
   template: Proof & Readonly<{
     approved: boolean; accountId: string; id: string; version: string; bodyDigest: string;
     audience: Audience; dayPastDue: number; channel: Channel; claimedFacts: readonly Fact[];
+    /** Verified assertion that the rendered body states no late fee at all. Optional and
+     * absent by default; it NEVER proves a fact and NEVER permits a fee claim. Its only
+     * effect is the narrow day-15 exemption below. */
+    feeClaimFree?: boolean;
   }>;
   /** Required for every channel. Email is never an automatic fallback from SMS. */
   channelAuthorization: Proof & Readonly<{
@@ -140,7 +144,18 @@ export function planNotification(request: Request, now: Date): Plan {
       Number(parts.find(p => p.type === "minute")!.value) * 60 + Number(parts.find(p => p.type === "second")!.value);
     if (seconds < 9 * 3600 || seconds >= (9 * 3600 + PROPOSAL.toleranceMinutes * 60)) hold("outside_proposed_window_no_catch_up");
   }
-  if (step && !step.requiredFacts.every(fact => event.claimedFacts.includes(fact))) hold("required_template_fact_missing");
+  // The day-15 fee fact exists to stop a text CLAIMING the 3% fee without proof. A day-15
+  // homeowner text that states no fee at all makes no such claim, so the fact is not
+  // required of it. Deliberately narrow: day 15 only, homeowner only, the fee fact only,
+  // no facts claimed anywhere, and BOTH evidence reads must independently assert that the
+  // template is fee-claim-free. It exempts nothing from any other milestone or fact, and
+  // it never substitutes for proof of a fact that IS claimed.
+  const feeClaimFreeDay15 = event.dayPastDue === 15 && event.audience === "homeowner" &&
+    event.claimedFacts.length === 0 &&
+    request.preflight.template.feeClaimFree === true && request.final.template.feeClaimFree === true &&
+    request.preflight.template.claimedFacts.length === 0 && request.final.template.claimedFacts.length === 0;
+  if (step && !step.requiredFacts.every(fact => event.claimedFacts.includes(fact) ||
+      (fact === "three_percent_fee_applied" && feeClaimFreeDay15))) hold("required_template_fact_missing");
 
   for (const [phase, evidence] of [["preflight", request.preflight], ["final", request.final]] as const) {
     const fail = (reason: string) => hold(`${phase}:${reason}`);

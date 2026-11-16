@@ -209,6 +209,18 @@ export function feeEvidenceProvesThreePercent(evidence: Day15FeeEvidence | null,
   return evidence.feeMinor === Math.round((evidence.baseMinor * DAY15_FEE_BASIS_POINTS) / 10_000);
 }
 
+/**
+ * True only when the RENDERED body mentions no fee at all, in any form.
+ * This is the sole basis for the narrow day-15 fee-fact exemption in the gate.
+ * It is a statement about wording, never evidence that a fee does or does not exist.
+ * Deliberately strict: any mention, asserted or conditional, returns false.
+ */
+export function bodyMakesNoFeeClaim(body: unknown): boolean {
+  if (typeof body !== "string" || !body.trim() || body.includes("\0")) return false;
+  if (Buffer.byteLength(body, "utf8") > 4000) return false;
+  return !FEE_MENTION.test(body) && !FEE_ASSERTED.test(body) && !FEE_CONDITIONAL.test(body);
+}
+
 /** The terms text must itself mention a late fee. `statesLateFee: true` alone is a claim, not proof. */
 const TERMS_STATE_A_FEE = /\b(late fee|late charge|finance charge|past[- ]due (?:fee|charge)|3\s?%)\b/i;
 export function termsEvidenceSupportsWarning(evidence: Day15TermsEvidence | null, invoiceId: string): boolean {
