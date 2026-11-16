@@ -19,6 +19,7 @@ import { planNotification, type Event, type Request } from "../lib/notification-
 import {
   inspectDay15PilotReadiness, reviewDay15PilotConfiguration, feeEvidenceProvesThreePercent,
   renderDay15Body, day15ClaimedFacts, DAY15_FEE_FACT,
+  APPROVED_DAY15_SMS_BODY, termsEvidenceSupportsWarning, smsConsentIsRecorded,
   type Day15PilotConfig, type Day15PilotReview,
 } from "../lib/notification-day15-pilot";
 
@@ -258,8 +259,14 @@ test("the validator exposes no send action at all", () => {
 import { createHash } from "node:crypto";
 const sha256 = (v: string) => createHash("sha256").update(v, "utf8").digest("hex");
 
+const GOOD_CONSENT = { source: "signed-agreement", contactId: "contact-1", scope: "billing-sms",
+  recordedAt: "2026-09-01T17:00:00.000Z", evidenceRef: "consent-1" };
+const GOOD_TERMS = { source: "jobber-invoice-terms", invoiceId: "invoice-1",
+  termsExcerpt: "Payment due on receipt. A late fee of 3% may be applied to past due balances.",
+  statesLateFee: true, observedAt: "2026-11-14T16:00:00.000Z", evidenceRef: "terms-1" };
+
 function validConfig(options: { templatePolicy: Day15PilotConfig["template"]["policy"];
-  fee?: unknown; body?: string }): Day15PilotConfig {
+  fee?: unknown; body?: string; terms?: unknown; consent?: unknown }): Day15PilotConfig {
   const now = Date.now();
   const iso = (ms: number) => new Date(ms).toISOString();
   return {
@@ -282,6 +289,9 @@ function validConfig(options: { templatePolicy: Day15PilotConfig["template"]["po
         ? "Your invoice is 15 days past due and a 3% late fee has been applied. Balance now {{balance}}."
         : "Your invoice is 15 days past due. Balance {{balance}}. Please call our office at 602-329-7865.") },
     feeEvidence: (options.fee ?? null) as Day15PilotConfig["feeEvidence"],
+    termsEvidence: ((options.terms !== undefined ? options.terms
+      : options.templatePolicy === "day15-fee-may-apply" ? GOOD_TERMS : null)) as Day15PilotConfig["termsEvidence"],
+    smsConsent: ((options.consent !== undefined ? options.consent : GOOD_CONSENT)) as Day15PilotConfig["smsConsent"],
     nativeSms: { version: "2021-07-28", status: "pending", receiptSource: "app", semanticsRef: "sem-1",
       footer: { mode: "exact-native-suffix", suffix: "\n\nReply STOP to opt out.", evidenceRef: "foot-1" } },
   } as unknown as Day15PilotConfig;
@@ -410,4 +420,83 @@ test("rendering refuses a zero balance and an absent invoice number", () => {
     /invoice_display_number_required/);
   assert.equal(renderDay15Body(withNumber, { balanceMinor: 13700, invoiceNumber: "7203", dueOn: "2026-10-30" }),
     "Invoice 7203 is 15 days past due. Balance USD 137.00.");
+});
+
+// ---------------------------------------------------------------------------
+// 7. The exact approved wording, invoice terms, and consent
+// ---------------------------------------------------------------------------
+test("the exact approved copy is accepted: no balance placeholder, no currency policy", () => {
+  const config = validConfig({ templatePolicy: "day15-fee-may-apply", body: APPROVED_DAY15_SMS_BODY });
+  (config as any).currencyPolicy = null;   // it names no amount
+  const raw = JSON.stringify(config);
+  const result = inspectDay15PilotReadiness(raw, review(config, raw));
+  assert.equal(result.state, "reviewed_configuration", `missing: ${JSON.stringify(result.missing)}`);
+  assert.equal(result.feeClaim, "not_claimed_gate_will_hold");
+  assert.deepEqual([...result.claimedFacts], []);
+  // Nothing is rendered into it, so nothing can be rendered wrong.
+  assert.equal(renderDay15Body(config, { balanceMinor: 13700, dueOn: "2026-10-30" }), APPROVED_DAY15_SMS_BODY);
+});
+
+test("the warning is held unless the invoice TERMS support it", () => {
+  const config = validConfig({ templatePolicy: "day15-fee-may-apply", body: APPROVED_DAY15_SMS_BODY, terms: null });
+  (config as any).currencyPolicy = null;
+  const raw = JSON.stringify(config);
+  const result = inspectDay15PilotReadiness(raw, review(config, raw));
+  assert.equal(result.state, "held");
+  assert.ok(result.missing.includes("jobber_invoice_terms_must_support_the_fee_warning"));
+});
+
+test("terms evidence must show the fee in its own text, not just assert statesLateFee", () => {
+  const silent = { source: "jobber-invoice-terms" as const, invoiceId: "invoice-1",
+    termsExcerpt: "Payment is due on receipt. Thank you for your business.",
+    statesLateFee: true as const, observedAt: "2026-11-14T16:00:00.000Z", evidenceRef: "terms-1" };
+  assert.equal(termsEvidenceSupportsWarning(silent, "invoice-1"), false, "a flag is not proof");
+  assert.equal(termsEvidenceSupportsWarning({ ...silent,
+    termsExcerpt: "A late fee of 3% applies to past due balances." }, "invoice-1"), true);
+  assert.equal(termsEvidenceSupportsWarning({ ...silent,
+    termsExcerpt: "A late fee of 3% applies." }, "invoice-2"), false, "terms from another invoice");
+  assert.equal(termsEvidenceSupportsWarning(null, "invoice-1"), false);
+});
+
+test("terms evidence may not ride along with a policy that does not use it", () => {
+  const config = validConfig({ templatePolicy: "day15-no-fee-claim", terms: GOOD_TERMS });
+  const raw = JSON.stringify(config);
+  const result = inspectDay15PilotReadiness(raw, review(config, raw));
+  assert.equal(result.state, "held");
+  assert.ok(result.missing.includes("terms_evidence_requires_may_apply_policy"));
+});
+
+test("no recorded consent means held, under every policy", () => {
+  for (const policy of ["day15-fee-applied", "day15-fee-may-apply", "day15-no-fee-claim"] as const) {
+    const config = validConfig({ templatePolicy: policy, consent: null,
+      fee: policy === "day15-fee-applied" ? { source: "jobber-invoice-line-item", invoiceId: "invoice-1",
+        lineItemName: "Late Fee", feeMinor: 399, baseMinor: 13300,
+        observedAt: "2026-11-14T16:00:00.000Z", evidenceRef: "jobber-line-1" } : null });
+    const raw = JSON.stringify(config);
+    const result = inspectDay15PilotReadiness(raw, review(config, raw));
+    assert.equal(result.state, "held", `${policy} should hold without consent`);
+    assert.ok(result.missing.includes("recorded_homeowner_consent_to_billing_sms"), policy);
+  }
+});
+
+test("an absent SMS DND record cannot be turned into consent", () => {
+  // The shapes a DND reading could offer. None of them satisfies the check.
+  for (const shape of [
+    { source: "no_dnd_record", contactId: "contact-1", scope: "billing-sms", recordedAt: "2026-09-01T17:00:00.000Z", evidenceRef: "dnd-1" },
+    { source: "signed-agreement", contactId: "contact-1", scope: "sms", recordedAt: "2026-09-01T17:00:00.000Z", evidenceRef: "dnd-1" },
+    { source: "signed-agreement", contactId: "contact-1", scope: "marketing-sms", recordedAt: "2026-09-01T17:00:00.000Z", evidenceRef: "dnd-1" },
+    { source: "signed-agreement", contactId: "someone-else", scope: "billing-sms", recordedAt: "2026-09-01T17:00:00.000Z", evidenceRef: "dnd-1" },
+  ]) {
+    assert.equal(smsConsentIsRecorded(shape as any, "contact-1"), false, JSON.stringify(shape.source + "/" + shape.scope));
+  }
+  assert.equal(smsConsentIsRecorded(GOOD_CONSENT as any, "contact-1"), true);
+});
+
+test("consent to marketing texts is not consent to billing texts", () => {
+  const config = validConfig({ templatePolicy: "day15-no-fee-claim",
+    consent: { ...GOOD_CONSENT, scope: "marketing-sms" } });
+  const raw = JSON.stringify(config);
+  const result = inspectDay15PilotReadiness(raw, review(config, raw));
+  assert.equal(result.state, "held");
+  assert.ok(result.missing.includes("recorded_homeowner_consent_to_billing_sms"));
 });
