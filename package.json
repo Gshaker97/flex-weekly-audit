@@ -9,7 +9,8 @@
     "sync:cron": "JOBBER_PAID_BALANCE_CORRECTION_ENABLED=true TZ=America/Phoenix tsx scripts/sync-cron.ts",
     "lint": "next lint",
     "postinstall": "prisma generate",
-    "reminders:evaluate": "TZ=America/Phoenix tsx scripts/reminder-evaluate-cron.ts"
+    "reminders:evaluate": "TZ=America/Phoenix tsx scripts/reminder-evaluate-cron.ts",
+    "day15:pilot": "TZ=America/Phoenix tsx scripts/day15-pilot-cron.ts"
   },
   "dependencies": {
     "@prisma/client": "^5.22.0",

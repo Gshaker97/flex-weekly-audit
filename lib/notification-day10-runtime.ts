@@ -19,14 +19,19 @@ export function verifyDay10DeploymentHolds(env: Record<string, string | undefine
 /** No OAuth refresh, token save, schema change or startup/migration call. Do not invoke during development. */
 export async function bootstrapDay10PilotRuntime(scope: Readonly<{
   accountId: string; locationId: string; action: "read-only" | "one-attempt"; expiresAt: string;
+  /** Which deployed service is bootstrapping. Omitted means the original web pilot
+   *  service, so every existing caller keeps the exact behaviour it had. */
+  service?: "pilot" | "recurring-cron";
 }>): Promise<Day10PilotRuntime> {
   if (!["read-only", "one-attempt"].includes(scope.action) || !scope.accountId || !scope.locationId)
     throw new Error("explicit_exact_runtime_scope_required");
-  verifyDay10DeploymentHolds(process.env, scope.locationId);
+  const service = scope.service ?? "pilot";
+  if (!["pilot", "recurring-cron"].includes(service)) throw new Error("explicit_exact_runtime_scope_required");
+  verifyDay10DeploymentHolds(process.env, scope.locationId, service);
   const original = Object.fromEntries(["RAILWAY_SERVICE_ID", "RAILWAY_ENVIRONMENT_ID", "RAILWAY_PROJECT_ID",
     "RAILWAY_DEPLOYMENT_ID", "DATABASE_URL", "GHL_LOCATION_ID", "GHL_API_KEY"].map(key => [key, process.env[key]]));
   const verify = () => {
-    verifyDay10DeploymentHolds(process.env, scope.locationId);
+    verifyDay10DeploymentHolds(process.env, scope.locationId, service);
     if (Date.now() >= Date.parse(scope.expiresAt) || !Number.isFinite(Date.parse(scope.expiresAt)) ||
         Object.entries(original).some(([key, value]) => process.env[key] !== value)) throw new Error("pilot_runtime_configuration_changed_or_expired");
   };
