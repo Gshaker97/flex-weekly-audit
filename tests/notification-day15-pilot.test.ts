@@ -258,7 +258,7 @@ test("the validator exposes no send action at all", () => {
 import { createHash } from "node:crypto";
 const sha256 = (v: string) => createHash("sha256").update(v, "utf8").digest("hex");
 
-function validConfig(options: { templatePolicy: "day15-fee-applied" | "day15-no-fee-claim";
+function validConfig(options: { templatePolicy: Day15PilotConfig["template"]["policy"];
   fee?: unknown; body?: string }): Day15PilotConfig {
   const now = Date.now();
   const iso = (ms: number) => new Date(ms).toISOString();
@@ -335,7 +335,49 @@ test("no-fee-claim copy may not smuggle fee wording back in", () => {
   const raw = JSON.stringify(config);
   const result = inspectDay15PilotReadiness(raw, review(config, raw));
   assert.equal(result.state, "held");
-  assert.ok(result.missing.includes("no_fee_claim_copy_must_not_assert_a_fee"));
+  assert.ok(result.missing.includes("no_fee_claim_copy_must_not_mention_a_fee"));
+  assert.ok(result.missing.includes("asserted_fee_requires_fee_applied_policy"));
+});
+
+// --- The copy that is actually live in Fixed Automation, read 2026-11-16 ---
+const LIVE_DAY15_SMS =
+  "Hello {{balance}}, This is your reminder that your invoice is past due. " +
+  "A late fee of 3% may apply under your invoice terms, and we kindly ask this invoice " +
+  "be paid to avoid potential late fees. If you have any questions or concerns please " +
+  "reach out to our office at 602-329-7865.";
+
+test("the live approved Day 15 copy warns about the fee and does NOT assert it", () => {
+  const config = validConfig({ templatePolicy: "day15-fee-may-apply", body: LIVE_DAY15_SMS });
+  const raw = JSON.stringify(config);
+  const result = inspectDay15PilotReadiness(raw, review(config, raw));
+  assert.equal(result.state, "reviewed_configuration", `missing: ${JSON.stringify(result.missing)}`);
+  assert.equal(result.feeClaim, "not_claimed_gate_will_hold");
+  assert.deepEqual([...result.claimedFacts], [], "a warning claims nothing, so no Jobber proof is needed");
+});
+
+test("the live copy is rejected if filed as an assertion, because nothing proves the fee", () => {
+  const config = validConfig({ templatePolicy: "day15-fee-applied", body: LIVE_DAY15_SMS, fee: null });
+  const raw = JSON.stringify(config);
+  const result = inspectDay15PilotReadiness(raw, review(config, raw));
+  assert.equal(result.state, "held");
+  assert.ok(result.missing.includes("jobber_proven_three_percent_fee_for_this_invoice"));
+});
+
+test("'may apply' is not accepted as a fee-free template", () => {
+  const config = validConfig({ templatePolicy: "day15-no-fee-claim", body: LIVE_DAY15_SMS });
+  const raw = JSON.stringify(config);
+  const result = inspectDay15PilotReadiness(raw, review(config, raw));
+  assert.equal(result.state, "held");
+  assert.ok(result.missing.includes("no_fee_claim_copy_must_not_mention_a_fee"));
+});
+
+test("an assertion dressed up as a warning is still an assertion", () => {
+  const config = validConfig({ templatePolicy: "day15-fee-may-apply",
+    body: "Your invoice is past due. A 3% late fee has been applied to avoid further charges. Balance {{balance}}." });
+  const raw = JSON.stringify(config);
+  const result = inspectDay15PilotReadiness(raw, review(config, raw));
+  assert.equal(result.state, "held");
+  assert.ok(result.missing.includes("may_apply_copy_must_not_assert_a_fee_was_applied"));
 });
 
 test("no-fee-claim copy is valid, claims nothing, and the gate will hold it", () => {

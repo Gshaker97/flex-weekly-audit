@@ -62,7 +62,22 @@ export type Day15FeeEvidence = Readonly<{
   evidenceRef: string;
 }>;
 
-export type Day15TemplatePolicy = "day15-fee-applied" | "day15-no-fee-claim";
+/**
+ * Three policies, because the live approved Day 15 copy is none of the two
+ * obvious ones. It reads, in part:
+ *
+ *   "A late fee of 3% MAY APPLY under your invoice terms, and we kindly ask
+ *    this invoice be paid to avoid POTENTIAL late fees."
+ *
+ * That warns about a fee. It does not claim one was charged. Treating it as a
+ * claim would be wrong, and treating it as fee-free would let a real claim slip
+ * through later, so it gets a policy of its own.
+ *
+ *   day15-fee-applied   asserts the fee -> requires Jobber proof
+ *   day15-fee-may-apply warns about it  -> asserts nothing, proves nothing
+ *   day15-no-fee-claim  silent about it -> no fee wording at all
+ */
+export type Day15TemplatePolicy = "day15-fee-applied" | "day15-fee-may-apply" | "day15-no-fee-claim";
 
 export type Day15PilotConfig = Readonly<{
   version: 1; kind: "day15-homeowner-sms-pilot"; reviewRef: string; reviewedAt: string; expiresAt: string;
@@ -117,8 +132,16 @@ const actualChecks = Object.freeze(["read_only_existing_token_with_900_second_co
   "approved_exact_rendered_request_and_single_pending_post_boundary",
   "jobber_proven_three_percent_fee_before_any_fee_claim"]);
 
-/** Any wording that asserts a fee was charged. Matched case-insensitively. */
-const FEE_LANGUAGE = /\b(late fee|3%|three percent|fee (?:has been|was|is) (?:applied|added|charged)|service charge)\b/i;
+/** Any mention of a fee at all, asserted or not. */
+const FEE_MENTION = /\b(late fee|late fees|3\s?%|three percent|service charge)\b/i;
+/**
+ * Wording that ASSERTS a fee was actually charged. This is the dangerous shape:
+ * it is a statement about the customer's balance, so it needs Jobber's proof.
+ * "may apply", "could apply", "potential" are warnings and are not matched.
+ */
+const FEE_ASSERTED = /\b(?:fee|charge)s?\b[^.!?]{0,40}\b(?:has been|have been|was|were|is|are)\s+(?:now\s+)?(?:applied|added|charged|assessed)\b|\b(?:applied|added|charged|assessed)\s+(?:a\s+)?(?:3\s?%\s+)?(?:late\s+)?fee\b|\byour\s+balance\s+(?:now\s+)?includes\b/i;
+/** Explicit conditional language. Required for the "may apply" policy. */
+const FEE_CONDITIONAL = /\b(may|might|could|can|will)\s+(?:apply|be applied|be added|be charged)\b|\bpotential\b|\bto avoid\b/i;
 
 /**
  * Jobber must prove the fee on THIS invoice, arithmetically.
@@ -189,7 +212,8 @@ function readiness(raw: string | undefined, review?: Day15PilotReview): { result
       text(c.sender?.approvalRef) && text(c.sender?.writeScopeEvidenceRef), "explicit_sender_and_scope_review");
 
     const t = c.template;
-    const policyKnown = t?.policy === "day15-fee-applied" || t?.policy === "day15-no-fee-claim";
+    const policyKnown = t?.policy === "day15-fee-applied" || t?.policy === "day15-fee-may-apply" ||
+      t?.policy === "day15-no-fee-claim";
     check(keys(t, ["id", "version", "body", "policy", "approvalRef"]) && [t?.id, t?.version, t?.approvalRef].every(text) &&
       policyKnown && typeof t?.body === "string" && t.body.trim() && Buffer.byteLength(t.body, "utf8") <= 4000 &&
       !t.body.includes("\0") && t.body.includes("{{balance}}") &&
@@ -199,22 +223,32 @@ function readiness(raw: string | undefined, review?: Day15PilotReview): { result
     // ---- The fee rule. This is the whole reason the module exists. ----
     const invoiceId = s?.scope?.invoiceId;
     const proven = typeof invoiceId === "string" && feeEvidenceProvesThreePercent(c.feeEvidence ?? null, invoiceId);
-    const claimsFee = typeof t?.body === "string" && FEE_LANGUAGE.test(t.body);
+    const body = typeof t?.body === "string" ? t.body : "";
+    const asserts = FEE_ASSERTED.test(body);
+    const mentions = FEE_MENTION.test(body);
+    const conditional = FEE_CONDITIONAL.test(body);
 
     if (t?.policy === "day15-fee-applied") {
       check(proven, "jobber_proven_three_percent_fee_for_this_invoice");
       feeClaim = proven ? "proven_by_jobber" : "unresolved";
       claimedFacts = proven ? Object.freeze([DAY15_FEE_FACT]) : Object.freeze([]);
+    } else if (t?.policy === "day15-fee-may-apply") {
+      // A warning, not a claim. It must actually be conditional, and it must
+      // not assert. It proves nothing and so carries no evidence.
+      check(!asserts, "may_apply_copy_must_not_assert_a_fee_was_applied");
+      check(mentions && conditional, "may_apply_copy_must_state_the_condition_explicitly");
+      check(c.feeEvidence === null, "may_apply_policy_requires_null_fee_evidence");
+      feeClaim = "not_claimed_gate_will_hold";
+      claimedFacts = Object.freeze([]);
     } else if (t?.policy === "day15-no-fee-claim") {
-      // Copy that does not claim the fee must not smuggle it back in, and must
-      // not carry evidence it is not using.
-      check(!claimsFee, "no_fee_claim_copy_must_not_assert_a_fee");
+      // Silent about the fee. Any mention at all belongs under another policy.
+      check(!mentions, "no_fee_claim_copy_must_not_mention_a_fee");
       check(c.feeEvidence === null, "no_fee_claim_policy_requires_null_fee_evidence");
       feeClaim = "not_claimed_gate_will_hold";
       claimedFacts = Object.freeze([]);
     }
-    // Fee language is only ever permitted under the proven policy.
-    check(!claimsFee || t?.policy === "day15-fee-applied", "fee_language_requires_fee_applied_policy");
+    // An assertion is only ever permitted under the proven policy.
+    check(!asserts || t?.policy === "day15-fee-applied", "asserted_fee_requires_fee_applied_policy");
 
     const n = c.nativeSms;
     check(keys(n, ["version", "status", "receiptSource", "semanticsRef", "footer"]) && n?.version === "2021-07-28" &&
