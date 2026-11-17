@@ -13,6 +13,7 @@ import { resetJournalOwnedInvoiceCycle } from "./ghl-cycle-reset";
 import { syncRecurringDueDateBeforeStage } from "./ghl-recurring-due-date";
 import { runConfiguredDateRepair } from "./ghl-date-repair-operation";
 import { runConfiguredRecurringDay10, recurringDay10SyncIssue } from "./notification-recurring-cron";
+import { runConfiguredRecurringDay15Email, recurringDay15EmailSyncIssue } from "./notification-recurring-day15-cron";
 import {
   fetchAllClients,
   fetchAllJobs,
@@ -138,6 +139,9 @@ export async function runFullSync(
   const writer = new SyncRunWriter(run.id);
   let heavyFeeds: Promise<{ ok: true } | { ok: false; err: unknown }> | undefined;
   let recurringDay10Issue: string | null = null;
+  let recurringDay15EmailIssue: string | null = null;
+  // Both notification phases contribute to one SyncRun note.
+  const notificationIssues = () => [recurringDay10Issue, recurringDay15EmailIssue].filter(Boolean).join(" · ") || null;
   log(`[sync] mode=${run.mode}${since ? ` since=${since.toISOString()}` : ""}`);
 
   try {
@@ -155,7 +159,15 @@ export async function runFullSync(
     // retain their ledger fence without stopping unrelated dashboard cache refresh.
     const recurringDay10 = await runConfiguredRecurringDay10({ entrypoint: opts.entrypoint ?? "http" });
     recurringDay10Issue = recurringDay10SyncIssue(recurringDay10);
-    if (recurringDay10Issue) await prisma.syncRun.update({ where: { id: run.id }, data: { errorMessage: recurringDay10Issue } });
+
+    // Day 15 customer email. Independent milestone, independent ledger events, same
+    // admitted standalone-cron entrypoint and the same default-disabled contract. A
+    // held or unknown Day 10 phase does not start or skip this one; each milestone is
+    // fenced by its own ledger key, so neither can mask the other.
+    const recurringDay15Email = await runConfiguredRecurringDay15Email({ entrypoint: opts.entrypoint ?? "http" });
+    recurringDay15EmailIssue = recurringDay15EmailSyncIssue(recurringDay15Email);
+    const notificationIssue = notificationIssues();
+    if (notificationIssue) await prisma.syncRun.update({ where: { id: run.id }, data: { errorMessage: notificationIssue } });
 
     // Jobs and visits are the two heavy feeds — neither accepts an updatedAt
     // filter, so both pull in full every sync and together they are the large
@@ -189,7 +201,7 @@ export async function runFullSync(
               visitsFetched: visits.length,
               // A truncated pull is not an error, but it silently leaves the
               // newest records stale — so it has to be recorded, not just logged.
-              ...(warnings.length ? { errorMessage: [recurringDay10Issue, ...warnings].filter(Boolean).join(" · ") } : {}),
+              ...(warnings.length ? { errorMessage: [notificationIssues(), ...warnings].filter(Boolean).join(" · ") } : {}),
             },
           });
         } catch (err: any) {
@@ -199,7 +211,7 @@ export async function runFullSync(
           await prisma.syncRun
             .update({
               where: { id: run.id },
-              data: { errorMessage: [recurringDay10Issue, `Visit sync failed: ${err?.message ?? err}`].filter(Boolean).join(" · ") },
+              data: { errorMessage: [notificationIssues(), `Visit sync failed: ${err?.message ?? err}`].filter(Boolean).join(" · ") },
             })
             .catch(() => {});
         }
@@ -300,7 +312,7 @@ export async function runFullSync(
     // Never release admission while a rejected feed still has sibling work.
     // A killed process leaves running/blocked state for explicit operator review.
     await heavyFeeds;
-    await writer.finish("failed", [recurringDay10Issue, err?.message ?? "Unknown error"].filter(Boolean).join(" · "));
+    await writer.finish("failed", [notificationIssues(), err?.message ?? "Unknown error"].filter(Boolean).join(" · "));
     throw err;
   }
 }

@@ -160,10 +160,20 @@ test("actual sync has one awaited call after first normal token use and before a
   assert.ok(hook < source.indexOf("heavyFeeds = Promise.allSettled(["));
   assert.match(source.slice(hook, hook + 110), /entrypoint: opts.entrypoint \?\? "http"/);
   assert.ok(source.indexOf("recurringDay10Issue = recurringDay10SyncIssue(recurringDay10)") > hook);
-  assert.ok(source.indexOf("data: { errorMessage: recurringDay10Issue }") < source.indexOf("heavyFeeds = Promise.allSettled(["));
-  assert.match(source, /errorMessage: \[recurringDay10Issue, \.\.\.warnings\]/);
-  assert.match(source, /errorMessage: \[recurringDay10Issue, `Visit sync failed:/);
-  assert.match(source, /writer.finish\("failed", \[recurringDay10Issue,/);
+  // Both notification milestones fold into one SyncRun note. The Day 10 issue must
+  // still never be dropped, so the combined helper is required to include it.
+  assert.match(source, /const notificationIssues = \(\) => \[recurringDay10Issue, recurringDay15EmailIssue\]/);
+  assert.ok(source.indexOf("data: { errorMessage: notificationIssue }") < source.indexOf("heavyFeeds = Promise.allSettled(["));
+  assert.match(source, /errorMessage: \[notificationIssues\(\), \.\.\.warnings\]/);
+  assert.match(source, /errorMessage: \[notificationIssues\(\), `Visit sync failed:/);
+  assert.match(source, /writer.finish\("failed", \[notificationIssues\(\),/);
+  // The Day 15 email phase is a second awaited call in the same admitted phase,
+  // still before any heavy feed, and it never replaces the Day 10 phase.
+  const hook15 = source.indexOf("await runConfiguredRecurringDay15Email(");
+  assert.equal(source.match(/await runConfiguredRecurringDay15Email\(/g)?.length, 1);
+  assert.ok(hook < hook15);
+  assert.ok(hook15 < source.indexOf("heavyFeeds = Promise.allSettled(["));
+  assert.match(source.slice(hook15, hook15 + 110), /entrypoint: opts.entrypoint \?\? "http"/);
   const cron = readFileSync("scripts/sync-cron.ts", "utf8");
   assert.match(cron, /await runFullSync\(\{ triggeredBy: "cron", entrypoint: "standalone_cron" \}\)/);
 });

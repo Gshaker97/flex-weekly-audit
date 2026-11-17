@@ -1,7 +1,8 @@
 import { prisma } from "@/lib/prisma";
 import { computeDashboardKPIs } from "@/lib/kpis";
 import { COLLECTIONS_SINCE } from "@/lib/lateInvoices";
-import { overdueInvoicesWhere, legacyOverdueWhere } from "@/lib/invoiceMetrics";
+import { overdueInvoicesWhere, legacyOverdueWhere, oldestInvoiceVerification,
+  invoiceVerificationIsStale } from "@/lib/invoiceMetrics";
 import { resolveDateRange, rangeQueryString } from "@/lib/dateRange";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
@@ -59,11 +60,18 @@ export default async function DashboardPage({
   // stored due date has passed, within the existing issue-date scope.
   const overdueUnpaid = await prisma.invoiceRecord.findMany({
     where: overdueInvoicesWhere(range, COLLECTIONS_SINCE, now),
-    select: { amountDue: true, invoiceStatus: true },
+    select: { amountDue: true, invoiceStatus: true, lastSyncedAt: true },
   });
   const overdueInvoiceTotal = overdueUnpaid.reduce((a, i) => a + (i.amountDue || 0), 0);
   const overdueInvoiceCount = overdueUnpaid.length;
   const agedAwaitingCount = overdueUnpaid.filter(i => i.invoiceStatus === "awaiting_payment").length;
+  // How much of this headline figure has not been FULLY refreshed recently. Not the
+  // same as unverified: the hourly status refresh may have confirmed these balances,
+  // but it records no per-invoice outcome, so that cannot be shown here.
+  const overdueVerification = oldestInvoiceVerification(overdueUnpaid, now);
+  const overdueUnverifiedTotal = overdueUnpaid
+    .filter(i => invoiceVerificationIsStale(i, now))
+    .reduce((a, i) => a + (i.amountDue || 0), 0);
   const legacyOverdue = await prisma.invoiceRecord.aggregate({
     where: legacyOverdueWhere(range, COLLECTIONS_SINCE, now),
     _sum: { amountDue: true }, _count: true,
@@ -162,7 +170,9 @@ export default async function DashboardPage({
             href={`/risk/overdue-invoices${qs}`}
             label="Overdue in Collections scope"
             value={formatCurrency(overdueInvoiceTotal)}
-            sublabel={`${overdueInvoiceCount} positive balances; ${agedAwaitingCount} calculated from stored due dates`}
+            sublabel={`${overdueInvoiceCount} positive balances; ${agedAwaitingCount} calculated from stored due dates` + (overdueVerification.staleCount
+                ? ` · ${formatCurrency(overdueUnverifiedTotal)} across ${overdueVerification.staleCount} not fully refreshed recently`                + (overdueVerification.oldestDays === null ? "" : ` (oldest ${overdueVerification.oldestDays}d)`)
+                : "")}
             accent={overdueInvoiceTotal > 0 ? "danger" : "success"}
             icon={<Receipt size={18} />}
           />

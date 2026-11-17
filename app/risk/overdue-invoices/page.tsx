@@ -12,7 +12,8 @@ import { StatCard } from "@/components/ui/StatCard";
 import DateRangeFilter from "@/components/ui/DateRangeFilter";
 import { resolveDateRange, getDateRange } from "@/lib/dateRange";
 import { COLLECTIONS_SINCE } from "@/lib/lateInvoices";
-import { overdueInvoicesWhere, legacyOverdueWhere, overdueDisplayBasis } from "@/lib/invoiceMetrics";
+import { overdueInvoicesWhere, legacyOverdueWhere, overdueDisplayBasis,
+  invoiceVerificationBasis, oldestInvoiceVerification, describeDashboardFreshness } from "@/lib/invoiceMetrics";
 import { formatCurrency, formatCurrencyDetailed, formatDate } from "@/lib/utils";
 import { Receipt, PiggyBank, Users } from "lucide-react";
 
@@ -43,6 +44,18 @@ export default async function OverdueInvoicesPage({
     orderBy: { dueAt: "asc" },
   });
   const legacyTotal = legacyInvoices.reduce((sum, i) => sum + i.amountDue, 0);
+
+  // Freshness is reported from the rows ACTUALLY DISPLAYED, not from the run.
+  // A completed sync run does not establish that any particular invoice was
+  // covered by it: Jobber can stop returning an invoice entirely, in which case
+  // the status refresh holds and the last-known values stay on screen.
+  const lastSuccessfulSync = await prisma.syncRun.findFirst({
+    where: { status: "complete", completedAt: { not: null } },
+    orderBy: { completedAt: "desc" },
+    select: { completedAt: true },
+  });
+  const verification = oldestInvoiceVerification([...invoices, ...legacyInvoices], now);
+  const freshness = describeDashboardFreshness(lastSuccessfulSync?.completedAt ?? null, verification);
 
   // Job date per invoice: match InvoiceRecord.invoiceNumber -> JobRecord.invoiceNumber
   // and use the job's completion (or scheduled end) date.
@@ -82,6 +95,9 @@ export default async function OverdueInvoicesPage({
               Positive balances with cached past_due status or awaiting_payment whose stored due date has passed, issued since January 1, 2026 and within{" "}
               <span className="font-medium text-foreground">{range.label}</span>. Stored-date aging is calculated for display, not refreshed source status or the original sent-day reminder clock. This is the Collections cutoff scope.
             </p>
+            <p className="mt-2 text-sm font-medium text-amber-700 dark:text-amber-500" data-testid="dashboard-freshness">
+              {freshness}
+            </p>
           </div>
           <DateRangeFilter />
         </div>
@@ -113,7 +129,7 @@ export default async function OverdueInvoicesPage({
         <CardHeader><CardTitle>Older Past Due Outside Collections Scope</CardTitle><CardDescription>{legacyInvoices.length} records / {formatCurrencyDetailed(legacyTotal)} within the selected range predate the cutoff. Policy exclusion does not prove settlement. Verify before any catch-up reminder.</CardDescription></CardHeader>
         <CardContent><div className="overflow-x-auto"><table className="w-full text-sm">
           <thead><tr className="text-left"><th className="p-2">Invoice</th><th className="p-2">Customer</th><th className="p-2">Issued</th><th className="p-2">Balance</th></tr></thead>
-          <tbody>{legacyInvoices.map(inv => <tr key={inv.id} className="border-t border-border"><td className="p-2">#{inv.invoiceNumber ?? "Unknown"}<div className="text-xs text-muted-foreground">Cached status: {inv.invoiceStatus ?? "Unknown"}<br />{overdueDisplayBasis(inv, now)}</div></td><td className="p-2">{inv.clientName ?? "Unknown"}</td><td className="p-2">{formatDate(inv.issuedAt)}</td><td className="p-2">{formatCurrencyDetailed(inv.amountDue)}</td></tr>)}</tbody>
+          <tbody>{legacyInvoices.map(inv => <tr key={inv.id} className="border-t border-border"><td className="p-2">#{inv.invoiceNumber ?? "Unknown"}<div className="text-xs text-muted-foreground">Cached status: {inv.invoiceStatus ?? "Unknown"}<br />{overdueDisplayBasis(inv, now)}{invoiceVerificationBasis(inv, now) && <><br /><span className="text-amber-600 dark:text-amber-500">{invoiceVerificationBasis(inv, now)}</span></>}</div></td><td className="p-2">{inv.clientName ?? "Unknown"}</td><td className="p-2">{formatDate(inv.issuedAt)}</td><td className="p-2">{formatCurrencyDetailed(inv.amountDue)}</td></tr>)}</tbody>
         </table></div></CardContent>
       </Card>}
 
@@ -153,7 +169,7 @@ export default async function OverdueInvoicesPage({
                         </td>
                         <td className="px-4 py-3 font-medium">
                           {inv.invoiceNumber ? `#${inv.invoiceNumber}` : "—"}
-                          <div className="text-xs font-normal text-muted-foreground">Cached status: {inv.invoiceStatus ?? "Unknown"}</div>
+                          <div className="text-xs font-normal text-muted-foreground">Cached status: {inv.invoiceStatus ?? "Unknown"}{invoiceVerificationBasis(inv, now) && <><br /><span className="text-amber-600 dark:text-amber-500">{invoiceVerificationBasis(inv, now)}</span></>}</div>
                           <div className="text-xs font-normal text-muted-foreground">{overdueDisplayBasis(inv, now)}</div>
                         </td>
                         <td className="px-4 py-3 text-muted-foreground">

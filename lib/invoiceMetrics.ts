@@ -112,3 +112,103 @@ export function sumInvoiceMonths(invoices: Array<{ issuedAt: Date | null; total:
   }
   return months;
 }
+
+// ---------------------------------------------------------------------------
+// Source-verification freshness.
+//
+// `InvoiceRecord.lastSyncedAt` is advanced only when the FULL invoice sync
+// actually included this invoice. The hourly open-invoice status refresh
+// deliberately does not advance it ("the row was not fully refreshed"), because
+// that read covers only status, amounts and owner.
+//
+// So this timestamp answers exactly one question: how long since the invoice was
+// fully refreshed. It does NOT mean the balance is unverified -- the hourly status
+// refresh may have confirmed it minutes ago. That hourly outcome is written only
+// to a log line, so nothing here can distinguish:
+//
+//   confirmed against Jobber this hour, unchanged   -> no record written
+//   not confirmable at all (Jobber returns null)    -> no record written
+//
+// Both look identical in the database. Telling them apart needs the refresh
+// outcome persisted, which is a schema change. Until then these helpers claim
+// only what the timestamp supports, and the page says plainly what it cannot
+// establish -- a completed run is not evidence that any one figure is current.
+// ---------------------------------------------------------------------------
+
+/** Beyond this, a row is reported as not fully refreshed rather than simply shown. */
+export const INVOICE_VERIFICATION_STALE_DAYS = 2;
+
+const DAY_MS = 86_400_000;
+
+/** Whole days since the full sync last included this invoice. Null if unreadable. */
+export function invoiceVerificationAgeDays(
+  invoice: { lastSyncedAt: Date | null },
+  asOf: Date,
+): number | null {
+  const at = invoice.lastSyncedAt?.getTime();
+  const ref = asOf?.getTime();
+  if (!Number.isFinite(at) || !Number.isFinite(ref)) return null;
+  return Math.max(0, Math.floor((ref! - at!) / DAY_MS));
+}
+
+/** True when this row has not been fully refreshed recently. */
+export function invoiceVerificationIsStale(
+  invoice: { lastSyncedAt: Date | null },
+  asOf: Date,
+  staleDays: number = INVOICE_VERIFICATION_STALE_DAYS,
+): boolean {
+  const age = invoiceVerificationAgeDays(invoice, asOf);
+  return age === null || age >= staleDays;
+}
+
+/**
+ * One short phrase for display, or null when recently refreshed. Deliberately
+ * says "not fully refreshed", NOT "unverified": the hourly status refresh may
+ * have confirmed this balance, and that is simply not recorded anywhere.
+ */
+export function invoiceVerificationBasis(
+  invoice: { lastSyncedAt: Date | null },
+  asOf: Date,
+  staleDays: number = INVOICE_VERIFICATION_STALE_DAYS,
+): string | null {
+  const age = invoiceVerificationAgeDays(invoice, asOf);
+  if (age === null) return "No refresh timestamp recorded";
+  if (age < staleDays) return null;
+  return `Not fully refreshed for ${age} day${age === 1 ? "" : "s"}`;
+}
+
+/**
+ * Worst-case refresh age across the rows actually displayed, so a current sync
+ * run cannot imply every figure on the page is current.
+ */
+export function oldestInvoiceVerification(
+  invoices: ReadonlyArray<{ lastSyncedAt: Date | null }>,
+  asOf: Date,
+): Readonly<{ oldestDays: number | null; staleCount: number; total: number }> {
+  let oldestDays: number | null = null;
+  let staleCount = 0;
+  for (const invoice of invoices) {
+    const age = invoiceVerificationAgeDays(invoice, asOf);
+    if (age === null || age >= INVOICE_VERIFICATION_STALE_DAYS) staleCount++;
+    if (age !== null && (oldestDays === null || age > oldestDays)) oldestDays = age;
+  }
+  return Object.freeze({ oldestDays, staleCount, total: invoices.length });
+}
+
+/**
+ * One sentence for a page header. Deliberately refuses to call the page current
+ * on the strength of a completed run alone.
+ */
+export function describeDashboardFreshness(
+  lastSuccessfulSyncAt: Date | null,
+  rows: Readonly<{ oldestDays: number | null; staleCount: number; total: number }>,
+): string {
+  const run = lastSuccessfulSyncAt
+    ? `Last successful sync ${lastSuccessfulSyncAt.toISOString().slice(0, 16).replace("T", " ")}Z`
+    : "No successful sync recorded";
+  if (!rows.total) return `${run}. No invoices shown.`;
+  if (!rows.staleCount) return `${run}. All ${rows.total} shown fully refreshed within ${INVOICE_VERIFICATION_STALE_DAYS} days.`;
+  const oldest = rows.oldestDays === null ? "unknown" : `${rows.oldestDays} days`;
+  return `${run}. ${rows.staleCount} of ${rows.total} shown NOT fully refreshed recently (oldest ${oldest}). ` +
+    `Per-invoice source confirmation is not recorded, so a completed sync is not evidence that any one figure here is current.`;
+}
