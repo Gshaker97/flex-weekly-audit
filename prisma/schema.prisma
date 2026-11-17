@@ -217,6 +217,13 @@ model InvoiceRecord {
   customerId        String?
   clientName        String?
   lastSyncedAt      DateTime  @default(now())
+  // Set by the hourly open-invoice status refresh only. lastVerifiedAt advances
+  // ONLY on a confirmed read, so a failed check cannot make a row look current.
+  // lastVerifyOutcome records the latest check's result; because that check covers
+  // every open invoice on every run, it is always as of the most recent run.
+  // Both are nullable: rows written before this change have no verification record.
+  lastVerifiedAt    DateTime?
+  lastVerifyOutcome String?
 
   customer Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
 

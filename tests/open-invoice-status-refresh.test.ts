@@ -86,7 +86,7 @@ test("complete batches include every ID; only the final complete result is retur
 });
 
 test("empty target list performs no source reads", async () => {
-  assert.deepEqual(await planOpenInvoiceStatusRefresh([], async () => { throw new Error("unexpected read"); }), { checked: 0, updates: [], holds: [] });
+  assert.deepEqual(await planOpenInvoiceStatusRefresh([], async () => { throw new Error("unexpected read"); }), { checked: 0, updates: [], holds: [], verifications: [] });
 });
 
 test("same explicit status is a no-op even if caller believes due date elapsed", async () => {

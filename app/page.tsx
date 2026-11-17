@@ -2,7 +2,7 @@ import { prisma } from "@/lib/prisma";
 import { computeDashboardKPIs } from "@/lib/kpis";
 import { COLLECTIONS_SINCE } from "@/lib/lateInvoices";
 import { overdueInvoicesWhere, legacyOverdueWhere, oldestInvoiceVerification,
-  invoiceVerificationIsStale } from "@/lib/invoiceMetrics";
+  invoiceVerificationIsStale, invoiceVerificationState } from "@/lib/invoiceMetrics";
 import { resolveDateRange, rangeQueryString } from "@/lib/dateRange";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
@@ -60,7 +60,8 @@ export default async function DashboardPage({
   // stored due date has passed, within the existing issue-date scope.
   const overdueUnpaid = await prisma.invoiceRecord.findMany({
     where: overdueInvoicesWhere(range, COLLECTIONS_SINCE, now),
-    select: { amountDue: true, invoiceStatus: true, lastSyncedAt: true },
+    select: { amountDue: true, invoiceStatus: true, lastSyncedAt: true,
+      lastVerifiedAt: true, lastVerifyOutcome: true },
   });
   const overdueInvoiceTotal = overdueUnpaid.reduce((a, i) => a + (i.amountDue || 0), 0);
   const overdueInvoiceCount = overdueUnpaid.length;
@@ -69,6 +70,12 @@ export default async function DashboardPage({
   // same as unverified: the hourly status refresh may have confirmed these balances,
   // but it records no per-invoice outcome, so that cannot be shown here.
   const overdueVerification = oldestInvoiceVerification(overdueUnpaid, now);
+  // The headline total keeps every unpaid overdue invoice, confirmed or not. An
+  // invoice Jobber could not confirm is called out, never dropped and never
+  // treated as paid: its stored balance still counts toward the figure above.
+  const overdueUnconfirmedTotal = overdueUnpaid
+    .filter(i => invoiceVerificationState(i, now) === "unconfirmed")
+    .reduce((a, i) => a + (i.amountDue || 0), 0);
   const overdueUnverifiedTotal = overdueUnpaid
     .filter(i => invoiceVerificationIsStale(i, now))
     .reduce((a, i) => a + (i.amountDue || 0), 0);
@@ -170,8 +177,13 @@ export default async function DashboardPage({
             href={`/risk/overdue-invoices${qs}`}
             label="Overdue in Collections scope"
             value={formatCurrency(overdueInvoiceTotal)}
-            sublabel={`${overdueInvoiceCount} positive balances; ${agedAwaitingCount} calculated from stored due dates` + (overdueVerification.staleCount
-                ? ` · ${formatCurrency(overdueUnverifiedTotal)} across ${overdueVerification.staleCount} not fully refreshed recently`                + (overdueVerification.oldestDays === null ? "" : ` (oldest ${overdueVerification.oldestDays}d)`)
+            sublabel={`${overdueInvoiceCount} positive balances; ${agedAwaitingCount} calculated from stored due dates`
+              + (overdueVerification.unconfirmedCount
+                ? ` · ${formatCurrency(overdueUnconfirmedTotal)} across ${overdueVerification.unconfirmedCount} Jobber could not confirm (still counted)`
+                : "")
+              + (overdueVerification.staleCount
+                ? ` · ${formatCurrency(overdueUnverifiedTotal)} across ${overdueVerification.staleCount} not confirmed recently`
+                  + (overdueVerification.oldestDays === null ? "" : ` (oldest ${overdueVerification.oldestDays}d)`)
                 : "")}
             accent={overdueInvoiceTotal > 0 ? "danger" : "success"}
             icon={<Receipt size={18} />}

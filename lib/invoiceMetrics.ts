@@ -116,99 +116,159 @@ export function sumInvoiceMonths(invoices: Array<{ issuedAt: Date | null; total:
 // ---------------------------------------------------------------------------
 // Source-verification freshness.
 //
-// `InvoiceRecord.lastSyncedAt` is advanced only when the FULL invoice sync
-// actually included this invoice. The hourly open-invoice status refresh
-// deliberately does not advance it ("the row was not fully refreshed"), because
-// that read covers only status, amounts and owner.
+// Two independent Jobber reads can confirm an invoice:
 //
-// So this timestamp answers exactly one question: how long since the invoice was
-// fully refreshed. It does NOT mean the balance is unverified -- the hourly status
-// refresh may have confirmed it minutes ago. That hourly outcome is written only
-// to a log line, so nothing here can distinguish:
+//   the FULL incremental invoice sync      -> advances `lastSyncedAt`
+//   the hourly open-invoice status refresh -> advances `lastVerifiedAt`
 //
-//   confirmed against Jobber this hour, unchanged   -> no record written
-//   not confirmable at all (Jobber returns null)    -> no record written
+// The hourly refresh deliberately does NOT advance `lastSyncedAt`, because it
+// covers only status, amounts and owner. Before `lastVerifiedAt` existed, its
+// outcome went to a log line and nothing else, so these two cases were
+// indistinguishable in the database:
 //
-// Both look identical in the database. Telling them apart needs the refresh
-// outcome persisted, which is a schema change. Until then these helpers claim
-// only what the timestamp supports, and the page says plainly what it cannot
-// establish -- a completed run is not evidence that any one figure is current.
+//   confirmed against Jobber this hour, unchanged   -> nothing written
+//   not confirmable at all (Jobber returned null)   -> nothing written
+//
+// That is why 59 of 73 open invoices read as "not fully refreshed" when only one
+// is genuinely unconfirmable. `lastVerifyOutcome` closes that gap: it records the
+// result of the most recent hourly check, and because that check covers every
+// open invoice on every run, it is always as of the latest run.
+//
+// A row is CONFIRMED when either read succeeded recently. It is UNCONFIRMED only
+// when the latest check actually failed. An unconfirmed row keeps its stored
+// status and balance and stays in every total -- not knowing is never recorded
+// as paid, and never silently dropped.
 // ---------------------------------------------------------------------------
 
-/** Beyond this, a row is reported as not fully refreshed rather than simply shown. */
+/** Beyond this, a row is reported as not confirmed recently rather than simply shown. */
 export const INVOICE_VERIFICATION_STALE_DAYS = 2;
+
+/** The one `lastVerifyOutcome` value that means Jobber confirmed the row. */
+export const INVOICE_VERIFY_CONFIRMED = "confirmed";
 
 const DAY_MS = 86_400_000;
 
-/** Whole days since the full sync last included this invoice. Null if unreadable. */
-export function invoiceVerificationAgeDays(
-  invoice: { lastSyncedAt: Date | null },
-  asOf: Date,
-): number | null {
-  const at = invoice.lastSyncedAt?.getTime();
-  const ref = asOf?.getTime();
-  if (!Number.isFinite(at) || !Number.isFinite(ref)) return null;
-  return Math.max(0, Math.floor((ref! - at!) / DAY_MS));
+/** Older rows predate `lastVerifiedAt`, so both fields stay optional. */
+export type InvoiceVerificationFields = {
+  lastSyncedAt: Date | null;
+  lastVerifiedAt?: Date | null;
+  lastVerifyOutcome?: string | null;
+};
+
+const stamp = (value: Date | null | undefined): number | null => {
+  const at = value?.getTime();
+  return Number.isFinite(at) ? at! : null;
+};
+
+/** True when the most recent hourly check failed to confirm this invoice. */
+export function invoiceVerificationFailed(invoice: InvoiceVerificationFields): boolean {
+  const outcome = invoice.lastVerifyOutcome;
+  return typeof outcome === "string" && outcome.length > 0 && outcome !== INVOICE_VERIFY_CONFIRMED;
 }
 
-/** True when this row has not been fully refreshed recently. */
+/**
+ * Whole days since Jobber last confirmed this invoice by EITHER read, whichever
+ * is more recent. Null when neither read has ever recorded a confirmation.
+ */
+export function invoiceVerificationAgeDays(
+  invoice: InvoiceVerificationFields,
+  asOf: Date,
+): number | null {
+  const ref = stamp(asOf);
+  const at = Math.max(stamp(invoice.lastVerifiedAt) ?? -Infinity, stamp(invoice.lastSyncedAt) ?? -Infinity);
+  if (ref === null || !Number.isFinite(at)) return null;
+  return Math.max(0, Math.floor((ref - at) / DAY_MS));
+}
+
+export type InvoiceVerificationState = "confirmed" | "unconfirmed" | "stale";
+
+/**
+ * `unconfirmed` is reserved for a check that ran and failed. `stale` means no
+ * recent confirmation and no recorded failure either -- nothing is claimed
+ * about why.
+ */
+export function invoiceVerificationState(
+  invoice: InvoiceVerificationFields,
+  asOf: Date,
+  staleDays: number = INVOICE_VERIFICATION_STALE_DAYS,
+): InvoiceVerificationState {
+  const age = invoiceVerificationAgeDays(invoice, asOf);
+  if (age !== null && age < staleDays) return "confirmed";
+  return invoiceVerificationFailed(invoice) ? "unconfirmed" : "stale";
+}
+
+/** True when this row was not confirmed by either Jobber read recently. */
 export function invoiceVerificationIsStale(
-  invoice: { lastSyncedAt: Date | null },
+  invoice: InvoiceVerificationFields,
   asOf: Date,
   staleDays: number = INVOICE_VERIFICATION_STALE_DAYS,
 ): boolean {
-  const age = invoiceVerificationAgeDays(invoice, asOf);
-  return age === null || age >= staleDays;
+  return invoiceVerificationState(invoice, asOf, staleDays) !== "confirmed";
 }
 
 /**
- * One short phrase for display, or null when recently refreshed. Deliberately
- * says "not fully refreshed", NOT "unverified": the hourly status refresh may
- * have confirmed this balance, and that is simply not recorded anywhere.
+ * One short phrase for display, or null when confirmed recently. Never says
+ * paid, unpaid or settled: a failed check carries no information about the
+ * balance, only about our ability to read it.
  */
 export function invoiceVerificationBasis(
-  invoice: { lastSyncedAt: Date | null },
+  invoice: InvoiceVerificationFields,
   asOf: Date,
   staleDays: number = INVOICE_VERIFICATION_STALE_DAYS,
 ): string | null {
+  const state = invoiceVerificationState(invoice, asOf, staleDays);
+  if (state === "confirmed") return null;
   const age = invoiceVerificationAgeDays(invoice, asOf);
-  if (age === null) return "No refresh timestamp recorded";
-  if (age < staleDays) return null;
-  return `Not fully refreshed for ${age} day${age === 1 ? "" : "s"}`;
+  const since = age === null
+    ? "never confirmed from Jobber"
+    : `last confirmed ${age} day${age === 1 ? "" : "s"} ago`;
+  if (state === "unconfirmed") return `Jobber could not confirm this invoice; ${since}`;
+  return age === null ? "No refresh timestamp recorded" : `Not fully refreshed for ${age} day${age === 1 ? "" : "s"}`;
 }
 
 /**
- * Worst-case refresh age across the rows actually displayed, so a current sync
- * run cannot imply every figure on the page is current.
+ * Worst case across the rows actually displayed, so a current sync run cannot
+ * imply every figure on the page is current. `unconfirmedCount` counts only
+ * rows whose latest check failed.
  */
 export function oldestInvoiceVerification(
-  invoices: ReadonlyArray<{ lastSyncedAt: Date | null }>,
+  invoices: ReadonlyArray<InvoiceVerificationFields>,
   asOf: Date,
-): Readonly<{ oldestDays: number | null; staleCount: number; total: number }> {
+): Readonly<{ oldestDays: number | null; staleCount: number; unconfirmedCount: number; total: number }> {
   let oldestDays: number | null = null;
   let staleCount = 0;
+  let unconfirmedCount = 0;
   for (const invoice of invoices) {
+    const state = invoiceVerificationState(invoice, asOf);
+    if (state !== "confirmed") staleCount++;
+    if (state === "unconfirmed") unconfirmedCount++;
     const age = invoiceVerificationAgeDays(invoice, asOf);
-    if (age === null || age >= INVOICE_VERIFICATION_STALE_DAYS) staleCount++;
     if (age !== null && (oldestDays === null || age > oldestDays)) oldestDays = age;
   }
-  return Object.freeze({ oldestDays, staleCount, total: invoices.length });
+  return Object.freeze({ oldestDays, staleCount, unconfirmedCount, total: invoices.length });
 }
 
 /**
- * One sentence for a page header. Deliberately refuses to call the page current
- * on the strength of a completed run alone.
+ * One sentence for a page header. Refuses to call the page current on the
+ * strength of a completed run alone, and names the unconfirmable rows
+ * separately from rows that are merely waiting on the next full sync.
  */
 export function describeDashboardFreshness(
   lastSuccessfulSyncAt: Date | null,
-  rows: Readonly<{ oldestDays: number | null; staleCount: number; total: number }>,
+  rows: Readonly<{ oldestDays: number | null; staleCount: number; unconfirmedCount?: number; total: number }>,
 ): string {
   const run = lastSuccessfulSyncAt
     ? `Last successful sync ${lastSuccessfulSyncAt.toISOString().slice(0, 16).replace("T", " ")}Z`
     : "No successful sync recorded";
   if (!rows.total) return `${run}. No invoices shown.`;
-  if (!rows.staleCount) return `${run}. All ${rows.total} shown fully refreshed within ${INVOICE_VERIFICATION_STALE_DAYS} days.`;
+  if (!rows.staleCount) {
+    return `${run}. All ${rows.total} shown confirmed from Jobber within ${INVOICE_VERIFICATION_STALE_DAYS} days.`;
+  }
   const oldest = rows.oldestDays === null ? "unknown" : `${rows.oldestDays} days`;
-  return `${run}. ${rows.staleCount} of ${rows.total} shown NOT fully refreshed recently (oldest ${oldest}). ` +
-    `Per-invoice source confirmation is not recorded, so a completed sync is not evidence that any one figure here is current.`;
+  const unconfirmed = rows.unconfirmedCount ?? 0;
+  const failed = unconfirmed
+    ? ` ${unconfirmed} of those failed its latest check and is still counted at its stored balance.`
+    : "";
+  return `${run}. ${rows.staleCount} of ${rows.total} shown NOT confirmed from Jobber recently (oldest ${oldest}).` +
+    `${failed} A completed sync is not evidence that any one figure here is current.`;
 }

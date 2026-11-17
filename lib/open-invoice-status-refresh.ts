@@ -1,6 +1,7 @@
 import { prisma } from "./prisma";
 import { jobberGraphQL } from "./jobber";
-import { log } from "./log";
+import { log, logError } from "./log";
+import { INVOICE_VERIFY_CONFIRMED } from "./invoiceMetrics";
 
 const OPEN_STATUSES = ["awaiting_payment", "past_due"];
 const KNOWN_STATUSES = new Set([...OPEN_STATUSES, "draft", "paid", "void", "bad_debt"]);
@@ -40,10 +41,22 @@ export interface InvoiceStatusCorrection {
   amountDue?: number;
   amountPaid?: number;
 }
+/**
+ * One entry per checked invoice. `outcome` is INVOICE_VERIFY_CONFIRMED only when
+ * this read confirmed the invoice AND the stored row agrees with it. Anything
+ * else carries a short machine code, so "Jobber confirmed it minutes ago" and
+ * "Jobber has not confirmed it for 159 days" stop looking identical.
+ */
+export interface InvoiceVerification {
+  id: string;
+  jobberInvoiceId: string;
+  outcome: string;
+}
 export interface StatusRefreshPlan {
   checked: number;
   updates: InvoiceStatusCorrection[];
   holds: Array<{ jobberInvoiceId: string; reason: string }>;
+  verifications: InvoiceVerification[];
 }
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -75,7 +88,7 @@ export async function planOpenInvoiceStatusRefresh(
   // Snapshot the gate once for the whole plan. A batch is never half-corrected
   // because the environment changed partway through a run.
   const correctBalance = options.paidBalanceCorrection === true;
-  const plan: StatusRefreshPlan = { checked: cached.length, updates: [], holds: [] };
+  const plan: StatusRefreshPlan = { checked: cached.length, updates: [], holds: [], verifications: [] };
   const ids = new Set<string>();
   const localIds = new Set<string>();
   for (const invoice of cached) {
@@ -103,58 +116,70 @@ export async function planOpenInvoiceStatusRefresh(
         throw new Error("Missing Jobber status refresh alias");
       }
       const source = data[key];
-      const hold = (reason: string) => plan.holds.push({ jobberInvoiceId: invoice.jobberInvoiceId, reason });
-      if (source === null) { hold("Source object unavailable; retained last-known state"); continue; }
+      const verify = (outcome: string) =>
+        plan.verifications.push({ id: invoice.id, jobberInvoiceId: invoice.jobberInvoiceId, outcome });
+      // Every hold is also a non-confirmation: the stored figure is not known current.
+      const hold = (reason: string, outcome: string) => {
+        plan.holds.push({ jobberInvoiceId: invoice.jobberInvoiceId, reason });
+        verify(outcome);
+      };
+      const confirm = () => verify(INVOICE_VERIFY_CONFIRMED);
+      if (source === null) { hold("Source object unavailable; retained last-known state", "source_unavailable"); continue; }
       if (!record(source) || source.id !== invoice.jobberInvoiceId) {
         throw new Error("Mismatched Jobber status refresh identity");
       }
       if (typeof source.invoiceStatus !== "string" || !KNOWN_STATUSES.has(source.invoiceStatus)) {
-        hold("Unknown source status"); continue;
+        hold("Unknown source status", "source_unreadable"); continue;
       }
       if (!record(source.client) || typeof source.client.id !== "string" ||
           !invoice.customer?.jobberClientId || source.client.id !== invoice.customer.jobberClientId) {
-        hold("Unknown or changed invoice owner"); continue;
+        hold("Unknown or changed invoice owner", "source_owner_unverified"); continue;
       }
       const total = record(source.amounts) ? cents(source.amounts.total) : null;
       const balance = record(source.amounts) ? cents(source.amounts.invoiceBalance) : null;
-      if (total === null || balance === null) { hold("Unknown source amounts"); continue; }
+      if (total === null || balance === null) { hold("Unknown source amounts", "source_unreadable"); continue; }
       if (total < 0 || balance < 0 || balance > total ||
           (source.invoiceStatus === "paid" && balance !== 0) ||
           (OPEN_STATUSES.includes(source.invoiceStatus) && balance <= 0)) {
-        hold("Conflicting or credit balance requires review"); continue;
+        hold("Conflicting or credit balance requires review", "source_conflicting"); continue;
       }
       if (!correctBalance) {
         // Previous release behaviour, retained verbatim while the gate is off.
         if (total !== cents(invoice.total) || balance !== cents(invoice.amountDue)) {
-          hold("Amounts changed; requires full invoice sync, not a status-only correction"); continue;
+          hold("Amounts changed; requires full invoice sync, not a status-only correction", "stored_value_differs"); continue;
         }
       } else if (total !== cents(invoice.total)) {
         // A changed total means the invoice itself was re-issued or edited. That
         // is more than this read covers, so it stays the full invoice sync's job.
-        hold("Invoice total changed; requires full invoice sync, not a status correction"); continue;
+        hold("Invoice total changed; requires full invoice sync, not a status correction", "stored_value_differs"); continue;
       }
       if (!OPEN_STATUSES.includes(invoice.invoiceStatus ?? "")) {
-        hold("Cached invoice is no longer open"); continue;
+        hold("Cached invoice is no longer open", "not_open_locally"); continue;
       }
       const cachedBalance = cents(invoice.amountDue);
       const cachedPaid = cents(invoice.amountPaid);
-      if (cachedBalance === null || cachedPaid === null) { hold("Unknown cached amounts"); continue; }
+      if (cachedBalance === null || cachedPaid === null) { hold("Unknown cached amounts", "cached_unreadable"); continue; }
 
       const statusChanged = invoice.invoiceStatus !== source.invoiceStatus;
       const balanceChanged = balance !== cachedBalance;
-      if (!statusChanged && !balanceChanged) continue;
+      // THE FIX for the dashboard. This read confirmed the invoice and the stored
+      // row already agrees with it. Previously that fact was discarded, which is
+      // why a row checked minutes ago still read as 159 days unrefreshed.
+      if (!statusChanged && !balanceChanged) { confirm(); continue; }
       if (!correctBalance) {
         // The balance is already known unchanged here, so this is status-only.
         plan.updates.push({ cached: invoice, invoiceStatus: source.invoiceStatus });
+        confirm();
         continue;
       }
       // A balance that moved on its own may be a partial payment, a credit or a
       // line-item edit, none of which this narrow read can distinguish.
       if (!statusChanged) {
-        hold("Balance changed without a status change; requires full invoice sync"); continue;
+        hold("Balance changed without a status change; requires full invoice sync", "stored_value_differs"); continue;
       }
       if (!balanceChanged) {
         plan.updates.push({ cached: invoice, invoiceStatus: source.invoiceStatus });
+        confirm();
         continue;
       }
       // THE FIX. An open invoice that is now paid with nothing outstanding is the
@@ -163,7 +188,7 @@ export async function planOpenInvoiceStatusRefresh(
       // amountPaid is derived, not invented: total and balance come from one read
       // and the total is already known to be unchanged.
       if (source.invoiceStatus !== "paid" || balance !== 0) {
-        hold("Balance changed on a non-payment transition; requires full invoice sync"); continue;
+        hold("Balance changed on a non-payment transition; requires full invoice sync", "stored_value_differs"); continue;
       }
       plan.updates.push({
         cached: invoice,
@@ -171,6 +196,7 @@ export async function planOpenInvoiceStatusRefresh(
         amountDue: 0,
         amountPaid: total / 100,
       });
+      confirm();
     }
   }
   return plan;
@@ -222,8 +248,54 @@ export async function refreshOpenInvoiceStatuses(): Promise<StatusRefreshPlan | 
       }
     }, { isolationLevel: "Serializable", timeout: 30000 });
   }
+  // Record what this run actually established, per invoice. Written AFTER the
+  // corrections above, and never inside their transaction: these two columns are
+  // not part of the pre-image guard, so they cannot cause a correction to roll
+  // back. A confirmed read advances lastVerifiedAt; every other outcome records
+  // the code only, leaving lastVerifiedAt where it was.
+  await recordInvoiceVerifications(plan.verifications);
   log(`[sync] open invoice status refresh: checked=${plan.checked} changed=${plan.updates.length} held=${plan.holds.length} paidBalanceCorrection=${correctBalance}`);
   // IDs/reasons only; no customer contact details or financial values in logs.
   for (const hold of plan.holds) log(`[sync] status refresh held ${hold.jobberInvoiceId}: ${hold.reason}`);
   return plan;
+}
+
+/**
+ * Persist one verification outcome per checked invoice.
+ *
+ * Deliberately non-fatal. The corrections above have already been committed by
+ * the time this runs, and this writes display metadata only -- no status, no
+ * balance, no payment date. If the columns are missing because the migration has
+ * not been applied yet, the hourly refresh must still succeed, so the failure is
+ * logged and the run continues. That also means code and migration can be
+ * deployed in either order.
+ */
+export async function recordInvoiceVerifications(
+  verifications: InvoiceVerification[],
+  at: Date = new Date(),
+): Promise<void> {
+  if (!verifications.length) return;
+  const byOutcome = new Map<string, string[]>();
+  for (const row of verifications) {
+    const ids = byOutcome.get(row.outcome);
+    if (ids) ids.push(row.id); else byOutcome.set(row.outcome, [row.id]);
+  }
+  try {
+    for (const [outcome, ids] of byOutcome) {
+      await prisma.invoiceRecord.updateMany({
+        where: { id: { in: ids } },
+        // A failed check proves nothing about the invoice, so it must NOT look
+        // freshly confirmed. Only a confirmed outcome moves lastVerifiedAt.
+        data: outcome === INVOICE_VERIFY_CONFIRMED
+          ? { lastVerifiedAt: at, lastVerifyOutcome: INVOICE_VERIFY_CONFIRMED }
+          : { lastVerifyOutcome: outcome },
+      });
+    }
+    const confirmed = byOutcome.get(INVOICE_VERIFY_CONFIRMED)?.length ?? 0;
+    log(`[sync] invoice verification recorded: confirmed=${confirmed} unconfirmed=${verifications.length - confirmed}`);
+  } catch (error) {
+    // Codes and counts only; no invoice identifiers or financial values.
+    logError(`[sync] invoice verification not recorded (dashboard freshness will read as unknown): ${
+      error instanceof Error ? error.message.slice(0, 160) : "unknown error"}`);
+  }
 }
