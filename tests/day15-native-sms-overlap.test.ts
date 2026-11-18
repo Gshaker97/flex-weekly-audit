@@ -172,7 +172,7 @@ const evaluate = (tags: readonly string[], extra: Record<string, unknown>) =>
     candidates: [CANDIDATE],
     readers: {
       readInvoice: async () => SOURCE,
-      matchContacts: async () => [{ id: "c1", tags, dnd: false,
+      matchContacts: async () => [{ id: "c1", tags, dnd: false, emailDndStatus: "inactive",
         phone: "+16025550100", email: "a@example.com" }],
       cardsForContact: async () => [],
       linkedJobText: async () => LINKED,

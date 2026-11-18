@@ -84,7 +84,7 @@ const run = (history: unknown, extra: Record<string, unknown> = {}) =>
     candidates: [CANDIDATE],
     readers: {
       readInvoice: async () => SOURCE,
-      matchContacts: async () => [{ id: "c1", tags: [], dnd: false,
+      matchContacts: async () => [{ id: "c1", tags: [], dnd: false, emailDndStatus: "inactive",
         phone: "+16025550100", email: "a@example.com" }],
       cardsForContact: async () => [],
       linkedJobText: async () => LINKED,
@@ -196,4 +196,54 @@ test("the reader only ever dates an UNNUMBERED message", async () => {
   assert.equal(classify("Just a reminder about your balance", longBefore), "predates_invoice");
   assert.equal(classify("Just a reminder about your balance",
     new Date("2026-11-25T16:00:00.000Z")), "ambiguous");
+});
+
+
+/* ------------------------------------------------------------------ */
+/* Email consent, read exactly as the send path reads it.              */
+/* ------------------------------------------------------------------ */
+
+const runWithContact = (contact: Record<string, unknown>) =>
+  evaluateReminders({
+    candidates: [CANDIDATE],
+    readers: {
+      readInvoice: async () => SOURCE,
+      matchContacts: async () => [{ id: "c1", tags: [], dnd: false,
+        phone: "+16025550100", email: "a@example.com", ...contact }],
+      cardsForContact: async () => [],
+      linkedJobText: async () => LINKED,
+      sendHistory: async () => ({ complete: true, sends: [] }),
+    } as any,
+    now: AT_DAY_15, verifiedExclusions: ["cli-x", "cli-y"], ignoreWindow: true,
+    milestoneChannels: () => ["email"],
+    jobberOnlyDay15Email: true, feeClaimFreeDay15: true, channelBlindMilestones: [15],
+    priorSendIgnoresPreIssueMessages: true,
+  });
+
+test("an explicit Email inactive is the only thing that counts as consent", async () => {
+  const plan = await runWithContact({ emailDndStatus: "inactive" });
+  assert.deepEqual(plan.rows[0].holds, []);
+  assert.equal(plan.rows[0].decision, "eligible");
+});
+
+test("NO Email entry in GoHighLevel holds: unknown is not consent", async () => {
+  for (const contact of [{}, { emailDndStatus: null }, { emailDndStatus: undefined }]) {
+    const plan = await runWithContact(contact);
+    assert.ok(plan.rows[0].holds.some(h => h.startsWith("destination_contact_email_consent_unknown")),
+      JSON.stringify(contact) + " -> " + plan.rows[0].holds.join(" | "));
+  }
+});
+
+test("an explicit Email opt-out holds and is named as an opt-out", async () => {
+  for (const status of ["active", "permanent"]) {
+    const plan = await runWithContact({ emailDndStatus: status });
+    assert.ok(plan.rows[0].holds.includes("destination_contact_email_opted_out"),
+      status + " -> " + plan.rows[0].holds.join(" | "));
+  }
+});
+
+test("an unrecognised Email status holds rather than being read as consent", async () => {
+  const plan = await runWithContact({ emailDndStatus: "paused" });
+  assert.ok(plan.rows[0].holds.some(h => h.startsWith("destination_contact_email_consent_unknown")),
+    plan.rows[0].holds.join(" | "));
 });

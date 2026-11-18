@@ -55,7 +55,7 @@ const CANDIDATE = { jobberInvoiceId: "inv-1", invoiceNumber: "7207", clientName:
   jobberClientId: "cli-1", email: "a@example.com", phone: "+16025550100" };
 const readers = {
   readInvoice: async () => SOURCE,
-  matchContacts: async () => [{ id: "c1", tags: ["Irrigation"], dnd: false,
+  matchContacts: async () => [{ id: "c1", tags: ["Irrigation"], dnd: false, emailDndStatus: "inactive",
     phone: "+16025550100", email: "a@example.com" }],
   cardsForContact: async () => [{ id: "o1", stage: "invoice overdue", status: "open" }],
   sendHistory: async () => ({ complete: true, sends: [] }),
@@ -202,7 +202,7 @@ test("email path: a MAINTENANCE invoice with no pipeline card is now a candidate
       readInvoice: async () => ({ ...SOURCE, clientTags: ["Maintenance"],
         lineItemNames: ["Monthly maintenance"] }),
       cardsForContact: async () => [],
-      matchContacts: async () => [{ id: "c1", tags: [], dnd: false,
+      matchContacts: async () => [{ id: "c1", tags: [], dnd: false, emailDndStatus: "inactive",
         phone: "+16025550100", email: "a@example.com" }] } as any,
     now: AT_DAY_15, verifiedExclusions: ["cli-x", "cli-y"], ignoreWindow: true,
     milestoneChannels: () => ["email"], feeClaimFreeDay15: true,
@@ -286,7 +286,7 @@ test("the NON-email path still requires the card and the service type", async ()
     readers: { ...readers,
       readInvoice: async () => ({ ...SOURCE, clientTags: ["Maintenance"],
         lineItemNames: ["Monthly maintenance"] }),
-      matchContacts: async () => [{ id: "c1", tags: [], dnd: false,
+      matchContacts: async () => [{ id: "c1", tags: [], dnd: false, emailDndStatus: "inactive",
         phone: "+16025550100", email: "a@example.com" }] } as any,
     now: AT_DAY_15, verifiedExclusions: ["cli-x", "cli-y"], ignoreWindow: true,
     milestoneChannels: () => ["email"], feeClaimFreeDay15: true });

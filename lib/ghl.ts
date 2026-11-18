@@ -149,6 +149,9 @@ export interface GhlContact {
   phone?: string | null;
   tags?: string[] | null;
   dnd?: boolean | null;
+  /** Per-channel opt-out, exactly as GoHighLevel returns it. An ABSENT Email
+   *  entry is NOT consent: the send path requires an explicit "inactive". */
+  dndSettings?: Record<string, { status?: string | null } | null> | null;
 }
 
 const lastTen = (value: string | null | undefined): string =>

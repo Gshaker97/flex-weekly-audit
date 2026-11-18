@@ -61,6 +61,17 @@ export interface SourceInvoice {
   lineItemNames: readonly string[] | null;
 }
 export interface DestinationContact {
+  /**
+   * The contact's Email opt-out status, exactly as GoHighLevel returns it, or
+   * null when GoHighLevel carries no Email entry at all.
+   *
+   * MIRRORS THE SEND PATH. notification-ghl-contract.ts allows an email only
+   * when this reads "inactive". A missing entry is `channel_dnd_unknown` there
+   * and holds; the "omitted means no override" allowance is SMS-only and does
+   * not extend to email. Without this field the evaluation would call a contact
+   * eligible that the sender would refuse.
+   */
+  emailDndStatus?: string | null;
   id: string;
   tags: readonly string[];
   dnd: boolean;
@@ -366,6 +377,18 @@ export async function evaluateReminders(input: {
       soleContactId = contact.id;
       // The opt-out check is NOT part of the relaxation and always runs.
       if (contact.dnd) holds.push("destination_contact_opted_out");
+      // Email consent, read exactly as the sender reads it. Absent is unknown,
+      // and unknown is not consent.
+      if (day15EmailPath) {
+        const status = typeof contact.emailDndStatus === "string"
+          ? contact.emailDndStatus.toLowerCase() : null;
+        if (status === "active" || status === "permanent") {
+          holds.push("destination_contact_email_opted_out");
+        } else if (status !== "inactive") {
+          holds.push(`destination_contact_email_consent_unknown: ` +
+            `${status === null ? "no Email entry in GoHighLevel" : status}`);
+        }
+      }
       if (!day15EmailPath) {
         const cards = await readers.cardsForContact(contact.id);
         if (cards.length === 0) holds.push("no_invoice_pipeline_card");

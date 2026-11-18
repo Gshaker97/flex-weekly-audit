@@ -68,6 +68,13 @@ export function createReminderEvaluationReaders(): ReminderEvaluationReaders {
         id: contact.id,
         tags: Array.isArray(contact.tags) ? contact.tags.filter((t): t is string => typeof t === "string") : [],
         dnd: contact.dnd === true,
+        emailDndStatus: (() => {
+          const settings = contact.dndSettings;
+          if (!settings || typeof settings !== "object") return null;
+          if (!Object.prototype.hasOwnProperty.call(settings, "Email")) return null;
+          const entry = (settings as Record<string, { status?: string | null } | null>).Email;
+          return entry && typeof entry.status === "string" ? entry.status : null;
+        })(),
         phone: contact.phone ?? null,
         email: contact.email ?? null,
       }));
