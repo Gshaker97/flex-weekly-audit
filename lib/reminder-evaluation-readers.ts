@@ -1,4 +1,5 @@
 import { jobberGraphQL } from "./jobber";
+import { readLinkedJobText, type LinkedJobsResult } from "./reminder-job-notes-source";
 import { findExactContactMatches, getInvoicePipelineRefs, getOutboundMessages, searchOpportunities } from "./ghl";
 import type {
   DestinationCard, DestinationContact, PriorSend, ReminderCandidate,
@@ -113,6 +114,16 @@ export function createReminderEvaluationReaders(): ReminderEvaluationReaders {
         };
       });
       return { complete: history.complete, incompleteReason: history.incompleteReason, sends };
+    },
+
+    /**
+     * Every job Jobber links to this invoice, with each job's notes, read live.
+     * Used by the Day 15 email path so the warranty / no-charge rule is applied
+     * to the real linked job rather than to an invoice-number guess.
+     */
+    async linkedJobText(candidate: ReminderCandidate): Promise<LinkedJobsResult | null> {
+      try { return await readLinkedJobText(candidate.jobberInvoiceId, jobberGraphQL); }
+      catch { return null; }   // unreadable holds the row; it never passes
     },
 
     async cardsForContact(contactId: string): Promise<DestinationCard[]> {

@@ -49,14 +49,6 @@ async function tokenMinutes(): Promise<number> {
   return Math.floor((auth.expiresAt.getTime() - Date.now()) / 60000);
 }
 
-/**
- * Reports what WOULD be eligible if the two GoHighLevel dependencies that
- * contradict "Jobber decides" were not consulted. It relaxes nothing else: a
- * row with any recipient, opt-out or duplicate hold is never promoted. Off
- * unless asked for, and it still cannot send.
- */
-const projectWithoutGhlDependency = process.argv.includes("--project-without-ghl-dependency");
-
 function resolveNow(): { now: Date; label: string } {
   const flag = process.argv.find(arg => arg.startsWith("--as-of="));
   if (!flag) return { now: new Date(), label: "live clock" };
@@ -79,7 +71,8 @@ type Disposition =
   | "held_notes_unverifiable"
   | "day15_passed_no_catch_up"
   | "not_yet_day15"
-  | "eligible"
+  /** Passed every check in this run. NOT cleared to send: a send re-reads Jobber. */
+  | "candidate"
   | "held_protection"
   | "held_ghl_dependency";
 
@@ -105,7 +98,6 @@ async function main() {
     throw new Error(`jobber_token_coverage_too_short: ${minutes}m left; a read would refresh and write. Stopping.`);
   }
   say(`clock: ${label}; jobber token coverage ${minutes}m (no refresh, no write)`);
-  if (projectWithoutGhlDependency) say("MODE: projecting WITHOUT the GHL stage/service-type dependencies (protections still enforced)");
   const today = invoiceCalendarDate(now)!;
 
   // The cache is used ONLY to choose who to read. No date filter here on
@@ -184,6 +176,8 @@ async function main() {
       milestoneChannels: MILESTONE_CHANNELS,
       feeClaimFreeDay15: true,
       channelBlindMilestones: CHANNEL_BLIND,
+      // The approved email path: Jobber decides status and timing.
+      jobberOnlyDay15Email: true,
     });
     for (const row of plan.rows) {
       const label2 = `#${row.invoiceNumber ?? "?"}`;
@@ -191,15 +185,7 @@ async function main() {
       const ghl = real.filter(h => GHL_DEPENDENCY.some(g => h.startsWith(g)));
       const prot = real.filter(h => PROTECTION.some(p => h.startsWith(p)));
       const other = real.filter(h => !ghl.includes(h) && !prot.includes(h));
-      if (!real.length) { disposition.set(row.jobberInvoiceId, "eligible"); detail.set(row.jobberInvoiceId, label2); }
-      else if (!prot.length && !other.length && ghl.length && projectWithoutGhlDependency) {
-        // A PROJECTION, not a decision. The two dependencies set aside here ask
-        // GoHighLevel to confirm something Jobber already decided; see the
-        // report. Recipient, opt-out and duplicate holds are NOT set aside:
-        // `prot` and `other` being empty is a precondition of this branch.
-        disposition.set(row.jobberInvoiceId, "eligible");
-        detail.set(row.jobberInvoiceId, `${label2} (projected: ${ghl.map(h => h.split(":")[0]).join("+")} set aside)`);
-      }
+      if (!real.length) { disposition.set(row.jobberInvoiceId, "candidate"); detail.set(row.jobberInvoiceId, label2); }
       else if (prot.length || other.length) {
         disposition.set(row.jobberInvoiceId, "held_protection");
         detail.set(row.jobberInvoiceId, `${label2}:${[...prot, ...other].map(h => h.split(":")[0]).join("+")}`);
@@ -210,7 +196,7 @@ async function main() {
     }
   }
 
-  const ORDER: Disposition[] = ["eligible", "held_protection", "held_ghl_dependency",
+  const ORDER: Disposition[] = ["candidate", "held_protection", "held_ghl_dependency",
     "held_notes_unverifiable", "excluded_warranty_or_no_charge", "withheld_by_name",
     "zero_or_unreadable_amount", "day15_passed_no_catch_up", "not_yet_day15",
     "issued_before_programme", "settled_no_longer_owes", "source_unreadable"];
@@ -233,6 +219,7 @@ async function main() {
     const first = upcoming[0].date;
     const sameDay = upcoming.filter(u => u.date === first);
     say(`---- earliest date with an invoice that clears every Jobber-side rule ----`);
+    say("  (candidates, not cleared to send: Jobber is re-read immediately before any send)");
     say(`  ${first}: ${sameDay.length} invoice(s) ${sameDay.map(u => `${u.label} $${u.amount.toFixed(2)}`).join(" ")}`);
     const next = [...new Set(upcoming.map(u => u.date))].slice(0, 8);
     for (const date of next) {

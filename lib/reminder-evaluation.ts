@@ -1,6 +1,8 @@
-import { INVOICE_TIME_ZONE, invoiceReminderClock, invoiceReminderMilestones } from "./invoice-reminder-clock";
+import { INVOICE_TIME_ZONE, addInvoiceCalendarDays, invoiceReminderClock, invoiceReminderMilestones } from "./invoice-reminder-clock";
 import { resolveServiceType, serviceTypeIsConfirmed, type ServiceTypeResolution } from "./reminder-service-type";
-import { day15EmailAmountsArePositive } from "./reminder-email-window";
+import { day15EmailAmountsArePositive, day15EmailIssueWindow } from "./reminder-email-window";
+import { classifyLinkedJobRework } from "./reminder-rework-notes";
+import type { LinkedJobsResult } from "./reminder-job-notes-source";
 
 /**
  * Evaluate-only reminder runner.
@@ -32,6 +34,8 @@ const OPEN_STATUSES = new Set(["awaiting_payment", "past_due"]);
 const SETTLED_STATUSES = new Set(["paid", "void", "bad_debt"]);
 /** Compared case-insensitively; the GHL client reports stage names lowercased. */
 const OVERDUE_STAGE = "invoice overdue";
+/** The only milestone the Day 15 email path can ever reach. */
+const DAY15 = 15;
 export const ARIZONA_WINDOW_START_HOUR = 9;
 export const ARIZONA_WINDOW_MINUTES = 15;
 
@@ -104,6 +108,13 @@ export interface ReminderEvaluationReaders {
    * "nothing was sent".
    */
   sendHistory?(candidate: ReminderCandidate): Promise<SendHistory | null>;
+  /**
+   * Every job Jobber links to this invoice, with each job's own notes. Required
+   * by the Day 15 email path: the warranty / no-charge rule is re-read from
+   * Jobber at decision time rather than trusted from a cache. OPTIONAL on the
+   * type so existing callers compile, but a caller that omits it gets a hold.
+   */
+  linkedJobText?(candidate: ReminderCandidate): Promise<LinkedJobsResult | null>;
 }
 
 export interface ReminderEvaluationRow {
@@ -121,6 +132,9 @@ export interface ReminderEvaluationRow {
   totalCents: number | null;
   /** Issue date as the SOURCE reports it, so date-scoped policy need not trust the cache. */
   sourceIssuedDate: string | null;
+  /** Warranty / no-charge verdict from the linked job, on the Day 15 email path. */
+  reworkVerdict: "excluded" | "hold" | "clear" | null;
+  reworkReason: string | null;
   milestoneDay: number | null;
   audience: string | null;
   /** Per-channel outcome for today's milestone. Empty when no milestone is due. */
@@ -204,8 +218,31 @@ export async function evaluateReminders(input: {
    * eligible when the ledger would in fact refuse it.
    */
   channelBlindMilestones?: readonly number[];
+  /**
+   * The fee-free Day 15 CUSTOMER EMAIL path, and nothing else.
+   *
+   * Approved 2026-11-18: on this path Jobber alone decides whether the invoice
+   * is still owed and whether today is its day 15, so the two GoHighLevel
+   * demands that duplicated that decision are not consulted:
+   *   - the Invoice Pipeline card's stage and status, and
+   *   - service-type corroboration.
+   * Neither was ever needed here. The day-15 step is identical in the
+   * maintenance and irrigation ladders, so no ladder has to be chosen; and the
+   * pipeline board has been frozen since around 2026-10-20, so asking it to
+   * confirm an overdue invoice only produced false holds.
+   *
+   * NOTHING ELSE IS RELAXED. The exact-contact match, the opt-out check and the
+   * prior-send checks all still run, and this path adds two of its own: the
+   * invoice must be issued inside the programme window, and the linked job's
+   * notes must be readable and clear the warranty / no-charge rule. Both are
+   * re-read from Jobber here, immediately before any send decision.
+   *
+   * On this path the only milestone that can ever come due is day 15.
+   */
+  jobberOnlyDay15Email?: boolean;
 }): Promise<ReminderEvaluationPlan> {
   const { candidates, readers, now } = input;
+  const day15EmailPath = input.jobberOnlyDay15Email === true;
   const parts = phoenixParts(now);
   const notes: string[] = [];
 
@@ -240,7 +277,7 @@ export async function evaluateReminders(input: {
       clientName: candidate.clientName, decision: "held", holds,
       category: null, categorySource: null, categoryEvidence: null,
       daysPastDue: null, balanceCents: null, totalCents: null, sourceIssuedDate: null,
-      milestoneDay: null, audience: null,
+      reworkVerdict: null, reworkReason: null, milestoneDay: null, audience: null,
       channels: [],
     };
     rows.push(row);
@@ -292,13 +329,16 @@ export async function evaluateReminders(input: {
     } else {
       const contact = contacts[0];
       contactTags = contact.tags;
+      // The opt-out check is NOT part of the relaxation and always runs.
       if (contact.dnd) holds.push("destination_contact_opted_out");
-      const cards = await readers.cardsForContact(contact.id);
-      if (cards.length === 0) holds.push("no_invoice_pipeline_card");
-      else if (cards.length > 1) holds.push(`ambiguous_pipeline_cards: ${cards.length}`);
-      else {
-        if ((cards[0].stage ?? "").toLowerCase() !== OVERDUE_STAGE) holds.push(`card_not_in_overdue_stage: ${cards[0].stage ?? "unknown"}`);
-        if (cards[0].status !== "open") holds.push(`card_status_not_open: ${cards[0].status ?? "unknown"}`);
+      if (!day15EmailPath) {
+        const cards = await readers.cardsForContact(contact.id);
+        if (cards.length === 0) holds.push("no_invoice_pipeline_card");
+        else if (cards.length > 1) holds.push(`ambiguous_pipeline_cards: ${cards.length}`);
+        else {
+          if ((cards[0].stage ?? "").toLowerCase() !== OVERDUE_STAGE) holds.push(`card_not_in_overdue_stage: ${cards[0].stage ?? "unknown"}`);
+          if (cards[0].status !== "open") holds.push(`card_status_not_open: ${cards[0].status ?? "unknown"}`);
+        }
       }
     }
 
@@ -312,13 +352,23 @@ export async function evaluateReminders(input: {
     row.category = service.category;
     row.categorySource = service.source;
     row.categoryEvidence = JSON.stringify(service.evidence);
-    if (!serviceTypeIsConfirmed(service)) {
+    // Reported either way. Only the non-email path treats it as a requirement.
+    if (!day15EmailPath && !serviceTypeIsConfirmed(service)) {
       holds.push(`service_type_${service.source}: ${service.detail}`);
       row.decision = "held";
       continue; // without a confirmed category there is no ladder to consult
     }
 
-    const milestones = invoiceReminderMilestones(service.category!, source.issuedDate, source.dueDate, now);
+    // On the Day 15 email path the only milestone is day 15, which is identical
+    // in both ladders, so it is built here rather than chosen from one.
+    const milestones = day15EmailPath
+      ? [{ dayPastDue: DAY15, audience: "homeowner" as const,
+           requiredFacts: ["three_percent_fee_applied" as const],
+           scheduledOn: addInvoiceCalendarDays(clock.dueOn, DAY15)!,
+           timing: (addInvoiceCalendarDays(clock.dueOn, DAY15)! < clock.today ? "past_reconcile"
+             : addInvoiceCalendarDays(clock.dueOn, DAY15)! === clock.today ? "today" : "future") as
+             "past_reconcile" | "today" | "future" }]
+      : invoiceReminderMilestones(service.category!, source.issuedDate, source.dueDate, now);
     if (!milestones) { holds.push("milestones_unavailable"); continue; }
     const today = milestones.find(step => step.timing === "today");
     if (!today) {
@@ -336,6 +386,23 @@ export async function evaluateReminders(input: {
 
     row.milestoneDay = today.dayPastDue;
     row.audience = today.audience;
+
+    // Re-read from Jobber at decision time, on the email path only.
+    if (day15EmailPath) {
+      const window = day15EmailIssueWindow(source.issuedDate);
+      if (window !== "in_programme") holds.push(`issue_window_${window}`);
+      const linked = readers.linkedJobText ? await readers.linkedJobText(candidate) : null;
+      if (!linked) {
+        holds.push("linked_job_unreadable: cannot apply the warranty rule");
+      } else {
+        const rework = classifyLinkedJobRework(linked);
+        row.reworkVerdict = rework.verdict;
+        row.reworkReason = rework.reason;
+        if (rework.verdict !== "clear") holds.push(`job_notes_${rework.verdict}: ${rework.reason}`);
+        // The invoice the notes belong to must be the invoice being decided.
+        if (linked.invoiceId !== candidate.jobberInvoiceId) holds.push("linked_job_invoice_mismatch");
+      }
+    }
 
     // Interlock with the hourly sender. Unconditional: not a flag, not a
     // window, not dependent on either send path being enabled.

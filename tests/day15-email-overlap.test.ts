@@ -179,3 +179,117 @@ test("channel-blindness does not block a DIFFERENT milestone or a different invo
         attribution: "other_invoice" as const, confirmed: true }] }) });
   assert.equal(otherInvoice.rows[0].decision, "eligible");
 });
+
+/**
+ * The approved Day 15 email path: Jobber decides status and timing, the two
+ * GoHighLevel demands are gone, and nothing else is relaxed.
+ */
+const CLEAN_JOB = { complete: true, reason: null, invoiceId: "inv-1",
+  jobs: [{ notesComplete: true, title: "Monthly service", instructions: "",
+    jobNoteMessages: ["Trimmed and blown, billed per agreement"] }] } as any;
+const emailReaders = { ...readers, linkedJobText: async () => CLEAN_JOB };
+const emailRun = (over: Record<string, unknown> = {}, extra: Record<string, unknown> = {}) =>
+  evaluateReminders({ candidates: [CANDIDATE], readers: { ...emailReaders, ...over } as any,
+    now: AT_DAY_15, verifiedExclusions: ["cli-x", "cli-y"], ignoreWindow: true,
+    milestoneChannels: () => ["email"], feeClaimFreeDay15: true,
+    channelBlindMilestones: [15], jobberOnlyDay15Email: true, ...extra });
+
+test("email path: a MAINTENANCE invoice with no pipeline card is now a candidate", async () => {
+  const plan = await evaluateReminders({
+    candidates: [CANDIDATE],
+    readers: { ...emailReaders,
+      // Maintenance, which the service-type rule can never confirm, and no card.
+      readInvoice: async () => ({ ...SOURCE, clientTags: ["Maintenance"],
+        lineItemNames: ["Monthly maintenance"] }),
+      cardsForContact: async () => [],
+      matchContacts: async () => [{ id: "c1", tags: [], dnd: false,
+        phone: "+16025550100", email: "a@example.com" }] } as any,
+    now: AT_DAY_15, verifiedExclusions: ["cli-x", "cli-y"], ignoreWindow: true,
+    milestoneChannels: () => ["email"], feeClaimFreeDay15: true,
+    channelBlindMilestones: [15], jobberOnlyDay15Email: true });
+  assert.deepEqual(plan.rows[0].holds, []);
+  assert.equal(plan.rows[0].decision, "eligible");
+  assert.equal(plan.rows[0].milestoneDay, 15);
+  assert.equal(plan.rows[0].categorySource, "jobber_only");  // still reported
+  assert.equal(plan.sendsAttempted, 0);
+});
+
+test("email path: the protections are untouched", async () => {
+  const optedOut = await emailRun({ matchContacts: async () => [{ id: "c1", tags: [], dnd: true,
+    phone: "+16025550100", email: "a@example.com" }] });
+  assert.ok(optedOut.rows[0].holds.includes("destination_contact_opted_out"));
+
+  const noContact = await emailRun({ matchContacts: async () => [] });
+  assert.ok(noContact.rows[0].holds.includes("no_exact_destination_contact"));
+
+  const twoContacts = await emailRun({ matchContacts: async () => [
+    { id: "c1", tags: [], dnd: false, phone: "+16025550100", email: "a@example.com" },
+    { id: "c2", tags: [], dnd: false, phone: "+16025550100", email: "a@example.com" }] });
+  assert.ok(twoContacts.rows[0].holds.some(h => h.startsWith("ambiguous_destination_contacts")));
+
+  const smsAlready = await emailRun({ sendHistory: async () => SMS_ALREADY_SENT });
+  assert.ok(smsAlready.rows[0].holds.some(h => h.startsWith("milestone_already_sent_on_another_channel")));
+
+  const noHistory = await emailRun({ sendHistory: async () => null });
+  assert.ok(noHistory.rows[0].holds.some(h => h.startsWith("send_history_unavailable")));
+});
+
+test("email path: Jobber is re-read for the window and the job notes", async () => {
+  const tooOld = await emailRun({ readInvoice: async () => ({ ...SOURCE, issuedDate: "2026-02-28" }) });
+  assert.ok(tooOld.rows[0].holds.includes("issue_window_before_programme"));
+
+  const noReader = await emailRun({ linkedJobText: undefined });
+  assert.ok(noReader.rows[0].holds.some(h => h.startsWith("linked_job_unreadable")));
+
+  const unreadable = await emailRun({ linkedJobText: async () => null });
+  assert.ok(unreadable.rows[0].holds.some(h => h.startsWith("linked_job_unreadable")));
+
+  // #7334 / #6872 shape: a bare rework word. Must stay held on the real path.
+  const bareRework = await emailRun({ linkedJobText: async () => ({ ...CLEAN_JOB,
+    jobs: [{ notesComplete: true, title: null, instructions: "",
+      jobNoteMessages: ["Send out quote to client for redoing backyard drip"] }] }) });
+  assert.equal(bareRework.rows[0].reworkVerdict, "hold");
+  assert.ok(bareRework.rows[0].holds.some(h => h.startsWith("job_notes_hold")));
+
+  const warranty = await emailRun({ linkedJobText: async () => ({ ...CLEAN_JOB,
+    jobs: [{ notesComplete: true, title: null, instructions: "",
+      jobNoteMessages: ["Valve replaced under warranty"] }] }) });
+  assert.ok(warranty.rows[0].holds.some(h => h.startsWith("job_notes_excluded")));
+
+  const wrongInvoice = await emailRun({ linkedJobText: async () => ({ ...CLEAN_JOB, invoiceId: "inv-999" }) });
+  assert.ok(wrongInvoice.rows[0].holds.includes("linked_job_invoice_mismatch"));
+});
+
+test("email path: only day 15 can ever come due, and there is no catch-up", async () => {
+  // Day 16 past due: not today's milestone, and never replayed.
+  const dayAfter = await evaluateReminders({ candidates: [CANDIDATE], readers: emailReaders as any,
+    now: new Date("2026-11-18T16:05:00.000Z"), verifiedExclusions: ["cli-x", "cli-y"],
+    ignoreWindow: true, milestoneChannels: () => ["email"], feeClaimFreeDay15: true,
+    channelBlindMilestones: [15], jobberOnlyDay15Email: true });
+  assert.equal(dayAfter.rows[0].decision, "not_due");
+  assert.ok(dayAfter.rows[0].holds.some(h => h.includes("never replayed") ||
+    h.startsWith("ladder_complete") || h.startsWith("past_milestones")));
+
+  // Day 21 cannot be reached from this path at all.
+  const atDay21 = await evaluateReminders({ candidates: [CANDIDATE], readers: emailReaders as any,
+    now: new Date("2026-11-23T16:05:00.000Z"), verifiedExclusions: ["cli-x", "cli-y"],
+    ignoreWindow: true, milestoneChannels: () => ["email"], feeClaimFreeDay15: true,
+    channelBlindMilestones: [15], jobberOnlyDay15Email: true });
+  assert.notEqual(atDay21.rows[0].decision, "eligible");
+  assert.notEqual(atDay21.rows[0].milestoneDay, 21);
+});
+
+test("the NON-email path still requires the card and the service type", async () => {
+  const plan = await run({ feeClaimFreeDay15: true }, { cardsForContact: async () => [] });
+  assert.ok(plan.rows[0].holds.includes("no_invoice_pipeline_card"));
+  const maintenance = await evaluateReminders({ candidates: [CANDIDATE],
+    readers: { ...readers,
+      readInvoice: async () => ({ ...SOURCE, clientTags: ["Maintenance"],
+        lineItemNames: ["Monthly maintenance"] }),
+      matchContacts: async () => [{ id: "c1", tags: [], dnd: false,
+        phone: "+16025550100", email: "a@example.com" }] } as any,
+    now: AT_DAY_15, verifiedExclusions: ["cli-x", "cli-y"], ignoreWindow: true,
+    milestoneChannels: () => ["email"], feeClaimFreeDay15: true });
+  assert.ok(maintenance.rows[0].holds.some(h => h.startsWith("service_type_jobber_only")),
+    JSON.stringify(maintenance.rows[0].holds));
+});
