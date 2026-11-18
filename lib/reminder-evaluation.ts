@@ -1,5 +1,6 @@
 import { INVOICE_TIME_ZONE, invoiceReminderClock, invoiceReminderMilestones } from "./invoice-reminder-clock";
 import { resolveServiceType, serviceTypeIsConfirmed, type ServiceTypeResolution } from "./reminder-service-type";
+import { day15EmailAmountsArePositive } from "./reminder-email-window";
 
 /**
  * Evaluate-only reminder runner.
@@ -116,6 +117,10 @@ export interface ReminderEvaluationRow {
   categoryEvidence: string | null;
   daysPastDue: number | null;
   balanceCents: number | null;
+  /** Source invoice total. Reported so a $0 invoice is visible, not just held. */
+  totalCents: number | null;
+  /** Issue date as the SOURCE reports it, so date-scoped policy need not trust the cache. */
+  sourceIssuedDate: string | null;
   milestoneDay: number | null;
   audience: string | null;
   /** Per-channel outcome for today's milestone. Empty when no milestone is due. */
@@ -213,7 +218,8 @@ export async function evaluateReminders(input: {
       jobberInvoiceId: candidate.jobberInvoiceId, invoiceNumber: candidate.invoiceNumber,
       clientName: candidate.clientName, decision: "held", holds,
       category: null, categorySource: null, categoryEvidence: null,
-      daysPastDue: null, balanceCents: null, milestoneDay: null, audience: null,
+      daysPastDue: null, balanceCents: null, totalCents: null, sourceIssuedDate: null,
+      milestoneDay: null, audience: null,
       channels: [],
     };
     rows.push(row);
@@ -221,6 +227,8 @@ export async function evaluateReminders(input: {
     const source = await readers.readInvoice(candidate.jobberInvoiceId);
     if (!source) { holds.push("source_invoice_unreadable"); continue; }
     row.balanceCents = source.balanceCents;
+    row.totalCents = source.totalCents;
+    row.sourceIssuedDate = source.issuedDate;
 
     const status = (source.invoiceStatus ?? "").toLowerCase();
     const balance = source.balanceCents;
@@ -236,6 +244,11 @@ export async function evaluateReminders(input: {
     if (typeof balance !== "number" || !Number.isSafeInteger(balance) || balance <= 0) {
       holds.push("source_balance_unknown"); continue;
     }
+    // Approved rule: the invoice TOTAL must be positive as well as the balance.
+    // A $0 invoice is never a reminder candidate even if a balance appears on
+    // it, and a total that could not be read is unknown, never assumed good.
+    const amounts = day15EmailAmountsArePositive(source.totalCents, balance);
+    if (!amounts.ok) { holds.push(amounts.reason!); continue; }
     if (!source.clientId || !candidate.jobberClientId || source.clientId !== candidate.jobberClientId) {
       holds.push("source_owner_unknown_or_changed"); continue;
     }
