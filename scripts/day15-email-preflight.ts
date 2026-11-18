@@ -42,9 +42,30 @@ async function assertExistingJobberTokenIsEnough(): Promise<number> {
   return minutes;
 }
 
+/**
+ * `--as-of=YYYY-MM-DD` runs the whole chain as if it were 09:05 Phoenix on that
+ * date, so the recipient, opt-out and duplicate checks can be exercised against
+ * the invoices that will actually be first in line instead of only against a day
+ * on which nothing is at day 15. Balances are still read live, which is the
+ * point: it shows what would happen today if that date arrived now. It cannot
+ * send on any date.
+ */
+function resolveNow(): { now: Date; label: string } {
+  const flag = process.argv.find(arg => arg.startsWith("--as-of="));
+  if (!flag) return { now: new Date(), label: "live clock" };
+  const date = flag.slice("--as-of=".length);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error("as_of_must_be_yyyy_mm_dd");
+  // 09:05 Phoenix = 16:05Z. Inside the 09:00-09:15 window, so the "window has
+  // already passed today" hold does not mask the checks we want to see.
+  const now = new Date(`${date}T16:05:00.000Z`);
+  if (!Number.isFinite(now.getTime())) throw new Error("as_of_unparseable");
+  return { now, label: `simulated 09:05 Phoenix on ${date}` };
+}
+
 async function main() {
-  const now = new Date();
+  const { now, label } = resolveNow();
   const say = (line: string) => console.log("PF15: " + line);
+  say(`clock: ${label}`);
   say(`token coverage ${await assertExistingJobberTokenIsEnough()}m (no refresh, no write)`);
 
   // Rule 1, from the cache, purely to decide who is worth a live read.
