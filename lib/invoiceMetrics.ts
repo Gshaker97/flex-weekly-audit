@@ -65,6 +65,24 @@ export function legacyOverdueWhere(range: Pick<DateRange, "start" | "end">, cuto
   };
 }
 
+/**
+ * Every overdue-by-display invoice issued BEFORE the Collections cutoff,
+ * independent of the selected date range.
+ *
+ * Deliberately not range-filtered: this backs a read-failure warning, not a
+ * financial figure. A warning that "Jobber could not read this invoice" must not
+ * disappear because the viewer is looking at a narrower window -- under the
+ * default year-to-date range, `legacyOverdueWhere` intersects to the empty set,
+ * which would hide the warning exactly when it is most needed. Totals, tiles and
+ * the range-scoped legacy sentence all continue to use `legacyOverdueWhere`.
+ */
+export function legacyOverdueAnyRangeWhere(cutoff: Date, asOf: Date): Prisma.InvoiceRecordWhereInput {
+  return {
+    ...overdueDisplayWhere(asOf),
+    issuedAt: { lt: cutoff },
+  };
+}
+
 export function overdueDisplayBasis(invoice: { invoiceStatus: string | null; amountDue: number; dueAt: Date | null }, asOf: Date): string | null {
   if (!Number.isFinite(asOf.getTime()) || !(invoice.amountDue > 0)) return null;
   if (invoice.invoiceStatus === "past_due") return "Cached past_due status";

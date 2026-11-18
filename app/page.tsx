@@ -1,8 +1,9 @@
 import { prisma } from "@/lib/prisma";
 import { computeDashboardKPIs } from "@/lib/kpis";
 import { COLLECTIONS_SINCE } from "@/lib/lateInvoices";
-import { overdueInvoicesWhere, legacyOverdueWhere, oldestInvoiceVerification,
-  invoiceVerificationIsStale, invoiceVerificationState } from "@/lib/invoiceMetrics";
+import { overdueInvoicesWhere, legacyOverdueWhere, legacyOverdueAnyRangeWhere,
+  oldestInvoiceVerification, invoiceVerificationIsStale,
+  invoiceVerificationState } from "@/lib/invoiceMetrics";
 import { resolveDateRange, rangeQueryString } from "@/lib/dateRange";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
@@ -84,6 +85,22 @@ export default async function DashboardPage({
     _sum: { amountDue: true }, _count: true,
   });
 
+  // Pre-cutoff invoices whose LATEST Jobber check failed. Read separately and
+  // without the range filter, because a read failure is not a financial figure:
+  // it must stay visible on the default year-to-date view, where the range-scoped
+  // legacy set is empty. Nothing here feeds any tile or total -- the Collections
+  // headline, its count and the range-scoped legacy sentence are all unchanged.
+  const legacyRows = await prisma.invoiceRecord.findMany({
+    where: legacyOverdueAnyRangeWhere(COLLECTIONS_SINCE, now),
+    select: { amountDue: true, lastSyncedAt: true,
+      lastVerifiedAt: true, lastVerifyOutcome: true },
+  });
+  const legacyUnconfirmed = legacyRows
+    .filter(i => invoiceVerificationState(i, now) === "unconfirmed");
+  const legacyUnconfirmedCount = legacyUnconfirmed.length;
+  const legacyUnconfirmedTotal = legacyUnconfirmed
+    .reduce((a, i) => a + (i.amountDue || 0), 0);
+
   // Carry the active range into detail-page links so the number you click
   // matches the list you land on. Default to YTD when nothing is set.
   const qs = rangeQueryString({
@@ -164,6 +181,13 @@ export default async function DashboardPage({
           Current cached status and balances, filtered by issue or visit date. Overdue invoices include cached past_due and awaiting_payment with a stored due date that has passed. The latter is a display calculation, not refreshed source status or the original sent-day reminder clock. These are not historical as-of balances.
           {(legacyOverdue._count ?? 0) > 0 && ` ${legacyOverdue._count} older invoices past due by status or stored due date / ${formatCurrencyDetailed(legacyOverdue._sum.amountDue ?? 0)} in this range are outside the Collections cutoff and remain listed for review.`}
         </p>
+        {legacyUnconfirmedCount > 0 && (
+          <p className="text-sm text-amber-700">
+            Jobber could not confirm {legacyUnconfirmedCount} older past-due {legacyUnconfirmedCount === 1 ? "invoice" : "invoices"} / {formatCurrencyDetailed(legacyUnconfirmedTotal)} on the latest check, issued before the Collections cutoff.
+            {" "}Not part of the Collections figures above and not treated as paid; still counted at {legacyUnconfirmedCount === 1 ? "its" : "their"} stored balance on the{" "}
+            <a className="underline" href="/risk/overdue-invoices?range=allTime">All time overdue invoice list</a>. Verify in Jobber before collection or settlement.
+          </p>
+        )}
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
           <ClickableStatCard
             href={`/risk/overdue${qs}`}
