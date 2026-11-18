@@ -354,6 +354,7 @@ export async function evaluateReminders(input: {
 
     const contacts = await readers.matchContacts(candidate);
     let contactTags: readonly string[] | null = null;
+    let soleContactId: string | null = null;
     if (contacts.length === 0) {
       holds.push("no_exact_destination_contact");
     } else if (contacts.length > 1) {
@@ -362,6 +363,7 @@ export async function evaluateReminders(input: {
     } else {
       const contact = contacts[0];
       contactTags = contact.tags;
+      soleContactId = contact.id;
       // The opt-out check is NOT part of the relaxation and always runs.
       if (contact.dnd) holds.push("destination_contact_opted_out");
       if (!day15EmailPath) {
@@ -381,6 +383,7 @@ export async function evaluateReminders(input: {
     if (nativeSmsGuardRuns) {
       holds.push(...nativeSmsOverlapHolds({
         contactTags,
+        contactId: soleContactId,
         attestation: input.nativeSmsOverlapAttestation ?? null,
         now,
         observedPublishedWorkflowCount: input.nativeSmsObservedPublishedWorkflowCount ?? null,

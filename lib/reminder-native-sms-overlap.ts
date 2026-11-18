@@ -53,14 +53,14 @@ export interface NativeSmsAttestation {
   /** Count of published workflows seen at that review. A change invalidates it. */
   publishedWorkflowCount: number;
   /**
-   * Fixed Automation's ACTIVE enrolment count, read from the workflow's own
-   * enrolment panel in the builder at that review. This is the only readable
-   * proxy for "is anyone inside the ladder right now", and it is the one thing
-   * the tag check cannot cover: a contact enrolled while tagged stays enrolled
-   * after the tag is removed, because the filters are evaluated at entry only.
-   * Anything other than exactly 0 holds.
+   * One entry per contact that was cleared by reading Fixed Automation's own
+   * enrolment panel for that contact. This covers the one thing the tag check
+   * cannot: a contact enrolled while tagged stays enrolled after the tag is
+   * removed, because the trigger filters are evaluated at entry only. It also
+   * covers a hand-made enrolment, which no workflow configuration can rule out.
+   * A contact with no entry here, or whose entry is not from today, HOLDS.
    */
-  activeEnrolments: number;
+  clearances: readonly NativeSmsEnrolmentClearance[];
   /**
    * True only when a person confirmed, at that review, that no other published
    * workflow enrols a contact into the legacy Day 15 ladder and none of them
@@ -69,7 +69,31 @@ export interface NativeSmsAttestation {
   noOtherEnrolmentPath: boolean;
 }
 
+/**
+ * One contact, cleared by eye in Fixed Automation's enrolment panel.
+ *
+ * HOW TO PRODUCE ONE. Open the workflow, go to Enrollment history, set the date
+ * range to the full 60 days GoHighLevel retains, pick the contact in "Search
+ * contact", and read the Current status column. Either the panel says "No
+ * enrollments found", or every row for that contact reads Finished. Anything
+ * else — a row still waiting, a status you cannot read, a panel that will not
+ * load — is not a clearance, and the email holds.
+ */
+export interface NativeSmsEnrolmentClearance {
+  /** The GoHighLevel contact id, exactly as the contact read returns it. */
+  contactId: string;
+  /** The Phoenix calendar day the panel was read, YYYY-MM-DD. */
+  readOn: string;
+  /** True only when the panel showed no rows, or every row read Finished. */
+  noActiveEnrolment: boolean;
+}
+
 export interface NativeSmsOverlapInput {
+  /**
+   * The id of the single exactly-matched destination contact. null when there
+   * was not exactly one, which holds: a clearance is about one named contact.
+   */
+  contactId?: string | null;
   /**
    * Every tag on the single exactly-matched destination contact, as read in the
    * same decision. null means the tags could not be read, or there was not
@@ -127,10 +151,7 @@ export function nativeSmsOverlapHolds(input: NativeSmsOverlapInput): string[] {
           `older than ${maxAge} days`);
       }
     }
-    if (!Number.isInteger(attestation.activeEnrolments) || attestation.activeEnrolments !== 0) {
-      holds.push(`native_sms_active_enrolments: ${typeof attestation.activeEnrolments === "number"
-        ? attestation.activeEnrolments : "unread"} contacts are inside the legacy ladder`);
-    }
+    holds.push(...enrolmentClearanceHolds(attestation, input));
     const observed = input.observedPublishedWorkflowCount;
     if (typeof observed === "number" && Number.isFinite(observed) &&
         observed !== attestation.publishedWorkflowCount) {
@@ -141,6 +162,41 @@ export function nativeSmsOverlapHolds(input: NativeSmsOverlapInput): string[] {
 
   holds.push(...nativeSmsTagHolds(input.contactTags));
   return holds;
+}
+
+/** The per-contact enrolment leg. Separated so the rule reads in one place. */
+function enrolmentClearanceHolds(
+  attestation: NativeSmsAttestation,
+  input: NativeSmsOverlapInput,
+): string[] {
+  const contactId = typeof input.contactId === "string" && input.contactId.trim().length
+    ? input.contactId : null;
+  if (!contactId) {
+    return ["native_sms_enrolment_contact_unknown: no single contact to clear"];
+  }
+  const list = Array.isArray(attestation.clearances) ? attestation.clearances : [];
+  const mine = list.filter(entry => entry && entry.contactId === contactId);
+  if (!mine.length) {
+    return [`native_sms_enrolment_uncleared: no enrolment-panel read for this contact`];
+  }
+  if (mine.some(entry => entry.noActiveEnrolment !== true)) {
+    return [`native_sms_active_enrolment: the enrolment panel did not clear this contact`];
+  }
+  const today = phoenixToday(input.now);
+  if (!today) return ["native_sms_enrolment_clearance_undated: decision time unusable"];
+  if (mine.every(entry => entry.readOn !== today)) {
+    return [`native_sms_enrolment_clearance_stale: read on ` +
+      `${mine.map(entry => entry.readOn).join("/")}, not ${today}`];
+  }
+  return [];
+}
+
+/** The Phoenix calendar day the instant falls in, YYYY-MM-DD. */
+function phoenixToday(now: Date): string | null {
+  const ms = now instanceof Date ? now.getTime() : NaN;
+  if (!Number.isFinite(ms)) return null;
+  const dayStart = Math.floor((ms - PHOENIX_DAY_START_UTC_HOURS * 3_600_000) / DAY_MS) * DAY_MS;
+  return new Date(dayStart).toISOString().slice(0, 10);
 }
 
 /**
