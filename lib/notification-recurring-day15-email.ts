@@ -39,6 +39,7 @@ import { DAY15_EMAIL_TEMPLATE_POLICY, PROPOSED_DAY15_EMAIL_BODY, PROPOSED_DAY15_
 import type { RecurringNotificationReadScope } from "./notification-recurring-coordinator";
 import type { NotificationInventoryIO } from "./notification-inventory";
 import type { NotificationRecurringSourceIO } from "./notification-source";
+import { nativeSmsTagHolds } from "./reminder-native-sms-overlap";
 import type { NotificationLedgerDatabase } from "./notification-ledger";
 
 /** One read-only Jobber query. The reader rejects anything not starting with `query`. */
@@ -218,9 +219,11 @@ export function createRecurringDay15EmailService(options: Readonly<{
         const { readNotificationInventory, inspectNotificationInventory, planNotificationInventory, readDiscoveredNotificationSource } =
           notificationModuleFunctions(await import("./notification-inventory"),
             ["readNotificationInventory", "inspectNotificationInventory", "planNotificationInventory", "readDiscoveredNotificationSource"]);
-        const { readNotificationSourceBatch, inspectNotificationSourceDestinations, inspectRecurringNotificationSource } =
+        const { readNotificationSourceBatch, inspectNotificationSourceDestinations, inspectRecurringNotificationSource,
+          inspectNotificationSourceContactTags } =
           notificationModuleFunctions(await import("./notification-source"),
-            ["readNotificationSourceBatch", "inspectNotificationSourceDestinations", "inspectRecurringNotificationSource"]);
+            ["readNotificationSourceBatch", "inspectNotificationSourceDestinations", "inspectRecurringNotificationSource",
+              "inspectNotificationSourceContactTags"]);
         const inventory = await readNotificationInventory({ ...scope, expiresAt: new Date(deadline).toISOString() }, inventoryIO);
         const scan = inspectNotificationInventory(inventory);
         output.invoices = scan.rows.map((_, i) => ({ ordinal: i + 1, result: null, holds: ["not_current_day15"] }));
@@ -294,6 +297,13 @@ export function createRecurringDay15EmailService(options: Readonly<{
                 const rerendered = renderDay15EmailBody(p.template.body,
                   { balanceMinor: s.balanceMinor, currency: p.currency }, await readInvoiceLink(s.invoiceId));
                 if (sha(rerendered) !== event.bodyDigest) throw new Error("Source render drift");
+                // Overlap with the legacy GoHighLevel Day 15 text ladder, checked HERE,
+                // in the final pre-send read, against the same exact authenticated
+                // contact read. The ladder's only trigger is gated on an exact tag, so
+                // the tag's verified absence is what licenses this email. Tags that
+                // cannot be read hold, because unreadable is not absent.
+                const overlap = nativeSmsTagHolds(inspectNotificationSourceContactTags(handle)?.tags ?? null);
+                if (overlap.length) throw new Error(`Legacy Day15 text overlap: ${overlap.join("; ")}`);
                 const history = await readNotificationHistory({ scope: { accountId: p.accountId, locationId: p.locationId,
                   contactId: s.homeownerContactId, invoiceId: s.invoiceId, issuedDate: s.issuedDate, audience: "homeowner" },
                   reviewRef: saved.sourceRef }, {

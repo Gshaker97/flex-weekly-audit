@@ -30,6 +30,7 @@ import { DAY15_EMAIL_ISSUED_ON_OR_AFTER, day15EmailAmountsArePositive, day15Emai
   day15EmailIssueWindow } from "../lib/reminder-email-window";
 import { readLinkedJobText, type LinkedJobsResult } from "../lib/reminder-job-notes-source";
 import { classifyLinkedJobRework } from "../lib/reminder-rework-notes";
+import { NATIVE_SMS_ATTESTATION_2026_11_17 } from "../lib/reminder-native-sms-attestation";
 
 const DAY = 15;
 /** Email only. Day 21 keeps whatever it already does; this run never touches it. */
@@ -183,6 +184,11 @@ async function main() {
       // in Phoenix. Messages at or after issuance, unreadable timestamps,
       // incomplete history and messages naming this invoice all still hold.
       priorSendIgnoresPreIssueMessages: true,
+      // Pass --native-sms-guard to run the legacy-text overlap guard. It is off
+      // by default so this script keeps showing the invoice-side picture on its
+      // own; with the flag it reports what the guard would do today.
+      ...(process.argv.includes("--native-sms-guard")
+        ? { nativeSmsOverlapAttestation: NATIVE_SMS_ATTESTATION_2026_11_17 } : {}),
     });
     for (const row of plan.rows) {
       const label2 = `#${row.invoiceNumber ?? "?"}`;

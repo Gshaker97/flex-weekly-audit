@@ -3,6 +3,7 @@ import { resolveServiceType, serviceTypeIsConfirmed, type ServiceTypeResolution 
 import { day15EmailAmountsArePositive, day15EmailIssueWindow } from "./reminder-email-window";
 import { classifyLinkedJobRework } from "./reminder-rework-notes";
 import type { LinkedJobsResult } from "./reminder-job-notes-source";
+import { nativeSmsOverlapHolds, type NativeSmsAttestation } from "./reminder-native-sms-overlap";
 
 /**
  * Evaluate-only reminder runner.
@@ -258,9 +259,23 @@ export async function evaluateReminders(input: {
    * a pre-issue message holds exactly as it does today.
    */
   priorSendIgnoresPreIssueMessages?: boolean;
+  /**
+   * Refuse to email any contact the legacy GoHighLevel text ladder could also
+   * reach. See reminder-native-sms-overlap.ts for why the trigger's tag filter
+   * is the gate and why enrolment itself cannot be read through the API.
+   *
+   * Pass the attestation to RUN the guard. Pass null to run it with no
+   * attestation, which holds every row by design. Omit the option entirely and
+   * the guard does not run at all, which is how every caller that predates it
+   * keeps its current behaviour.
+   */
+  nativeSmsOverlapAttestation?: NativeSmsAttestation | null;
+  /** Published-workflow count read in this same run, when one is available. */
+  nativeSmsObservedPublishedWorkflowCount?: number | null;
 }): Promise<ReminderEvaluationPlan> {
   const { candidates, readers, now } = input;
   const day15EmailPath = input.jobberOnlyDay15Email === true;
+  const nativeSmsGuardRuns = Object.prototype.hasOwnProperty.call(input, "nativeSmsOverlapAttestation");
   const parts = phoenixParts(now);
   const notes: string[] = [];
 
@@ -358,6 +373,18 @@ export async function evaluateReminders(input: {
           if (cards[0].status !== "open") holds.push(`card_status_not_open: ${cards[0].status ?? "unknown"}`);
         }
       }
+    }
+
+    // Overlap with the legacy GoHighLevel text ladder. Runs on the freshly read
+    // contact, in the same decision as the send, so there is no window between
+    // the check and the send in which a tag could appear.
+    if (nativeSmsGuardRuns) {
+      holds.push(...nativeSmsOverlapHolds({
+        contactTags,
+        attestation: input.nativeSmsOverlapAttestation ?? null,
+        now,
+        observedPublishedWorkflowCount: input.nativeSmsObservedPublishedWorkflowCount ?? null,
+      }));
     }
 
     // Service type. Jobber decides; GoHighLevel may only corroborate. Anything

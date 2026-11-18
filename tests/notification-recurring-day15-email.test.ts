@@ -290,6 +290,30 @@ test("a contact with no Email DND entry holds: unknown is not consent", () => cl
   assert.notEqual(r.invoices[0].result?.state, "accepted");
 }));
 
+test("the legacy text ladder's gate tag holds the email, with no post", () => clock(async tick => {
+  const f = fixture(tick);
+  f.data.contacts[0].tags = ["irrigation", "flex-native-paula-approved"];
+  const r = await f.run().run();
+  assert.equal(f.state.posts, 0);
+  assert.notEqual(r.invoices[0].result?.state, "accepted");
+}));
+
+test("the gate tag holds even when it is the contact's only tag", () => clock(async tick => {
+  const f = fixture(tick);
+  f.data.contacts[0].tags = ["flex-native-paula-approved"];
+  const r = await f.run().run();
+  assert.equal(f.state.posts, 0);
+  assert.notEqual(r.invoices[0].result?.state, "accepted");
+}));
+
+test("unreadable contact tags hold the email: unreadable is not absent", () => clock(async tick => {
+  const f = fixture(tick);
+  f.data.contacts[0].tags = null;
+  const r = await f.run().run();
+  assert.equal(f.state.posts, 0);
+  assert.notEqual(r.invoices[0].result?.state, "accepted");
+}));
+
 test("an explicit Email opt-out holds", () => clock(async tick => {
   const f = fixture(tick);
   f.data.contacts[0].dndSettings = { SMS: { status: "inactive" }, Email: { status: "active" } };
