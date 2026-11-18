@@ -75,16 +75,21 @@ export type SendChannel = "email" | "sms";
  *
  * `attribution` is the only thing that ties a message to an invoice, and it is
  * stated by the reader, never inferred here from due-date arithmetic:
- *  - "exact"         the enrollment or message evidence names THIS invoice
- *  - "other_invoice" the evidence names a DIFFERENT invoice; it suppresses nothing
- *  - "ambiguous"     the evidence cannot be tied to one invoice; it holds
+ *  - "exact"            the enrollment or message evidence names THIS invoice
+ *  - "other_invoice"    the evidence names a DIFFERENT invoice; it suppresses nothing
+ *  - "predates_invoice" the message was reliably sent STRICTLY BEFORE the invoice's
+ *                       issue day in Phoenix, so it cannot be about this invoice.
+ *                       It still HOLDS unless the caller opts in with
+ *                       `priorSendIgnoresPreIssueMessages`, in which case it is
+ *                       dropped exactly like "other_invoice".
+ *  - "ambiguous"        the evidence cannot be tied to one invoice; it holds
  * `confirmed` is false when it is not certain the message actually went out.
  */
 export interface PriorSend {
   messageId: string;
   channel: SendChannel | null;
   milestoneDay: number | null;
-  attribution: "exact" | "other_invoice" | "ambiguous";
+  attribution: "exact" | "other_invoice" | "predates_invoice" | "ambiguous";
   confirmed: boolean;
 }
 
@@ -107,7 +112,8 @@ export interface ReminderEvaluationReaders {
    * every milestone: missing history is treated as unknown history, never as
    * "nothing was sent".
    */
-  sendHistory?(candidate: ReminderCandidate): Promise<SendHistory | null>;
+  sendHistory?(candidate: ReminderCandidate,
+    context?: { issuedDate: string | null }): Promise<SendHistory | null>;
   /**
    * Every job Jobber links to this invoice, with each job's own notes. Required
    * by the Day 15 email path: the warranty / no-charge rule is re-read from
@@ -240,6 +246,18 @@ export async function evaluateReminders(input: {
    * On this path the only milestone that can ever come due is day 15.
    */
   jobberOnlyDay15Email?: boolean;
+  /**
+   * Dismiss a past GoHighLevel message ONLY when the reader proved it was sent
+   * strictly before this invoice's issue day in Phoenix. Such a message cannot
+   * be a reminder for an invoice that did not yet exist.
+   *
+   * WHAT THIS DOES NOT DO. It does not touch a message that names this invoice,
+   * a message sent on the issue day or any day after it, a message whose
+   * timestamp could not be read, or a history that could not be read in full.
+   * Each of those still holds the row. With this option off — the default —
+   * a pre-issue message holds exactly as it does today.
+   */
+  priorSendIgnoresPreIssueMessages?: boolean;
 }): Promise<ReminderEvaluationPlan> {
   const { candidates, readers, now } = input;
   const day15EmailPath = input.jobberOnlyDay15Email === true;
@@ -434,16 +452,29 @@ export async function evaluateReminders(input: {
       holds.push("milestone_channels_undeclared: no channel policy supplied for this milestone");
     }
 
-    const history = readers.sendHistory ? await readers.sendHistory(candidate) : null;
+    const history = readers.sendHistory
+      ? await readers.sendHistory(candidate, { issuedDate: source.issuedDate })
+      : null;
     if (!history) {
       holds.push("send_history_unavailable: cannot prove this milestone was not already sent");
     } else {
       if (!history.complete) {
         holds.push(`send_history_incomplete: ${history.incompleteReason || "history could not be read in full"}`);
       }
+      // A message sent strictly before the invoice's issue day cannot be about
+      // this invoice. Dismissing it is OPT-IN: with the option off it is held
+      // exactly as an ambiguous message is, so nothing changes for any caller
+      // that does not ask for it. Messages at or after issuance, messages with
+      // an unusable timestamp, and messages naming this invoice are never
+      // dismissed by this rule.
+      const dismissPreIssue = input.priorSendIgnoresPreIssueMessages === true;
+      const sends = history.sends.map(send => send.attribution !== "predates_invoice" ? send : {
+        ...send,
+        attribution: (dismissPreIssue ? "other_invoice" : "ambiguous") as PriorSend["attribution"],
+      });
       // "other_invoice" is dropped here and nowhere else: that is the one case
       // that must never suppress this invoice's reminder.
-      const relevant = history.sends.filter(send => send.attribution !== "other_invoice");
+      const relevant = sends.filter(send => send.attribution !== "other_invoice");
       for (const send of relevant) {
         if (send.attribution === "ambiguous") {
           holds.push(`ambiguous_send_attribution: ${send.messageId} cannot be tied to one invoice`);

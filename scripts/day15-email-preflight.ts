@@ -178,6 +178,11 @@ async function main() {
       channelBlindMilestones: CHANNEL_BLIND,
       // The approved email path: Jobber decides status and timing.
       jobberOnlyDay15Email: true,
+      // The narrow history fix: an unnumbered GoHighLevel message is dismissed
+      // only when it was reliably sent strictly before this invoice's issue day
+      // in Phoenix. Messages at or after issuance, unreadable timestamps,
+      // incomplete history and messages naming this invoice all still hold.
+      priorSendIgnoresPreIssueMessages: true,
     });
     for (const row of plan.rows) {
       const label2 = `#${row.invoiceNumber ?? "?"}`;

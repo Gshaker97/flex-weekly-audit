@@ -1,5 +1,6 @@
 import { jobberGraphQL } from "./jobber";
 import { readLinkedJobText, type LinkedJobsResult } from "./reminder-job-notes-source";
+import { priorSendRelevance } from "./reminder-prior-send-window";
 import { findExactContactMatches, getInvoicePipelineRefs, getOutboundMessages, searchOpportunities } from "./ghl";
 import type {
   DestinationCard, DestinationContact, PriorSend, ReminderCandidate,
@@ -78,13 +79,25 @@ export function createReminderEvaluationReaders(): ReminderEvaluationReaders {
      * Attribution is read off the message itself, never computed from the due
      * date: a reminder counts as THIS invoice's only when the body names this
      * invoice number. A body naming a different number is "other_invoice" and
-     * suppresses nothing. Anything else is "ambiguous" and holds.
+     * suppresses nothing.
+     *
+     * An unnumbered message is "predates_invoice" ONLY when `context.issuedDate`
+     * is known AND the message's own timestamp is known AND it is strictly
+     * before the start of the invoice's issue day in Phoenix. That message
+     * cannot be about an invoice that did not yet exist. Everything else —
+     * including a message sent at any hour of the issue day itself, which is
+     * exactly where a same-day legacy Day 15 SMS would land relative to a LATER
+     * invoice — stays "ambiguous" and holds. Marking a message here does not
+     * dismiss it; only `priorSendIgnoresPreIssueMessages` in the evaluator does.
      *
      * `milestoneDay` is left null because nothing in a GoHighLevel message says
      * which rung of the ladder it was. That is deliberate: a null milestone day
      * holds the row instead of letting a guess cancel a reminder.
      */
-    async sendHistory(candidate: ReminderCandidate): Promise<SendHistory | null> {
+    async sendHistory(
+      candidate: ReminderCandidate,
+      context?: { issuedDate: string | null },
+    ): Promise<SendHistory | null> {
       const contacts = await findExactContactMatches({ email: candidate.email, phone: candidate.phone });
       // One exact contact or no history at all. Several already holds upstream,
       // and merging their histories would invent an attribution.
@@ -97,11 +110,21 @@ export function createReminderEvaluationReaders(): ReminderEvaluationReaders {
       const minePattern = mine ? new RegExp(`(?:^|[^0-9])${mine}(?:[^0-9]|$)`) : null;
       const anyInvoiceNumber = /#\s?\d{3,6}|invoice\s+#?\s?\d{3,6}/i;
 
+      const issuedDate = context?.issuedDate ?? null;
+
       const sends: PriorSend[] = history.messages.map(message => {
         const namesMine = minePattern ? minePattern.test(message.body) : false;
         const namesSome = anyInvoiceNumber.test(message.body);
+        // Only an UNNUMBERED message is ever dated against the invoice. A
+        // message naming this invoice stays "exact" however old it is.
+        const unnumbered = !namesMine && !namesSome;
+        const predates = unnumbered &&
+          priorSendRelevance(message.dateAdded, issuedDate) === "predates_invoice";
         const attribution: PriorSend["attribution"] =
-          namesMine ? "exact" : namesSome ? "other_invoice" : "ambiguous";
+          namesMine ? "exact"
+          : namesSome ? "other_invoice"
+          : predates ? "predates_invoice"
+          : "ambiguous";
         return {
           messageId: message.id,
           channel: message.channel,
