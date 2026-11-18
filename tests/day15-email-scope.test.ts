@@ -6,7 +6,7 @@ import {
   DAY15_EMAIL_WITHHELD_INVOICE_NUMBERS,
   day15EmailAmountsArePositive, day15EmailIsWithheld, day15EmailIssueWindow,
 } from "../lib/reminder-email-window";
-import { classifyReworkNotes } from "../lib/reminder-rework-notes";
+import { classifyJobText, classifyLinkedJobRework, classifyOneNote, classifyReworkNotes } from "../lib/reminder-rework-notes";
 
 test("the email programme starts 2026-03-01 and is NOT the dashboard cutoff", () => {
   assert.equal(DAY15_EMAIL_ISSUED_ON_OR_AFTER, "2026-03-01");
@@ -45,26 +45,53 @@ test("notes: an unmatched job or missing notes HOLDS, never clears or excludes",
   assert.deepEqual(classifyReworkNotes(false, "anything"),
     { verdict: "hold", reason: "job_not_matched_to_invoice", evidence: null });
   assert.equal(classifyReworkNotes(true, null).verdict, "hold");
-  assert.equal(classifyReworkNotes(true, "   ").reason, "job_notes_missing");
+  assert.equal(classifyReworkNotes(true, "   ").reason, "job_has_no_readable_text");
   assert.equal(classifyReworkNotes(true, "bad � text").reason, "job_notes_unreadable");
 });
 
-test("notes: confirmed warranty, callback and no-charge rework are excluded", () => {
+test("notes: only a phrase asserting warranty or no charge excludes", () => {
   for (const note of [
-    "Warranty repair on the valve we installed",
+    "Valve replaced under warranty",
+    "Warranty repair on the head we installed",
     "warrantied the controller",
-    "Callback - sprinkler head we replaced is leaking",
-    "call-back for the same zone",
-    "redo the trim, no charge",
-    "Reworked the edging",
+    "Replaced the emitter at no charge",
+    "no charge to the client for the trip",
     "free of charge, our error",
     "completed at no cost to the client",
+    "redid the trim at our expense",
+    "Callback on the same zone, we will cover the parts",
   ]) {
-    const result = classifyReworkNotes(true, note);
+    const result = classifyOneNote(note);
     assert.equal(result.verdict, "excluded", note);
-    assert.equal(result.reason, "confirmed_rework_phrase");
     assert.ok(result.evidence && result.evidence === result.evidence.toLowerCase());
   }
+});
+
+test("notes: a bare rework word HOLDS, it does not exclude", () => {
+  // These are the real notes that the earlier bare-word rule got wrong.
+  const quote = classifyOneNote("Send out quote to client for redoing backyard drip with 1 new valve");
+  assert.equal(quote.verdict, "hold");
+  assert.equal(quote.reason, "rework_word_without_proof_it_was_free");
+  const tree = classifyOneNote("Complete fertilization service and re-do of tree");
+  assert.equal(tree.verdict, "hold");
+  assert.equal(tree.reason, "rework_word_without_proof_it_was_free");
+  for (const note of ["Callback scheduled for Tuesday", "reworking the layout next week"]) {
+    assert.equal(classifyOneNote(note).verdict, "hold", note);
+  }
+});
+
+test("notes: a confirmation must come from ONE note, not two combined", () => {
+  const combined = classifyJobText({ title: null, instructions: null, jobNoteMessages: [
+    "Send out quote to client for redoing backyard drip",
+    "Courtesy call to confirm the gate code",
+  ] });
+  // "courtesy" alone is ambiguous and "redoing" alone is a bare rework word.
+  // Neither note confirms on its own, so the job holds instead of being excluded.
+  assert.equal(combined.verdict, "hold");
+  const singleNote = classifyJobText({ title: null, instructions: null, jobNoteMessages: [
+    "Redoing the valve box at no charge to the client",
+  ] });
+  assert.equal(singleNote.verdict, "excluded");
 });
 
 test("notes: 'out of warranty' means they DO owe us, so it is not excluded", () => {
@@ -114,4 +141,33 @@ test("the two invoices the user withheld can never be sendable", () => {
   assert.equal(day15EmailIsWithheld("7207"), false);
   assert.equal(day15EmailIsWithheld(null), false);
   assert.equal(day15EmailIsWithheld("71710"), false);
+});
+
+test("a job with no readable text at all holds (the #7207 case)", () => {
+  // Its one linked job carries 26 notes whose messages are all empty strings.
+  const empty = classifyJobText({ title: null, instructions: "", jobNoteMessages: ["", "  ", ""] });
+  assert.deepEqual(empty, { verdict: "hold", reason: "job_has_no_readable_text", evidence: null });
+});
+
+test("linked-job verdict: incomplete reads and no linked job both hold", () => {
+  assert.equal(classifyLinkedJobRework({ complete: false, reason: "jobs_read_errored", jobs: [] }).verdict, "hold");
+  assert.equal(classifyLinkedJobRework({ complete: true, reason: null, jobs: [] }).reason, "no_linked_job_in_jobber");
+  assert.equal(classifyLinkedJobRework({ complete: true, reason: null, jobs: [
+    { notesComplete: false, title: null, instructions: null, jobNoteMessages: ["Monthly maintenance"] },
+  ] }).reason, "job_notes_read_incomplete");
+});
+
+test("linked-job verdict: one warranty job excludes the invoice even beside a clean job", () => {
+  const verdict = classifyLinkedJobRework({ complete: true, reason: null, jobs: [
+    { notesComplete: true, title: null, instructions: null, jobNoteMessages: ["Monthly maintenance completed"] },
+    { notesComplete: true, title: null, instructions: null, jobNoteMessages: ["Head replaced under warranty"] },
+  ] });
+  assert.equal(verdict.verdict, "excluded");
+});
+
+test("linked-job verdict: every job readable and clean clears the invoice", () => {
+  const verdict = classifyLinkedJobRework({ complete: true, reason: null, jobs: [
+    { notesComplete: true, title: "Monthly service", instructions: "", jobNoteMessages: ["Trimmed and blown"] },
+  ] });
+  assert.equal(verdict.verdict, "clear");
 });

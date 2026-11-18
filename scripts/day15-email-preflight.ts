@@ -1,203 +1,251 @@
 // Day 15 customer EMAIL — no-send preflight.
 //
-// It answers one question: if the Day 15 email were live right now, exactly who
-// would receive one, and why is everyone else not receiving one.
+// It answers one question: if the Day 15 email were live, exactly who would
+// receive one, and why is everyone else not receiving one.
 //
-// It cannot send. It imports no sender, no GoHighLevel write path and no
-// dispatcher, and it writes nothing to either provider or to our own database.
-// Making it send would mean adding code.
+// It cannot send. It imports no sender, no dispatcher, no GoHighLevel write path
+// and nothing that reserves in the ledger. It writes nothing to either provider
+// or to our own database. Making it send would mean adding code.
 //
-// Rules applied, in this order:
-//   1. issued 2026-03-01 or later          (lib/reminder-email-window)
-//   2. open, with a positive TOTAL and a positive BALANCE, read live from Jobber
-//   3. exactly 15 days past the Jobber due date today; no catch-up
-//   4. the job's notes must not be confirmed warranty / callback / no-charge
-//      rework; unmatched, missing or ambiguous notes HOLD  (lib/reminder-rework-notes)
-//   5. the existing recipient, opt-out and per-invoice duplicate checks,
-//      unchanged                            (lib/reminder-evaluation)
+// WHO DECIDES WHAT
+//   Jobber decides, from a live per-invoice read: is the invoice open, is the
+//   original total positive, is there a balance left, when was it issued, and is
+//   today exactly day 15 past its due date in Arizona. The cache decides nothing
+//   except which invoices are worth reading.
+//   Jobber also supplies the job behind the invoice, through `Invoice.jobs` and
+//   `Invoice.archivedJobs`, so the warranty rule reads the real linked job rather
+//   than whatever the invoice-number join happened to find.
+//   GoHighLevel decides only who the message would go to and whether one has
+//   already gone out.
 //
-// Output carries invoice numbers and machine reasons only: no names, no email
-// addresses, no phone numbers, no message text.
+// `--as-of=YYYY-MM-DD` runs the whole chain as if it were 09:05 Phoenix on that
+// date, so the recipient, opt-out and duplicate checks are exercised against the
+// invoices that will actually be first in line. Balances are still read live.
 import { prisma } from "../lib/prisma";
 import { evaluateReminders, type SendChannel } from "../lib/reminder-evaluation";
 import { createReminderEvaluationReaders } from "../lib/reminder-evaluation-readers";
-import { DAY15_EMAIL_ISSUED_SINCE, day15EmailIsWithheld, day15EmailIssueWindow } from "../lib/reminder-email-window";
-import { classifyReworkNotes, type ReworkVerdict } from "../lib/reminder-rework-notes";
+import { jobberGraphQL } from "../lib/jobber";
+import { invoiceCalendarDate, addInvoiceCalendarDays } from "../lib/invoice-reminder-clock";
+import { DAY15_EMAIL_ISSUED_ON_OR_AFTER, day15EmailAmountsArePositive, day15EmailIsWithheld,
+  day15EmailIssueWindow } from "../lib/reminder-email-window";
+import { readLinkedJobText, type LinkedJobsResult } from "../lib/reminder-job-notes-source";
+import { classifyLinkedJobRework } from "../lib/reminder-rework-notes";
 
 const DAY = 15;
 /** Email only. Day 21 keeps whatever it already does; this run never touches it. */
 const MILESTONE_CHANNELS = (step: { dayPastDue: number }): readonly SendChannel[] =>
   step.dayPastDue === DAY ? ["email"] : [];
+/** Day 15 is one ledger event regardless of channel. Mirrors `eventKey`. */
+const CHANNEL_BLIND = [DAY];
+const OPEN = ["awaiting_payment", "past_due"];
+const SETTLED = new Set(["paid", "void", "bad_debt"]);
 
 /** Jobber reads must use the token that already exists. Refreshing it writes. */
-const MIN_TOKEN_MINUTES = 20;
+const MIN_TOKEN_MINUTES = 8;
 
-async function assertExistingJobberTokenIsEnough(): Promise<number> {
+async function tokenMinutes(): Promise<number> {
   const auth = await prisma.jobberAuth.findFirst({ orderBy: { createdAt: "desc" }, select: { expiresAt: true } });
   if (!auth) throw new Error("no_jobber_auth_row");
-  const minutes = Math.floor((auth.expiresAt.getTime() - Date.now()) / 60000);
-  if (minutes < MIN_TOKEN_MINUTES) {
-    throw new Error(`jobber_token_coverage_too_short: ${minutes}m left; a read would refresh and write. Stopping.`);
-  }
-  return minutes;
+  return Math.floor((auth.expiresAt.getTime() - Date.now()) / 60000);
 }
 
 /**
- * `--as-of=YYYY-MM-DD` runs the whole chain as if it were 09:05 Phoenix on that
- * date, so the recipient, opt-out and duplicate checks can be exercised against
- * the invoices that will actually be first in line instead of only against a day
- * on which nothing is at day 15. Balances are still read live, which is the
- * point: it shows what would happen today if that date arrived now. It cannot
- * send on any date.
+ * Reports what WOULD be eligible if the two GoHighLevel dependencies that
+ * contradict "Jobber decides" were not consulted. It relaxes nothing else: a
+ * row with any recipient, opt-out or duplicate hold is never promoted. Off
+ * unless asked for, and it still cannot send.
  */
+const projectWithoutGhlDependency = process.argv.includes("--project-without-ghl-dependency");
+
 function resolveNow(): { now: Date; label: string } {
   const flag = process.argv.find(arg => arg.startsWith("--as-of="));
   if (!flag) return { now: new Date(), label: "live clock" };
   const date = flag.slice("--as-of=".length);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error("as_of_must_be_yyyy_mm_dd");
-  // 09:05 Phoenix = 16:05Z. Inside the 09:00-09:15 window, so the "window has
-  // already passed today" hold does not mask the checks we want to see.
+  // 09:05 Phoenix = 16:05Z, inside the 09:00-09:15 window.
   const now = new Date(`${date}T16:05:00.000Z`);
   if (!Number.isFinite(now.getTime())) throw new Error("as_of_unparseable");
   return { now, label: `simulated 09:05 Phoenix on ${date}` };
 }
 
+/** One bucket per invoice, mutually exclusive, in this order. They must sum. */
+type Disposition =
+  | "source_unreadable"
+  | "settled_no_longer_owes"
+  | "issued_before_programme"
+  | "zero_or_unreadable_amount"
+  | "withheld_by_name"
+  | "excluded_warranty_or_no_charge"
+  | "held_notes_unverifiable"
+  | "day15_passed_no_catch_up"
+  | "not_yet_day15"
+  | "eligible"
+  | "held_protection"
+  | "held_ghl_dependency";
+
+/** Holds that exist to protect a customer. These must never be relaxed. */
+const PROTECTION = [
+  "no_exact_destination_contact", "ambiguous_destination_contacts", "destination_contact_opted_out",
+  "send_history_unavailable", "send_history_incomplete", "ambiguous_send_attribution",
+  "uncertain_send_attempt", "send_detail_unknown", "already_sent_all_channels",
+  "milestone_already_sent_on_another_channel", "owner_has_multiple_unpaid_invoices",
+  "source_owner_unknown_or_changed", "exclusions_unverified",
+];
+/** Holds that ask GoHighLevel to confirm something Jobber already decided. */
+const GHL_DEPENDENCY = [
+  "no_invoice_pipeline_card", "ambiguous_pipeline_cards", "card_not_in_overdue_stage",
+  "card_status_not_open", "service_type_jobber_only", "service_type_conflict", "service_type_unknown",
+];
+
 async function main() {
   const { now, label } = resolveNow();
   const say = (line: string) => console.log("PF15: " + line);
-  say(`clock: ${label}`);
-  say(`token coverage ${await assertExistingJobberTokenIsEnough()}m (no refresh, no write)`);
+  const minutes = await tokenMinutes();
+  if (minutes < MIN_TOKEN_MINUTES) {
+    throw new Error(`jobber_token_coverage_too_short: ${minutes}m left; a read would refresh and write. Stopping.`);
+  }
+  say(`clock: ${label}; jobber token coverage ${minutes}m (no refresh, no write)`);
+  if (projectWithoutGhlDependency) say("MODE: projecting WITHOUT the GHL stage/service-type dependencies (protections still enforced)");
+  const today = invoiceCalendarDate(now)!;
 
-  // Rule 1, from the cache, purely to decide who is worth a live read.
+  // The cache is used ONLY to choose who to read. No date filter here on
+  // purpose: the live Jobber issue date decides the programme window, so a
+  // drifted cache can neither add nor remove anyone.
   const cached = await prisma.invoiceRecord.findMany({
-    where: {
-      invoiceStatus: { in: ["awaiting_payment", "past_due"] },
-      amountDue: { gt: 0 },
-      issuedAt: { gte: DAY15_EMAIL_ISSUED_SINCE },
-    },
+    where: { invoiceStatus: { in: OPEN }, amountDue: { gt: 0 } },
     select: {
-      jobberInvoiceId: true, invoiceNumber: true, clientName: true, issuedAt: true,
+      jobberInvoiceId: true, invoiceNumber: true, clientName: true,
       customer: { select: { jobberClientId: true, email: true, phone: true } },
     },
   });
-  say(`in programme by cached issue date (>= 2026-03-01): ${cached.length}`);
+  say(`open invoices read from Jobber: ${cached.length} (cache used only to pick them)`);
 
-  // Rule 4's raw material: the job tied to each invoice, by invoice number.
-  const numbers = cached.map(r => r.invoiceNumber).filter((n): n is string => !!n);
-  const jobs = await prisma.jobRecord.findMany({
-    where: { invoiceNumber: { in: numbers } },
-    select: { invoiceNumber: true, notes: true },
-  });
-  const notesByInvoice = new Map<string, string | null>();
-  const seen = new Set<string>();
-  for (const job of jobs) {
-    if (!job.invoiceNumber) continue;
-    // Two jobs on one invoice number is ambiguous; keep the one with notes and
-    // record the clash so it cannot quietly resolve to "clear".
-    if (seen.has(job.invoiceNumber) && notesByInvoice.get(job.invoiceNumber) !== job.notes) {
-      notesByInvoice.set(job.invoiceNumber, "�");
+  const facts = new Map<string, LinkedJobsResult>();
+  for (const row of cached) {
+    facts.set(row.jobberInvoiceId, await readLinkedJobText(row.jobberInvoiceId, jobberGraphQL));
+  }
+
+  const disposition = new Map<string, Disposition>();
+  const detail = new Map<string, string>();
+  const day15Today: typeof cached = [];
+  /** invoiceNumber -> the date it will be exactly day 15, when that is future. */
+  const upcoming: { label: string; date: string; amount: number }[] = [];
+
+  for (const row of cached) {
+    const label2 = `#${row.invoiceNumber ?? "?"}`;
+    const live = facts.get(row.jobberInvoiceId)!;
+    const put = (d: Disposition, why: string) => { disposition.set(row.jobberInvoiceId, d); detail.set(row.jobberInvoiceId, `${label2}:${why}`); };
+
+    if (!live.complete && !live.invoiceStatus) { put("source_unreadable", live.reason ?? "unknown"); continue; }
+    const status = (live.invoiceStatus ?? "").toLowerCase();
+    if (SETTLED.has(status) || (live.balanceCents ?? 0) <= 0) { put("settled_no_longer_owes", status || "unknown"); continue; }
+    if (!OPEN.includes(status)) { put("source_unreadable", `status_${status || "unknown"}`); continue; }
+
+    const window = day15EmailIssueWindow(live.issuedDate);
+    if (window === "before_programme") { put("issued_before_programme", invoiceCalendarDate(live.issuedDate) ?? "?"); continue; }
+    if (window === "unusable_issue_date") { put("source_unreadable", "issue_date_unusable"); continue; }
+
+    const amounts = day15EmailAmountsArePositive(live.totalCents, live.balanceCents);
+    if (!amounts.ok) { put("zero_or_unreadable_amount", amounts.reason!); continue; }
+
+    if (day15EmailIsWithheld(row.invoiceNumber)) { put("withheld_by_name", "named carve-out"); continue; }
+
+    const rework = classifyLinkedJobRework(live);
+    if (rework.verdict === "excluded") { put("excluded_warranty_or_no_charge", `${rework.reason}=${rework.evidence}`); continue; }
+    if (rework.verdict === "hold") { put("held_notes_unverifiable", rework.reason); continue; }
+
+    const dueOn = invoiceCalendarDate(live.dueDate);
+    if (!dueOn) { put("source_unreadable", "due_date_unusable"); continue; }
+    const day15On = addInvoiceCalendarDays(dueOn, DAY)!;
+    if (day15On < today) { put("day15_passed_no_catch_up", `was ${day15On}`); continue; }
+    if (day15On > today) {
+      put("not_yet_day15", `day 15 on ${day15On}`);
+      upcoming.push({ label: label2, date: day15On, amount: (live.balanceCents ?? 0) / 100 });
       continue;
     }
-    seen.add(job.invoiceNumber);
-    notesByInvoice.set(job.invoiceNumber, job.notes ?? null);
+    day15Today.push(row);
   }
 
-  const rework = new Map<string, { verdict: ReworkVerdict; reason: string; evidence: string | null }>();
-  for (const row of cached) {
-    const key = row.jobberInvoiceId;
-    const matched = !!row.invoiceNumber && notesByInvoice.has(row.invoiceNumber);
-    rework.set(key, classifyReworkNotes(matched, matched ? notesByInvoice.get(row.invoiceNumber!) ?? null : null));
-  }
-
-  const plan = await evaluateReminders({
-    candidates: cached.map(row => ({
-      jobberInvoiceId: row.jobberInvoiceId,
-      invoiceNumber: row.invoiceNumber,
-      clientName: row.clientName,
-      jobberClientId: row.customer?.jobberClientId ?? null,
-      email: row.customer?.email ?? null,
-      phone: row.customer?.phone ?? null,
-    })),
-    readers: createReminderEvaluationReaders(),
-    now,
-    verifiedExclusions: null,   // asked for separately; nothing is sendable without them
-    ignoreWindow: true,         // a manual review, not the 09:00 send window
-    milestoneChannels: MILESTONE_CHANNELS,
-  });
-
-  const byInvoice = new Map(plan.rows.map(r => [r.jobberInvoiceId, r]));
-  const tally = new Map<string, number>();
-  const bump = (k: string) => tally.set(k, (tally.get(k) ?? 0) + 1);
-  const holdReasons = new Map<string, number>();
-  const ready: string[] = [];
-  const readyExceptExclusions: string[] = [];
-  const excludedRework: string[] = [];
-  const zeroAmount: string[] = [];
-  const unverifiableNotes: string[] = [];
-  const pastDay15: string[] = [];
-  const withheld: string[] = [];
-
-  for (const row of cached) {
-    const label = `#${row.invoiceNumber ?? "?"}`;
-    const ev = byInvoice.get(row.jobberInvoiceId)!;
-    const notes = rework.get(row.jobberInvoiceId)!;
-
-    if (ev.holds.some(h => h.startsWith("source_invoice_unreadable"))) { bump("source_unreadable"); continue; }
-    // Rule 1 again, this time against the live source issue date rather than the
-    // cached one, so a cache that drifted cannot pull an older invoice into the
-    // programme. Out of programme is permanent; unusable holds.
-    const window = day15EmailIssueWindow(ev.sourceIssuedDate);
-    if (window === "before_programme") { bump("source_issued_before_programme"); continue; }
-    if (window === "unusable_issue_date") { bump("source_issue_date_unusable"); continue; }
-    if (ev.decision === "no_longer_owes") { bump("no_longer_owes"); continue; }
-    if (ev.holds.some(h => h.startsWith("source_total") || h.startsWith("source_balance"))) {
-      zeroAmount.push(label); bump("zero_or_unreadable_amount"); continue;
-    }
-    if (notes.verdict === "excluded") { excludedRework.push(`${label}:${notes.evidence}`); bump("excluded_rework"); continue; }
-    // Named human carve-outs. Checked before any timing so they can never be
-    // "ready", not even for one day.
-    if (day15EmailIsWithheld(row.invoiceNumber)) { withheld.push(label); bump("withheld_by_name"); continue; }
-
-    const dpd = ev.daysPastDue;
-    if (typeof dpd !== "number") { bump("days_past_due_unknown"); continue; }
-    if (dpd > DAY) { pastDay15.push(label); bump("already_past_day_15_no_catch_up"); continue; }
-    if (dpd < DAY) { bump("not_yet_day_15"); continue; }
-
-    // From here on it IS day 15 today.
-    if (notes.verdict === "hold") { unverifiableNotes.push(`${label}:${notes.reason}`); bump("held_notes_unverifiable"); continue; }
-
-    const other = ev.holds.filter(h => !h.startsWith("exclusions_unverified"));
-    for (const h of other) holdReasons.set(h.split(":")[0], (holdReasons.get(h.split(":")[0]) ?? 0) + 1);
-    if (other.length === 0) {
-      readyExceptExclusions.push(label);
-      if (ev.decision === "eligible") ready.push(label);
-      bump("ready_except_exclusion_gate");
-    } else {
-      bump("held_by_existing_checks");
+  // Only the invoices that are exactly day 15 today go through the recipient,
+  // opt-out and duplicate checks, so nothing is read twice.
+  if (day15Today.length) {
+    const plan = await evaluateReminders({
+      candidates: day15Today.map(row => ({
+        jobberInvoiceId: row.jobberInvoiceId, invoiceNumber: row.invoiceNumber, clientName: row.clientName,
+        jobberClientId: row.customer?.jobberClientId ?? null,
+        email: row.customer?.email ?? null, phone: row.customer?.phone ?? null,
+      })),
+      readers: createReminderEvaluationReaders(),
+      now,
+      // Not supplied, and not needed for a disposition count: the quarantine is
+      // a send-time identity omission covering at most two clients.
+      verifiedExclusions: null,
+      ignoreWindow: true,
+      milestoneChannels: MILESTONE_CHANNELS,
+      feeClaimFreeDay15: true,
+      channelBlindMilestones: CHANNEL_BLIND,
+    });
+    for (const row of plan.rows) {
+      const label2 = `#${row.invoiceNumber ?? "?"}`;
+      const real = row.holds.filter(h => !h.startsWith("exclusions_unverified"));
+      const ghl = real.filter(h => GHL_DEPENDENCY.some(g => h.startsWith(g)));
+      const prot = real.filter(h => PROTECTION.some(p => h.startsWith(p)));
+      const other = real.filter(h => !ghl.includes(h) && !prot.includes(h));
+      if (!real.length) { disposition.set(row.jobberInvoiceId, "eligible"); detail.set(row.jobberInvoiceId, label2); }
+      else if (!prot.length && !other.length && ghl.length && projectWithoutGhlDependency) {
+        // A PROJECTION, not a decision. The two dependencies set aside here ask
+        // GoHighLevel to confirm something Jobber already decided; see the
+        // report. Recipient, opt-out and duplicate holds are NOT set aside:
+        // `prot` and `other` being empty is a precondition of this branch.
+        disposition.set(row.jobberInvoiceId, "eligible");
+        detail.set(row.jobberInvoiceId, `${label2} (projected: ${ghl.map(h => h.split(":")[0]).join("+")} set aside)`);
+      }
+      else if (prot.length || other.length) {
+        disposition.set(row.jobberInvoiceId, "held_protection");
+        detail.set(row.jobberInvoiceId, `${label2}:${[...prot, ...other].map(h => h.split(":")[0]).join("+")}`);
+      } else {
+        disposition.set(row.jobberInvoiceId, "held_ghl_dependency");
+        detail.set(row.jobberInvoiceId, `${label2}:${ghl.map(h => h.split(":")[0]).join("+")}`);
+      }
     }
   }
 
-  say("---- counts ----");
-  for (const [key, count] of [...tally.entries()].sort((a, b) => b[1] - a[1])) say(`  ${key}: ${count}`);
-  say(`  READY today (all checks incl. exclusion gate): ${ready.length}`);
-  say(`  READY apart from the exclusion gate: ${readyExceptExclusions.length} ${readyExceptExclusions.join(" ")}`);
-  say(`  excluded as rework: ${excludedRework.length} ${excludedRework.join(" ")}`);
-  say(`  excluded, zero or unreadable amount: ${zeroAmount.length} ${zeroAmount.join(" ")}`);
-  say(`  held, notes unverifiable: ${unverifiableNotes.length} ${unverifiableNotes.join(" ")}`);
-  say(`  already past day 15, never replayed: ${pastDay15.length} ${pastDay15.join(" ")}`);
-  say(`  withheld by name (never sendable): ${withheld.length} ${withheld.join(" ")}`);
-  if (holdReasons.size) { say("---- other hold reasons on day-15 invoices ----");
-    for (const [r, c] of [...holdReasons.entries()].sort((a, b) => b[1] - a[1])) say(`  ${r}: ${c}`); }
+  const ORDER: Disposition[] = ["eligible", "held_protection", "held_ghl_dependency",
+    "held_notes_unverifiable", "excluded_warranty_or_no_charge", "withheld_by_name",
+    "zero_or_unreadable_amount", "day15_passed_no_catch_up", "not_yet_day15",
+    "issued_before_programme", "settled_no_longer_owes", "source_unreadable"];
+  say(`---- primary disposition on ${today} (one bucket per invoice) ----`);
+  let sum = 0;
+  for (const bucket of ORDER) {
+    const rows = cached.filter(r => disposition.get(r.jobberInvoiceId) === bucket);
+    sum += rows.length;
+    if (!rows.length) continue;
+    say(`  ${bucket}: ${rows.length}`);
+    if (bucket !== "not_yet_day15" && bucket !== "issued_before_programme" && bucket !== "day15_passed_no_catch_up") {
+      for (const r of rows) say(`      ${detail.get(r.jobberInvoiceId)}`);
+    }
+  }
+  const unset = cached.filter(r => !disposition.get(r.jobberInvoiceId));
+  say(`  TOTAL ${sum} + unclassified ${unset.length} = ${cached.length} (must match)`);
 
-  // Programme-wide notes picture, so the warranty rule's blind spot is visible
-  // even for invoices that are not at day 15 today.
-  const notesTally = new Map<string, number>();
-  for (const value of rework.values()) notesTally.set(value.reason, (notesTally.get(value.reason) ?? 0) + 1);
-  say("---- notes verdicts across the whole programme ----");
-  for (const [r, c] of [...notesTally.entries()].sort((a, b) => b[1] - a[1])) say(`  ${r}: ${c}`);
+  upcoming.sort((a, b) => a.date.localeCompare(b.date));
+  if (upcoming.length) {
+    const first = upcoming[0].date;
+    const sameDay = upcoming.filter(u => u.date === first);
+    say(`---- earliest date with an invoice that clears every Jobber-side rule ----`);
+    say(`  ${first}: ${sameDay.length} invoice(s) ${sameDay.map(u => `${u.label} $${u.amount.toFixed(2)}`).join(" ")}`);
+    const next = [...new Set(upcoming.map(u => u.date))].slice(0, 8);
+    for (const date of next) {
+      const on = upcoming.filter(u => u.date === date);
+      say(`     ${date}  ${on.length} invoice(s) / $${on.reduce((a, u) => a + u.amount, 0).toFixed(2)}  ${on.map(u => u.label).join(" ")}`);
+    }
+  } else {
+    say("---- no invoice clears every Jobber-side rule on any future date ----");
+  }
 
-  say(`sends attempted: ${plan.sendsAttempted} (this script has no send path)`);
-  for (const note of plan.notes) say(`note: ${note}`);
+  say(`programme window: issued on or after ${DAY15_EMAIL_ISSUED_ON_OR_AFTER}`);
+  say("sends attempted: 0 (this script has no send path)");
+  say(`ledger reservations made: 0 (this script cannot reserve)`);
 }
 
 main()

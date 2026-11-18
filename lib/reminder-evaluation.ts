@@ -183,6 +183,27 @@ export async function evaluateReminders(input: {
    * this module does not decide channel policy. Absent, null or empty holds.
    */
   milestoneChannels?(step: { dayPastDue: number; audience: string }): readonly SendChannel[] | null;
+  /**
+   * MIRRORS the send path's `feeClaimFreeDay15` exemption in notification-gate.ts.
+   *
+   * The day-15 milestone requires the fact `three_percent_fee_applied`. The gate
+   * waives exactly that one fact, at day 15, for a homeowner, when the template
+   * claims no fee at all. Copy that states no fee makes no claim to prove. Pass
+   * true only when the copy being evaluated is that fee-free copy; the waiver
+   * applies to no other milestone and no other fact.
+   */
+  feeClaimFreeDay15?: boolean;
+  /**
+   * MIRRORS the ledger. `eventKey` in notification-gate.ts is
+   * (account, invoice, dayPastDue, audience) and carries NO channel, so for a
+   * milestone listed here a confirmed send on ANY channel occupies the single
+   * ledger event and the milestone cannot be sent again on another channel.
+   *
+   * Without this the evaluation is per-channel and disagrees with the send path:
+   * a day-15 SMS that already went out would leave the day-15 email looking
+   * eligible when the ledger would in fact refuse it.
+   */
+  channelBlindMilestones?: readonly number[];
 }): Promise<ReminderEvaluationPlan> {
   const { candidates, readers, now } = input;
   const parts = phoenixParts(now);
@@ -369,11 +390,23 @@ export async function evaluateReminders(input: {
           holds.push(`send_detail_unknown: ${send.messageId} has no ${send.channel === null ? "channel" : "milestone day"}`);
         }
       }
+      const channelBlind = Array.isArray(input.channelBlindMilestones) &&
+        input.channelBlindMilestones.includes(today.dayPastDue);
       const suppressing = new Map<SendChannel, string>();
+      let blockedBy: { messageId: string; channel: SendChannel } | null = null;
       for (const send of relevant) {
         if (send.attribution !== "exact" || !send.confirmed) continue;
         if (send.channel === null || send.milestoneDay !== today.dayPastDue) continue;
         if (!suppressing.has(send.channel)) suppressing.set(send.channel, send.messageId);
+        if (channelBlind && !blockedBy) blockedBy = { messageId: send.messageId, channel: send.channel };
+      }
+      // One ledger event for this milestone: any confirmed channel closes it.
+      if (blockedBy) {
+        for (const channel of channels) {
+          if (!suppressing.has(channel)) suppressing.set(channel, blockedBy.messageId);
+        }
+        holds.push(`milestone_already_sent_on_another_channel: day ${today.dayPastDue} ` +
+          `${blockedBy.channel} as ${blockedBy.messageId} occupies the single ledger event`);
       }
       row.channels = channels.map(channel => suppressing.has(channel)
         ? { channel, decision: "suppressed" as const,
@@ -386,10 +419,14 @@ export async function evaluateReminders(input: {
     }
     // ------------------------------------------------------------------------
 
-    if (today.requiredFacts.length) {
-      // Day 15 and beyond assert a fee or policy. Those need invoice-bound
-      // evidence and approved copy, neither of which this runner has.
-      holds.push(`milestone_requires_unverified_facts: ${today.requiredFacts.join(",")}`);
+    // Day 15 and beyond assert a fee or policy. Those need invoice-bound
+    // evidence and approved copy, neither of which this runner has — except for
+    // the one fact the send path itself waives for fee-free day-15 copy.
+    const waived = input.feeClaimFreeDay15 === true && today.dayPastDue === 15 &&
+      today.audience === "homeowner" ? "three_percent_fee_applied" : null;
+    const unprovenFacts = today.requiredFacts.filter(fact => fact !== waived);
+    if (unprovenFacts.length) {
+      holds.push(`milestone_requires_unverified_facts: ${unprovenFacts.join(",")}`);
     }
     if (!exclusionsVerified) holds.push("exclusions_unverified");
 
