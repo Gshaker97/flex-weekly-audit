@@ -253,3 +253,22 @@ model ServiceTypeRevenue {
   @@unique([year, serviceName])
   @@index([year])
 }
+
+// One row per run of the daily audit (scripts/daily-audit.ts). Read-only
+// checks of the dashboard cache against Jobber and GoHighLevel; the findings
+// are stored as JSON so the /daily-audit page can show them.
+model DailyAuditReport {
+  id           String    @id @default(cuid())
+  runDate      String    // America/Phoenix calendar date, YYYY-MM-DD
+  status       String    @default("running") // running | complete | failed
+  triggeredBy  String    @default("cron")
+  startedAt    DateTime  @default(now())
+  completedAt  DateTime?
+  failCount    Int       @default(0)
+  warnCount    Int       @default(0)
+  checks       Json?
+  errorMessage String?   @db.Text
+
+  @@index([startedAt])
+  @@index([runDate])
+}
