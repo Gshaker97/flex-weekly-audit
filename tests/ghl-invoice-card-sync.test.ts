@@ -117,28 +117,61 @@ test("the invoice is 50 days past due and the new card STILL goes to Sent, never
   assert.deepEqual(cards.filter(c => c.pipelineStageId === "overdue"), []);
 });
 
-test("even with the legacy gate opened, the writer refuses the Overdue move", async () => {
+test("an existing card is NOT moved to Overdue until the switch-off is recorded", async () => {
   setup({ GHL_PER_INVOICE_CARD_WRITES_ENABLED: "true", GHL_LEGACY_INVOICE_WORKFLOW_ID: "legacy-workflow" });
   cards = [structuredClone(perInvoiceCard)];
-  const legacySending = { source: "operator-confirmed-workflow-sending-disabled" as const,
-    workflowId: "legacy-workflow", disabledOn: "2026-11-20", observedAt: new Date().toISOString(),
-    evidenceRef: "synthetic-evidence" };
-  await syncGhlInvoicePipeline({ writer: writerState.writer, legacySending,
-    report: entry => reviews.push(entry), perInvoiceWriteReport: entry => cardReports.push(entry) });
-  // The plan's own gate is open, so it WANTED Overdue. The writer would not.
-  assert.ok(cardReports.some(r => r.reason === "overdue_writes_are_locked_off_in_this_build"));
+  await run();
+  // With no proof the PLAN keeps the card in Sent, so the writer is never even
+  // offered an Overdue target - it corrects the money and leaves the stage. The
+  // writer's own refusal is the second net, exercised in the unit tests.
+  assert.equal(writes.some(w => w.body.pipelineStageId === "overdue"), false);
+  const puts = writes.filter(w => w.method === "PUT");
+  assert.deepEqual(puts.map(p => p.body), [{ pipelineStageId: "sent", monetaryValue: 137.5 }]);
+  assert.equal(cards[0].pipelineStageId, "sent");
+});
+
+test("once the switch-off is recorded, the overdue invoice's card really moves", async () => {
+  setup({ GHL_PER_INVOICE_CARD_WRITES_ENABLED: "true", GHL_LEGACY_INVOICE_WORKFLOW_ID: "legacy-workflow",
+    GHL_LEGACY_SENDING_DISABLED: "2026-11-20|owner switched every GHL automation off" });
+  cards = [{ ...structuredClone(perInvoiceCard), monetaryValue: 137.5 }];
+  await run();
+  const puts = writes.filter(w => w.method === "PUT" && w.id === perInvoiceCard.id);
+  assert.equal(puts.length, 1);
+  assert.deepEqual(puts[0].body, { pipelineStageId: "overdue", monetaryValue: 137.5 });
+  assert.equal(puts[0].body.name, undefined, "a card is never renamed");
+});
+
+test("proof about a different workflow does not open this one", async () => {
+  setup({ GHL_PER_INVOICE_CARD_WRITES_ENABLED: "true", GHL_LEGACY_INVOICE_WORKFLOW_ID: "legacy-workflow",
+    GHL_LEGACY_SENDING_DISABLED: "2026-11-20|" });
+  cards = [structuredClone(perInvoiceCard)];
+  await run();
   assert.equal(writes.some(w => w.body.pipelineStageId === "overdue"), false);
 });
 
-test("a paid invoice's card is moved to Paid with a zero balance", async () => {
+test("a settled invoice is ignored entirely for now: no card, no move", async () => {
   setup({ GHL_PER_INVOICE_CARD_WRITES_ENABLED: "true" });
   cards = [{ ...structuredClone(perInvoiceCard), monetaryValue: 137.5 }];
   source = [{ ...overdueSource, invoiceStatus: "paid", amounts: { total: 300, invoiceBalance: 0 } }];
   await run();
+  assert.deepEqual(writes, [], "nothing at all happens to a paid invoice's card");
+  assert.ok(cardReports.some(r => r.reason === "paid_invoices_are_out_of_scope_for_now"));
+});
+
+test("paid handling can be switched on later without touching the code", async () => {
+  setup({ GHL_PER_INVOICE_CARD_WRITES_ENABLED: "true", GHL_PER_INVOICE_PAID_EXITS_ENABLED: "true" });
+  cards = [{ ...structuredClone(perInvoiceCard), monetaryValue: 137.5 }];
+  source = [{ ...overdueSource, invoiceStatus: "paid", amounts: { total: 300, invoiceBalance: 0 } }];
+  await run();
   const puts = writes.filter(w => w.method === "PUT" && w.id === perInvoiceCard.id);
-  assert.equal(puts.length, 1);
-  assert.deepEqual(puts[0].body, { pipelineStageId: "paid", monetaryValue: 0 });
-  assert.equal(puts[0].body.name, undefined, "a card is never renamed");
+  assert.deepEqual(puts.map(p => p.body), [{ pipelineStageId: "paid", monetaryValue: 0 }]);
+});
+
+test("a paid invoice with no card still never gets one", async () => {
+  setup({ GHL_PER_INVOICE_CARD_WRITES_ENABLED: "true", GHL_PER_INVOICE_PAID_EXITS_ENABLED: "true" });
+  source = [{ ...overdueSource, invoiceStatus: "paid", amounts: { total: 300, invoiceBalance: 0 } }];
+  await run();
+  assert.deepEqual(writes.filter(w => w.method === "POST"), []);
 });
 
 test("the per-customer aggregate leaves per-invoice cards alone once the writer owns them", async () => {

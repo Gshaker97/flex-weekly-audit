@@ -45,7 +45,7 @@ import { planCardCreation, describeCardCreation, CARD_CREATION_STAGE } from "./g
 import { invoiceNumbersInCardName, planInvoiceCards, PROTECTED_STAGES,
   type InvoiceCardPlan, type LegacySendingEvidence } from "./ghl-invoice-card-plan";
 import { applyInvoiceCardPlan, claimedInvoiceIdsFromHistory, invoiceCardWriteGate,
-  type InvoiceCardWriteReport } from "./ghl-invoice-card-writer";
+  legacySendingFromEnv, type InvoiceCardWriteReport } from "./ghl-invoice-card-writer";
 import { invoiceReminderClock } from "./invoice-reminder-clock";
 
 // Backfill scope: when set to a Date, invoices are pulled in full but limited to
@@ -838,7 +838,7 @@ export async function syncGhlInvoicePipeline(opts: {
           monetaryValue: card.monetaryValue ?? null,
         }));
         const plan = planInvoiceCards({
-            contactId, now, clocks, legacySending: opts.legacySending ?? null,
+            contactId, now, clocks, legacySending: opts.legacySending ?? legacySendingFromEnv(),
             legacyWorkflowId: process.env.GHL_LEGACY_INVOICE_WORKFLOW_ID ?? "",
             label: ownInvoices[0]?.clientName ?? customer.companyName ?? customer.name ?? customer.jobberClientId,
             invoices: mine.map(inv => ({

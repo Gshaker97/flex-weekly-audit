@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import { writerFixture } from "./helpers/sync-writer-fixture";
 import {
   applyInvoiceCardPlan, claimedInvoiceIdsFromHistory, decideInvoiceCardWrite, invoiceCardWriteGate,
-  DEFAULT_WRITE_BUDGET, MAX_WRITE_BUDGET, OVERDUE_WRITES_LOCKED,
-  type InvoiceCardWriteIo, type InvoiceCardWriteReport, type StageIds,
+  DEFAULT_WRITE_BUDGET, MAX_WRITE_BUDGET, legacySendingFromEnv,
+  type InvoiceCardWriteIo, type InvoiceCardWriteReport, type StageIds, type WriteAllowances,
 } from "../lib/ghl-invoice-card-writer";
 import { cardNameHash, creationPlaceholderId, invoiceSourceFingerprint,
   type CycleJournalEntry, type GhlWriteIntent } from "../lib/sync-writer-control";
@@ -39,35 +39,71 @@ const plan = (...actions: InvoiceCardAction[]): InvoiceCardPlan => ({
     hold: 0, skip: 0, untouched: 0 },
 });
 
-// --- the lock -------------------------------------------------------------
+const ALLOW_OVERDUE: WriteAllowances = { overdueMoves: true, paidExits: false };
+const ALLOW_PAID: WriteAllowances = { overdueMoves: false, paidExits: true };
 
-test("Overdue is not a configuration; it is a constant", () => {
-  assert.equal(OVERDUE_WRITES_LOCKED, true);
+// --- the two gates --------------------------------------------------------
+
+test("by default, asking for nothing extra means Overdue and Paid are both refused", () => {
+  const od = decideInvoiceCardWrite(adopt({ stage: "Invoice Overdue", desiredStage: "Invoice Overdue", changes: ["stage"] }), STAGES);
+  assert.equal(od.state === "refuse" && od.reason, "overdue_move_needs_recorded_proof_the_legacy_workflow_is_off");
+  const paid = decideInvoiceCardWrite(adopt({ stage: "Invoice Paid", monetaryValue: 0, changes: ["stage"] }), STAGES);
+  assert.equal(paid.state === "refuse" && paid.reason, "paid_invoices_are_out_of_scope_for_now");
 });
 
-test("an Overdue target is refused outright, whatever the plan decided", () => {
-  // The plan only emits stage "Invoice Overdue" once its own legacy-sending
-  // gate is open. This writer refuses it anyway: two independent locks.
-  for (const action of [adopt({ stage: "Invoice Overdue", desiredStage: "Invoice Overdue", changes: ["stage"] }),
-                        { ...create(), stage: "Invoice Overdue" } as any]) {
-    const decision = decideInvoiceCardWrite(action, STAGES);
-    assert.equal(decision.state, "refuse");
-    assert.equal(decision.state === "refuse" && decision.reason, "overdue_writes_are_locked_off_in_this_build");
-  }
+test("an Overdue move is allowed only once the legacy workflow is recorded as off", () => {
+  const action = adopt({ stage: "Invoice Overdue", desiredStage: "Invoice Overdue", changes: ["stage"] });
+  const allowed = decideInvoiceCardWrite(action, STAGES, ALLOW_OVERDUE);
+  assert.equal(allowed.state === "write" && allowed.role, "overdue");
+  assert.equal(allowed.state === "write" && allowed.stageId, STAGES.overdue);
+  // And permission for Paid does not quietly carry over to Overdue.
+  assert.equal(decideInvoiceCardWrite(action, STAGES, ALLOW_PAID).state, "refuse");
+});
+
+test("a new card is created in Sent even when Overdue moves are allowed", () => {
+  // The plan never creates straight into Overdue, and the writer would not
+  // either: a new card gets one run in Sent first.
+  const decision = decideInvoiceCardWrite(create({ desiredStage: "Invoice Overdue" }), STAGES, ALLOW_OVERDUE);
+  assert.equal(decision.state === "write" && decision.stageId, STAGES.sent);
 });
 
 test("a stage this writer does not know is refused, not guessed", () => {
-  const decision = decideInvoiceCardWrite(adopt({ stage: "Late Fee Invoice Sent", changes: ["stage"] }), STAGES);
+  const decision = decideInvoiceCardWrite(adopt({ stage: "Late Fee Invoice Sent", changes: ["stage"] }), STAGES, ALLOW_OVERDUE);
   assert.equal(decision.state === "refuse" && decision.reason, "target_stage_is_not_writable");
 });
 
-test("a pipeline whose Sent and Overdue ids are the same is refused", () => {
+test("a pipeline whose stage ids are not distinct is refused outright", () => {
   const decision = decideInvoiceCardWrite(adopt(), { ...STAGES, sent: STAGES.overdue });
-  assert.equal(decision.state === "refuse" && decision.reason, "stage_id_unresolved_or_is_the_overdue_stage");
+  assert.equal(decision.state === "refuse" && decision.reason, "pipeline_stage_ids_are_not_distinct");
 });
 
 test("an unresolved stage id is refused", () => {
   assert.equal(decideInvoiceCardWrite(adopt(), { ...STAGES, sent: "" }).state, "refuse");
+});
+
+// --- the recorded evidence ------------------------------------------------
+
+test("with nothing recorded, there is no proof the legacy workflow is off", () => {
+  assert.equal(legacySendingFromEnv({}), null);
+  assert.equal(legacySendingFromEnv({ GHL_LEGACY_INVOICE_WORKFLOW_ID: "w" }), null);
+  assert.equal(legacySendingFromEnv({ GHL_LEGACY_SENDING_DISABLED: "2026-11-21|checked" }), null);
+});
+
+test("recorded proof names the workflow and the day it was switched off", () => {
+  const evidence = legacySendingFromEnv({ GHL_LEGACY_INVOICE_WORKFLOW_ID: "w",
+    GHL_LEGACY_SENDING_DISABLED: "2026-11-20|owner turned every GHL automation off" });
+  assert.equal(evidence?.workflowId, "w");
+  assert.equal(evidence?.disabledOn, "2026-11-20");
+  assert.equal(evidence?.evidenceRef, "owner turned every GHL automation off");
+  assert.equal(evidence?.source, "operator-confirmed-workflow-sending-disabled");
+});
+
+test("a date that is not a real past day, or a claim with no reason, is not proof", () => {
+  for (const raw of ["2026-11-20", "|checked", "2026-13-01|checked", "2026-02-30|checked",
+                     "2099-01-01|checked", "yesterday|checked", "2026-11-20|", "  |  "]) {
+    assert.equal(legacySendingFromEnv({ GHL_LEGACY_INVOICE_WORKFLOW_ID: "w",
+      GHL_LEGACY_SENDING_DISABLED: raw }), null, raw);
+  }
 });
 
 // --- the decision ---------------------------------------------------------
@@ -78,10 +114,10 @@ test("a Sent adopt is a write that carries the invoice's balance", () => {
     stageId: STAGES.sent, monetaryValue: 137.5, invoiceId: INVOICE, invoiceNumber: NUMBER });
 });
 
-test("a Paid adopt must carry nothing at all", () => {
-  const ok = decideInvoiceCardWrite(adopt({ stage: "Invoice Paid", monetaryValue: 0, changes: ["stage"] }), STAGES);
+test("a Paid adopt, once allowed, must carry nothing at all", () => {
+  const ok = decideInvoiceCardWrite(adopt({ stage: "Invoice Paid", monetaryValue: 0, changes: ["stage"] }), STAGES, ALLOW_PAID);
   assert.equal(ok.state === "write" && ok.role, "paid");
-  const bad = decideInvoiceCardWrite(adopt({ stage: "Invoice Paid", monetaryValue: 12.5, changes: ["stage"] }), STAGES);
+  const bad = decideInvoiceCardWrite(adopt({ stage: "Invoice Paid", monetaryValue: 12.5, changes: ["stage"] }), STAGES, ALLOW_PAID);
   assert.equal(bad.state === "refuse" && bad.reason, "paid_card_must_carry_a_zero_balance");
 });
 
@@ -127,10 +163,19 @@ test("the gate needs an approval token and a location", () => {
   assert.equal(invoiceCardWriteGate({ ...baseEnv, GHL_LOCATION_ID: "  " }).open, false);
 });
 
-test("a fully configured gate opens with a bounded budget", () => {
-  assert.deepEqual(invoiceCardWriteGate(baseEnv),
-    { open: true, approvalId: "reviewed-plan-1", budget: DEFAULT_WRITE_BUDGET, paidExits: true });
-  assert.equal(invoiceCardWriteGate({ ...baseEnv, GHL_PER_INVOICE_CARD_WRITE_BUDGET: "10" }).open && true, true);
+test("a fully configured gate opens with a bounded budget and no extra allowances", () => {
+  assert.deepEqual(invoiceCardWriteGate(baseEnv), { open: true, approvalId: "reviewed-plan-1",
+    budget: DEFAULT_WRITE_BUDGET, allow: { overdueMoves: false, paidExits: false } });
+});
+
+test("the gate turns Overdue on only from recorded proof about the SAME workflow", () => {
+  const on = invoiceCardWriteGate({ ...baseEnv, GHL_LEGACY_INVOICE_WORKFLOW_ID: "legacy-w",
+    GHL_LEGACY_SENDING_DISABLED: "2026-11-20|owner switched them off" });
+  assert.equal(on.open && on.allow.overdueMoves, true);
+  // Proof naming a different workflow proves nothing about this one.
+  const mismatched = invoiceCardWriteGate({ ...baseEnv, GHL_LEGACY_INVOICE_WORKFLOW_ID: "legacy-w",
+    GHL_LEGACY_SENDING_DISABLED: "2026-11-20|" });
+  assert.equal(mismatched.open && mismatched.allow.overdueMoves, false);
 });
 
 test("a budget that does not parse closes the gate; it never falls back to the default", () => {
@@ -139,9 +184,13 @@ test("a budget that does not parse closes the gate; it never falls back to the d
   }
 });
 
-test("Paid exits can be turned off without a deploy", () => {
-  const gate = invoiceCardWriteGate({ ...baseEnv, GHL_PER_INVOICE_PAID_EXITS_ENABLED: "false" });
-  assert.equal(gate.open && gate.paidExits, false);
+test("Paid exits are off until explicitly asked for, and never by accident", () => {
+  for (const raw of [undefined, "", "false", "1", "yes", "TRUE"]) {
+    const gate = invoiceCardWriteGate({ ...baseEnv, ...(raw === undefined ? {} : { GHL_PER_INVOICE_PAID_EXITS_ENABLED: raw }) });
+    assert.equal(gate.open && gate.allow.paidExits, false, String(raw));
+  }
+  const on = invoiceCardWriteGate({ ...baseEnv, GHL_PER_INVOICE_PAID_EXITS_ENABLED: "true" });
+  assert.equal(on.open && on.allow.paidExits, true);
 });
 
 // --- history --------------------------------------------------------------
@@ -225,7 +274,8 @@ async function run(p: InvoiceCardPlan, h: Harness, over: Record<string, any> = {
     [c.id, { id: c.id, name: c.name ?? null, status: c.status ?? null, stageName: null, monetaryValue: c.monetaryValue ?? null }] as const));
   const result = await applyInvoiceCardPlan({
     plan: p, contactId: CONTACT, jobberClientId: CLIENT, pipelineId: PIPELINE, locationId: LOCATION,
-    stageIds: STAGES, gate: { open: true, approvalId: "reviewed-plan-1", budget: 60, paidExits: true, ...(over.gate ?? {}) },
+    stageIds: STAGES, gate: { open: true, approvalId: "reviewed-plan-1", budget: 60,
+      allow: { overdueMoves: false, paidExits: true, ...(over.allow ?? {}) }, ...(over.gate ?? {}) },
     source: over.source ?? [invoice()], observedAt: "2026-11-20T09:00:00.000Z",
     preflight, spend: over.spend ?? { remaining: 60 }, claimedInvoiceIds: over.claimedInvoiceIds ?? new Set<string>(),
     writer: over.writer ?? writer, report: entry => reports.push(entry), io: h.io,
@@ -315,12 +365,22 @@ test("a Paid exit writes a zero balance", async () => {
   assert.deepEqual(h.puts, [{ id: "card-1", stageId: STAGES.paid, monetaryValue: 0, name: undefined }]);
 });
 
-test("a Paid exit is held when Paid exits are configured off", async () => {
+test("a Paid exit is held while settled invoices are out of scope", async () => {
   const h = harness([openCard({ monetaryValue: 137.5 })]);
   const { reports } = await run(plan(adopt({ stage: "Invoice Paid", monetaryValue: 0, changes: ["stage"] })), h,
-    { gate: { paidExits: false } });
+    { allow: { paidExits: false } });
   assert.deepEqual(h.puts, []);
-  assert.equal(reports[0].reason, "paid_exits_disabled_by_configuration");
+  assert.equal(reports[0].reason, "paid_invoices_are_out_of_scope_for_now");
+});
+
+test("an Overdue move, once allowed, really is written", async () => {
+  const h = harness([openCard({ pipelineStageId: STAGES.sent, monetaryValue: 137.5 })]);
+  const { result, reports } = await run(
+    plan(adopt({ stage: "Invoice Overdue", desiredStage: "Invoice Overdue", changes: ["stage"] })), h,
+    { allow: { overdueMoves: true } });
+  assert.equal(result.applied, 1);
+  assert.deepEqual(h.puts, [{ id: "card-1", stageId: STAGES.overdue, monetaryValue: 137.5, name: undefined }]);
+  assert.match(reports[0].reason, /recorded proof the legacy workflow cannot send/);
 });
 
 test("an adopt is held when the card drifted since the plan was made", async () => {
@@ -431,13 +491,13 @@ test("the run's write budget bounds how much one run can change", async () => {
   assert.equal(h.puts.length, 1);
 });
 
-test("an Overdue action inside a real plan is held and nothing is sent", async () => {
+test("an Overdue action with no recorded proof is held before anything is even read", async () => {
   const h = harness([openCard({ pipelineStageId: STAGES.sent, monetaryValue: 99 })]);
   const { result, reports } = await run(plan(adopt({ stage: "Invoice Overdue", desiredStage: "Invoice Overdue", changes: ["stage"] })), h);
   assert.equal(result.applied, 0);
   assert.deepEqual(h.puts, []);
   assert.deepEqual(h.reads, []);
-  assert.equal(reports[0].reason, "overdue_writes_are_locked_off_in_this_build");
+  assert.equal(reports[0].reason, "overdue_move_needs_recorded_proof_the_legacy_workflow_is_off");
 });
 
 // --- the durable journal refuses a malformed creation claim ---------------

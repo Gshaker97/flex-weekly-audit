@@ -12,16 +12,15 @@
  *   - correct a card's amount to the invoice's real outstanding balance
  *
  * WHAT IT CANNOT DO, AND WHY
- *   - It cannot move a card into "Invoice Overdue". Not "will not unless" -
- *     cannot. `OVERDUE_WRITES_LOCKED` is a constant, there is no environment
- *     variable for it, and `decideInvoiceCardWrite` refuses an Overdue target
- *     even when the plan's own legacy-sending gate has been opened with valid
- *     evidence. Two independent locks, because the consequence of getting this
- *     wrong is a real text message to a real customer about a months-old
- *     invoice, and a text cannot be unsent. The legacy "Fixed Automation"
- *     workflow triggers on a pipeline-stage change (`exactOpportunityTrigger`),
- *     so the Overdue move IS the send. Removing this lock is a code change, made
- *     deliberately, after that workflow's sending is off.
+ *   - It cannot move a card into "Invoice Overdue" until someone has written
+ *     down that the legacy workflow's sending is off. The legacy "Fixed
+ *     Automation" workflow triggers on a pipeline-stage change
+ *     (`exactOpportunityTrigger`), so while it is live the Overdue move IS the
+ *     send - to real customers, about invoices that are months old, and a text
+ *     cannot be unsent. `legacySendingFromEnv` is the only way to say otherwise,
+ *     it names the workflow and the day it was switched off, and with nothing
+ *     set the answer is no. The owner is turning those automations off first and
+ *     this is what lets that decision be recorded rather than assumed.
  *   - It cannot rename a card. An `adopt` action carries no name, the PUT omits
  *     the name field, and the durable record has `updateName: false`. A card
  *     named `Invoice #7226` IS invoice 7226's card; its name is the only link
@@ -56,15 +55,13 @@ import { buildGhlWriteIntent, buildInvoiceSourceEvidence } from "./ghl-write-int
 import { moneyCents, type PhoneInvoiceEvidence } from "./ghl-phone-state";
 import { cardNameHash, creationPlaceholderId, invoiceSourceFingerprint,
   type CycleJournalEntry, type GhlWriteIntent, type SyncRunWriter } from "./sync-writer-control";
-import { invoiceNumbersInCardName, STAGE_PAID, STAGE_SENT, type ExistingCard,
-  type InvoiceCardAction, type InvoiceCardPlan } from "./ghl-invoice-card-plan";
+import { invoiceNumbersInCardName, legacySendingIsOff, STAGE_OVERDUE, STAGE_PAID, STAGE_SENT,
+  type ExistingCard, type InvoiceCardAction, type InvoiceCardPlan,
+  type LegacySendingEvidence } from "./ghl-invoice-card-plan";
 
-/**
- * Not configurable, on purpose. See the module header: the only way to allow an
- * Overdue write is to edit this file, which is a decision with a commit behind
- * it rather than a variable someone sets at 6pm.
- */
-export const OVERDUE_WRITES_LOCKED = true as const;
+/** What a caller may do beyond the safe default. Every field defaults to NO. */
+export type WriteAllowances = Readonly<{ overdueMoves: boolean; paidExits: boolean }>;
+const NOTHING_EXTRA: WriteAllowances = Object.freeze({ overdueMoves: false, paidExits: false });
 
 /** A sane ceiling on how much one run may change, whatever the environment says. */
 export const MAX_WRITE_BUDGET = 120;
@@ -84,7 +81,7 @@ export function claimedInvoiceIdsFromHistory(history: readonly CycleJournalEntry
 }
 
 export type WriteDecision =
-  | Readonly<{ state: "write"; kind: "adopt"; role: "sent" | "paid"; cardId: string;
+  | Readonly<{ state: "write"; kind: "adopt"; role: "sent" | "overdue" | "paid"; cardId: string;
       stageId: string; monetaryValue: number; invoiceId: string; invoiceNumber: string }>
   | Readonly<{ state: "write"; kind: "create"; role: "sent"; stageId: string; name: string;
       monetaryValue: number; invoiceId: string; invoiceNumber: string }>
@@ -95,25 +92,37 @@ export type WriteDecision =
  * Whether one planned action is something this writer may carry out, and if so
  * exactly what it will send. Pure: no environment, no clock, no I/O.
  */
-export function decideInvoiceCardWrite(action: InvoiceCardAction, stageIds: StageIds): WriteDecision {
+export function decideInvoiceCardWrite(
+  action: InvoiceCardAction, stageIds: StageIds, allow: WriteAllowances = NOTHING_EXTRA
+): WriteDecision {
   if (!action || (action.state !== "adopt" && action.state !== "create")) {
     return Object.freeze({ state: "nothing", reason: "action_is_not_a_write" });
   }
   const amount = moneyCents(action.monetaryValue);
   if (amount === null) return Object.freeze({ state: "refuse", reason: "monetary_value_unusable" });
 
-  // The lock. Checked against the stage this plan would ACTUALLY write, and
-  // again below against the resolved stage id, so neither a renamed stage nor a
-  // reordered pipeline can smuggle an Overdue write through.
-  if (action.stage !== STAGE_SENT && action.stage !== STAGE_PAID) {
-    return Object.freeze({ state: "refuse",
-      reason: OVERDUE_WRITES_LOCKED && action.stage === "Invoice Overdue"
-        ? "overdue_writes_are_locked_off_in_this_build" : "target_stage_is_not_writable" });
+  // The gates, checked against the stage this plan would ACTUALLY write.
+  if (action.stage !== STAGE_SENT && action.stage !== STAGE_PAID && action.stage !== STAGE_OVERDUE) {
+    return Object.freeze({ state: "refuse", reason: "target_stage_is_not_writable" });
   }
-  const role = action.stage === STAGE_PAID ? "paid" as const : "sent" as const;
-  const stageId = role === "paid" ? stageIds.paid : stageIds.sent;
-  if (!stageId || stageId === stageIds.overdue) {
-    return Object.freeze({ state: "refuse", reason: "stage_id_unresolved_or_is_the_overdue_stage" });
+  if (action.stage === STAGE_OVERDUE && !allow.overdueMoves) {
+    return Object.freeze({ state: "refuse", reason: "overdue_move_needs_recorded_proof_the_legacy_workflow_is_off" });
+  }
+  // Phase one ignores settled invoices entirely, by the owner's instruction on
+  // 2026-11-20: get the picture of what is OWED right first.
+  if (action.stage === STAGE_PAID && !allow.paidExits) {
+    return Object.freeze({ state: "refuse", reason: "paid_invoices_are_out_of_scope_for_now" });
+  }
+  const role = action.stage === STAGE_PAID ? "paid" as const
+    : action.stage === STAGE_OVERDUE ? "overdue" as const : "sent" as const;
+  const stageId = role === "paid" ? stageIds.paid : role === "overdue" ? stageIds.overdue : stageIds.sent;
+  if (!stageId) return Object.freeze({ state: "refuse", reason: "stage_id_unresolved" });
+  // A pipeline whose stages share an id cannot be reasoned about at all.
+  if (new Set([stageIds.sent, stageIds.overdue, stageIds.paid]).size !== 3) {
+    return Object.freeze({ state: "refuse", reason: "pipeline_stage_ids_are_not_distinct" });
+  }
+  if (role !== "overdue" && stageId === stageIds.overdue) {
+    return Object.freeze({ state: "refuse", reason: "resolved_stage_is_unexpectedly_the_overdue_stage" });
   }
   // A Paid card carries nothing. This is a guard, not a formality: it is half
   // the reason a Paid write cannot reach the legacy ladder's first branch.
@@ -135,8 +144,36 @@ export function decideInvoiceCardWrite(action: InvoiceCardAction, stageIds: Stag
 }
 
 export type InvoiceCardWriteGate =
-  | Readonly<{ open: true; approvalId: string; budget: number; paidExits: boolean }>
+  | Readonly<{ open: true; approvalId: string; budget: number; allow: WriteAllowances }>
   | Readonly<{ open: false; reason: string }>;
+
+/**
+ * The owner's recorded statement that the legacy workflow can no longer send,
+ * read from the environment rather than hardcoded, so it carries WHICH workflow
+ * and WHEN - and so withdrawing it is one variable, not a deploy.
+ *
+ *   GHL_LEGACY_INVOICE_WORKFLOW_ID  the workflow that was switched off
+ *   GHL_LEGACY_SENDING_DISABLED     "YYYY-MM-DD|how we know"
+ *
+ * Returns null unless both are present and well formed, and null means no
+ * Overdue move happens. There is no default, no inference from an empty value,
+ * and no "it was probably off" - the whole point is that somebody looked.
+ */
+export function legacySendingFromEnv(env: Record<string, string | undefined> = process.env): LegacySendingEvidence | null {
+  const workflowId = env.GHL_LEGACY_INVOICE_WORKFLOW_ID?.trim();
+  const raw = env.GHL_LEGACY_SENDING_DISABLED?.trim();
+  if (!workflowId || !raw) return null;
+  const [disabledOn, ...rest] = raw.split("|");
+  const evidenceRef = rest.join("|").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(disabledOn?.trim() ?? "") || !evidenceRef) return null;
+  const day = disabledOn.trim();
+  // A date that is not a real day, or is in the future, is a mistake not a fact.
+  const parsed = new Date(`${day}T00:00:00Z`);
+  if (!Number.isFinite(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== day) return null;
+  if (parsed.getTime() > Date.now()) return null;
+  return Object.freeze({ source: "operator-confirmed-workflow-sending-disabled",
+    workflowId, disabledOn: day, observedAt: new Date().toISOString(), evidenceRef });
+}
 
 /**
  * May this process write cards at all? A separate switch from
@@ -157,8 +194,13 @@ export function invoiceCardWriteGate(env: Record<string, string | undefined> = p
     budget = Number(raw);
     if (budget < 1 || budget > MAX_WRITE_BUDGET) return Object.freeze({ open: false, reason: "write_budget_out_of_range" });
   }
-  return Object.freeze({ open: true, approvalId, budget,
-    paidExits: env.GHL_PER_INVOICE_PAID_EXITS_ENABLED !== "false" });
+  // Both allowances are OFF unless something explicitly says otherwise. Paid is
+  // opt-in because phase one deliberately ignores settled invoices; Overdue is
+  // opt-in because it is the stage change the legacy workflow sends on.
+  return Object.freeze({ open: true, approvalId, budget, allow: Object.freeze({
+    overdueMoves: legacySendingIsOff(legacySendingFromEnv(env), env.GHL_LEGACY_INVOICE_WORKFLOW_ID?.trim() ?? ""),
+    paidExits: env.GHL_PER_INVOICE_PAID_EXITS_ENABLED === "true",
+  }) });
 }
 
 export interface InvoiceCardWriteReport {
@@ -226,13 +268,12 @@ export async function applyInvoiceCardPlan(input: ApplyInvoiceCardPlanInput): Pr
   for (const action of input.plan.actions) {
     if (action.state !== "adopt" && action.state !== "create") continue;
     const kind = action.state;
-    const decision = decideInvoiceCardWrite(action, stageIds);
+    const decision = decideInvoiceCardWrite(action, stageIds, input.gate.allow);
     const base = { invoiceId: action.invoiceId, invoiceNumber: action.invoiceNumber,
       cardId: action.state === "adopt" ? action.cardId : null, kind } as const;
 
     if (decision.state === "nothing") { input.report({ ...base, action: "unchanged", reason: decision.reason }); continue; }
     if (decision.state === "refuse") { hold(base, decision.reason); continue; }
-    if (decision.role === "paid" && !input.gate.paidExits) { hold(base, "paid_exits_disabled_by_configuration"); continue; }
     if (input.spend.remaining <= 0) { hold(base, "run_write_budget_exhausted"); continue; }
 
     try {
@@ -329,7 +370,8 @@ async function adoptCard(
   }
   return { state: "applied", cardId: decision.cardId, to, claimed: true,
     reason: decision.role === "paid" ? "Moved to Paid against verified Jobber settlement; card carries a zero balance"
-      : "Stage and amount corrected from verified Jobber source; Overdue remains locked off" };
+      : decision.role === "overdue" ? "Moved to Overdue against verified Jobber source, with recorded proof the legacy workflow cannot send"
+      : "Stage and amount corrected from verified Jobber source" };
 }
 
 /** Create the card an invoice has never had. Always "Invoice Sent". */
