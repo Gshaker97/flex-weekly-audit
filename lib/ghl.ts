@@ -385,6 +385,28 @@ export async function listPipelineOpportunities(
   throw new Error("GHL pipeline snapshot exceeded page limit");
 }
 
+// Every card a contact has in this pipeline, in EVERY status, verified
+// complete against meta.total. Used immediately before creating a card: a
+// closed duplicate still proves a card exists, and `searchOpportunities` above
+// does not ask for closed statuses, so it cannot answer that question.
+export async function listContactOpportunities(contactId: string, pipelineId: string): Promise<GhlOpportunity[]> {
+  const params = new URLSearchParams({ location_id: ghlLocationId(), pipeline_id: pipelineId,
+    contact_id: contactId, status: "all", limit: "100" });
+  const data: any = await ghlFetch(`/opportunities/search?${params}`);
+  const total = data.meta?.total;
+  if (!Array.isArray(data.opportunities) || !Number.isSafeInteger(total) || total < 0
+      || total !== data.opportunities.length) throw new Error("Incomplete GHL contact card snapshot");
+  const out = new Map<string, GhlOpportunity>();
+  for (const card of data.opportunities) {
+    if (typeof card?.id !== "string" || !card.id || out.has(card.id)
+        || card.pipelineId !== pipelineId || card.contactId !== contactId) {
+      throw new Error("Duplicate or misrouted GHL contact card");
+    }
+    out.set(card.id, card);
+  }
+  return [...out.values()];
+}
+
 // Phone path never selects a first card or invokes duplicate-create recovery.
 // Pinned GET search docs define meta.total and the snake_case filters. Search
 // every status so a hidden closed duplicate cannot establish false uniqueness.

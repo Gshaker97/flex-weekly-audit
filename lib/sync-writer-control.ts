@@ -73,9 +73,55 @@ export type WorkflowRemovalIntent = {
   apiVersion: "v3";
 };
 export type WorkflowRemovalAcknowledgment = { version: 1; httpStatus: 200; succeeded: true; observedAt: string };
+/**
+ * A card that does not exist yet, claimed BEFORE the POST that creates it.
+ *
+ * An update can name the card it is about; a creation cannot, so without a
+ * durable claim a POST that times out is invisible: the next run cannot tell
+ * "never created" from "created, then we lost the answer", and the difference
+ * is a duplicate card on a customer's board. The claim names the INVOICE
+ * instead, which exists before the card does and never changes.
+ *
+ * `stageRole: "sent"` is a literal, not a stage id, and that is the point: no
+ * durable record of a creation can ever authorize one into any other stage, so
+ * a card can never be created straight into "Invoice Overdue" - the transition
+ * the legacy Fixed Automation workflow triggers on. A wrong id would be caught
+ * by review; a wrong ROLE cannot be written down at all.
+ */
+export type InvoiceCardCreationClaim = {
+  version: 1;
+  stageRole: "sent";
+  locationId: string;
+  pipelineId: string;
+  stageId: string;
+  contactId: string;
+  jobberClientId: string;
+  invoiceId: string;
+  invoiceNumber: string;
+  /** sha256 of the exact name to be POSTed, so the name is evidence too. */
+  nameHash: string;
+  amountCents: number;
+  /** The invoice's own facts, hashed; an edited invoice cannot reuse this claim. */
+  sourceFingerprint: string;
+};
+
+/**
+ * The `opportunityId` a creation intent carries. Deliberately not id-shaped and
+ * deliberately derived from the invoice: it reads as what it is, it cannot
+ * collide with a GoHighLevel id, and it is the same string on a retry, which is
+ * what makes a duplicate claim detectable.
+ */
+export const creationPlaceholderId = (invoiceId: string) => `pending-creation:${invoiceId}`;
+
+/** The invoice facts a creation claim is bound to. Computed, never trusted. */
+export const invoiceSourceFingerprint = (i: { id: string; invoiceStatus: string; totalCents: number;
+  balanceCents: number; issuedDate: string | null; dueDate: string | null }) =>
+  hash(JSON.stringify([1, i.id, i.invoiceStatus, i.totalCents, i.balanceCents, i.issuedDate, i.dueDate]));
+
 export type BootstrapJournalClaim = { claim: BootstrapClaim; claimSha256: string;
   phase: "claim" | BootstrapPhase; claimId?: string };
 export interface GhlWriteIntent {
+  creation?: InvoiceCardCreationClaim;
   bootstrap?: BootstrapJournalClaim;
   workflowRemoval?: WorkflowRemovalIntent;
   cycle?: InvoiceCycleClaim;
@@ -135,6 +181,29 @@ function validateIntent(v: GhlWriteIntent): void {
     ids.add(i.id);
   }
   if (new Set(v.source.storedInvoiceIds).size !== v.source.storedInvoiceIds.length || v.source.storedInvoiceIds.some(id => !ids.has(id))) throw new SyncWriterBlockedError();
+  if (v.creation) {
+    // A creation adds a card; it never carries an enrollment, a workflow
+    // removal or a date repair, and every field of the claim must agree with
+    // the intent it travels in. `expected` describes nothing - no stage move,
+    // no money, no name - because there is nothing there yet.
+    const c = v.creation, i = v.source.invoices.find(i => i.id === c?.invoiceId);
+    if (c.version !== 1 || c.stageRole !== "sent"
+        || ![c.locationId, c.pipelineId, c.stageId, c.contactId, c.jobberClientId, c.invoiceId, c.invoiceNumber].every(identity)
+        || !digest(c.nameHash) || !digest(c.sourceFingerprint) || !minor(c.amountCents) || c.amountCents <= 0
+        || c.pipelineId !== v.pipelineId || c.contactId !== v.contactId || c.jobberClientId !== v.jobberClientId
+        || !identity(v.approvalId)
+        || v.opportunityId !== creationPlaceholderId(c.invoiceId)
+        || v.cycle || v.bootstrap || v.workflowRemoval || v.dateField
+        // The invoice must be in the verified source snapshot, must still be
+        // unpaid, and must still owe exactly what the claim says it owes.
+        || !i || v.source.storedInvoiceIds.length !== 1 || v.source.storedInvoiceIds[0] !== c.invoiceId
+        || i.invoiceStatus === "paid" || i.balanceCents <= 0 || i.balanceCents !== c.amountCents
+        || invoiceSourceFingerprint(i) !== c.sourceFingerprint
+        // Nothing existed before: no stage to leave, no money, no name.
+        || v.expected.amountCents !== 0 || v.expected.nameHash !== cardNameHash(null) || v.expected.stageId !== c.stageId
+        || v.target.stageId !== c.stageId || v.target.amountCents !== c.amountCents
+        || v.target.nameHash !== c.nameHash || !v.target.updateName) throw new SyncWriterBlockedError();
+  }
   if (v.bootstrap) {
     const b=v.bootstrap,c=b.claim,i=v.source.invoices.find(i=>i.id===c?.scope?.invoiceId);
     if (!c || c.version!==1 || !c.scope || !Object.values(c.scope).every(identity)
@@ -242,6 +311,24 @@ async function cycleHistory(db: Pick<Prisma.TransactionClient, "syncRun">): Prom
   const rows = await db.syncRun.findMany({ where: { errorMessage: { startsWith: JOURNAL_PREFIX } },
     select: { id: true, errorMessage: true }, orderBy: [{ startedAt: "asc" }, { id: "asc" }] });
   return rows.flatMap(row => (journal(row.errorMessage, row.id)?.writes ?? []).map(w => ({ ...w, runId: row.id })));
+}
+/**
+ * Has this invoice's card already been claimed, in ANY run?
+ *
+ * A pending claim counts as loudly as a confirmed one. Pending means a POST was
+ * started and never answered, so the card may well exist; treating that as "no
+ * card yet" is exactly how a customer ends up with two.
+ */
+export function invoiceCardCreationClaimed(history: CycleJournalEntry[],
+  scope: { locationId: string; pipelineId: string; invoiceId: string }): CycleJournalEntry | null {
+  return history.find(w => w.intent.creation
+    && w.intent.creation.locationId === scope.locationId
+    && w.intent.creation.pipelineId === scope.pipelineId
+    && w.intent.creation.invoiceId === scope.invoiceId) ?? null;
+}
+function assertCreationHistory(intent: GhlWriteIntent, history: CycleJournalEntry[]): void {
+  const c = intent.creation; if (!c) return;
+  if (invoiceCardCreationClaimed(history, c)) throw new SyncWriterBlockedError();
 }
 function assertCycleHistory(intent: GhlWriteIntent, history: CycleJournalEntry[]): void {
   const c = intent.cycle; if (!c) return;
@@ -374,6 +461,7 @@ export class SyncRunWriter {
       await durable(this.db, async tx => {
         const run = await tx.syncRun.findUniqueOrThrow({ where: { id: this.runId } });
         if (run.status !== "running") throw new SyncWriterBlockedError();
+        if (intent.creation) assertCreationHistory(intent, await cycleHistory(tx));
         if (intent.cycle) assertCycleHistory(intent, await cycleHistory(tx));
         if (intent.workflowRemoval) assertRemovalHistory(intent, await cycleHistory(tx));
         if (intent.bootstrap) assertBootstrapHistory(intent, await cycleHistory(tx));

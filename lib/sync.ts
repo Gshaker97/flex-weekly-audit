@@ -42,7 +42,10 @@ import { phoneSourcePlan, readPhoneInvoiceEvidence } from "./ghl-phone-state";
 import { canonicalPhone, matchPhoneCustomer, phoneMayShareOwner } from "./ghl-phone-match";
 import { log, logError } from "./log";
 import { planCardCreation, describeCardCreation, CARD_CREATION_STAGE } from "./ghl-card-creation-plan";
-import { planInvoiceCards, PROTECTED_STAGES, type InvoiceCardPlan, type LegacySendingEvidence } from "./ghl-invoice-card-plan";
+import { invoiceNumbersInCardName, planInvoiceCards, PROTECTED_STAGES,
+  type InvoiceCardPlan, type LegacySendingEvidence } from "./ghl-invoice-card-plan";
+import { applyInvoiceCardPlan, claimedInvoiceIdsFromHistory, invoiceCardWriteGate,
+  type InvoiceCardWriteReport } from "./ghl-invoice-card-writer";
 import { invoiceReminderClock } from "./invoice-reminder-clock";
 
 // Backfill scope: when set to a Date, invoices are pulled in full but limited to
@@ -693,6 +696,18 @@ export async function syncGhlInvoicePipeline(opts: {
   perInvoiceReport?: (entry: InvoiceCardPlanReport) => void;
   /** Proof the legacy workflow's sending is off; without it no Overdue move is planned. */
   legacySending?: LegacySendingEvidence | null;
+  /**
+   * Per-card outcomes from the per-invoice WRITER. Supplying this does not
+   * enable writing - `invoiceCardWriteGate` does - and withholding it does not
+   * disable it; it only decides whether the caller hears about each card.
+   */
+  perInvoiceWriteReport?: (entry: InvoiceCardWriteReport) => void;
+  /**
+   * Force the per-invoice writer off even when the environment gate is open.
+   * For dry runs that want the plan against production without any risk that a
+   * variable set on the host turns a read into a write.
+   */
+  perInvoiceWritesDisabled?: boolean;
 } = {}): Promise<number> {
   const mode = opts.mode ?? process.env.GHL_INVOICE_WRITE_MODE ?? "paid_only";
   if (!["review", "paid_only", "sync"].includes(mode)) throw new Error("Invalid GHL_INVOICE_WRITE_MODE");
@@ -743,6 +758,18 @@ export async function syncGhlInvoicePipeline(opts: {
   let sourceObservedAt: string | undefined;
   let applied = 0;
   let writesHalted = false;
+  // --- ONE CARD PER INVOICE: run-level state -------------------------------
+  // The gate is read once, here, so every customer in a run is judged by the
+  // same configuration even if the environment changes underneath us.
+  const cardGate = opts.perInvoiceWritesDisabled ? { open: false, reason: "per_invoice_writes_disabled_by_caller" } as const : invoiceCardWriteGate();
+  const perInvoiceActive = !!opts.perInvoiceReport || !!opts.perInvoiceWriteReport || cardGate.open;
+  const cardWritesEligible = cardGate.open && !!opts.writer && !!opts.writer.readCycleHistory;
+  if (cardGate.open && !cardWritesEligible) {
+    report({ action: "hold", reason: "Per-invoice card writes are enabled but no durable writer with cycle history was admitted" });
+  }
+  const cardSpend = { remaining: cardGate.open ? cardGate.budget : 0 };
+  let cardClaims: Set<string> | undefined;
+  let cardWritesHalted = false;
   const cardInfo = (card: GhlOpportunity) => ({ opportunityId: card.id, contactId: card.contactId ?? undefined,
     from: { stageId: card.pipelineStageId, status: card.status, monetaryValue: card.monetaryValue, name: card.name } });
   const holdCards = (reason: string, candidateIds: string[], customer?: typeof customers[number]) => {
@@ -791,8 +818,8 @@ export async function syncGhlInvoicePipeline(opts: {
     if (identityHold) { holdCards(identityHold, candidateIds, customer); return; }
     const matchingCards = cards.filter(card => card.contactId === contactId);
 
-    // ONE CARD PER INVOICE - report only, and only when asked for.
-    if (opts.perInvoiceReport) {
+    // ONE CARD PER INVOICE.
+    if (perInvoiceActive) {
       try {
         source ??= readPhoneInvoiceEvidence();
         const evidence = await source;
@@ -805,9 +832,12 @@ export async function syncGhlInvoicePipeline(opts: {
             ? { daysPastDue: clock.daysPastDue, isOverdue: clock.isOverdue, sentOn: clock.sentOn }
             : null;
         }
-        opts.perInvoiceReport({
-          customerId: customer.id, jobberClientId: customer.jobberClientId, contactId,
-          plan: planInvoiceCards({
+        const existingCards = matchingCards.map(card => ({
+          id: card.id, name: card.name ?? null, status: card.status ?? null,
+          stageName: stageNameById.get(card.pipelineStageId ?? "") ?? null,
+          monetaryValue: card.monetaryValue ?? null,
+        }));
+        const plan = planInvoiceCards({
             contactId, now, clocks, legacySending: opts.legacySending ?? null,
             legacyWorkflowId: process.env.GHL_LEGACY_INVOICE_WORKFLOW_ID ?? "",
             label: ownInvoices[0]?.clientName ?? customer.companyName ?? customer.name ?? customer.jobberClientId,
@@ -816,18 +846,65 @@ export async function syncGhlInvoicePipeline(opts: {
               totalDollars: inv.amounts?.total ?? null, balanceDollars: inv.amounts?.invoiceBalance ?? null,
               issuedDate: inv.issuedDate, dueDate: inv.dueDate,
             })),
-            cards: matchingCards.map(card => ({
-              id: card.id, name: card.name ?? null, status: card.status ?? null,
-              stageName: stageNameById.get(card.pipelineStageId ?? "") ?? null,
-              monetaryValue: card.monetaryValue ?? null,
-            })),
-          }),
+            cards: existingCards,
         });
+        opts.perInvoiceReport?.({ customerId: customer.id, jobberClientId: customer.jobberClientId, contactId, plan });
+
+        // The writer. Nothing below can move a card into "Invoice Overdue":
+        // `decideInvoiceCardWrite` refuses that target outright, independently
+        // of the plan's own legacy-sending gate.
+        if (cardWritesEligible && cardGate.open && !writesHalted && !cardWritesHalted
+            && plan.actions.some(a => a.state === "adopt" || a.state === "create")) {
+          cardClaims ??= claimedInvoiceIdsFromHistory(await opts.writer!.readCycleHistory!(),
+            { locationId: process.env.GHL_LOCATION_ID ?? "", pipelineId: refs.pipelineId });
+          const result = await applyInvoiceCardPlan({
+            plan, contactId, jobberClientId: customer.jobberClientId, pipelineId: refs.pipelineId,
+            locationId: process.env.GHL_LOCATION_ID ?? "",
+            stageIds: { sent: sentId, overdue: overdueId, paid: paidId },
+            gate: cardGate, source: evidence, observedAt: sourceObservedAt,
+            preflight: new Map(existingCards.map(card => [card.id, card])),
+            spend: cardSpend, claimedInvoiceIds: cardClaims,
+            writer: { prepare: opts.writer!.prepare.bind(opts.writer), assertPending: opts.writer!.assertPending.bind(opts.writer),
+              confirm: opts.writer!.confirm.bind(opts.writer), block: opts.writer!.block.bind(opts.writer),
+              readCycleHistory: opts.writer!.readCycleHistory!.bind(opts.writer) },
+            report: entry => {
+              log(`[ghl-card] ${JSON.stringify(entry)}`);
+              opts.perInvoiceWriteReport?.(entry);
+            },
+          });
+          applied += result.applied;
+          if (result.halted) {
+            // One shared writer: a halt here stops the per-customer path too.
+            cardWritesHalted = true;
+            writesHalted = true;
+          }
+        }
       } catch (err: any) {
-        // A failed plan must never change what the per-customer path does next.
+        // `applyInvoiceCardPlan` handles its own failures and halts itself, so
+        // anything thrown here happened before or around it - a bad journal
+        // read, unusable source. Stop attempting card writes for the rest of
+        // the run rather than retrying on a foundation we could not read, and
+        // leave the per-customer path's own guards to speak for themselves.
+        cardWritesHalted = true;
         report({ customerId: customer.id, jobberClientId: customer.jobberClientId, contactId,
-          action: "hold", reason: `Per-invoice plan unavailable: ${err?.message ?? err}` });
+          action: "hold", reason: `Per-invoice card plan or write unavailable; card writes stopped for this run: ${err?.message ?? err}` });
       }
+    }
+
+    // THE OWNERSHIP BOUNDARY. A card that names an invoice belongs to the
+    // per-invoice writer, so once that writer is on the per-customer aggregate
+    // must keep its hands off: measured 2026-11-20, 28 of the 40 per-invoice
+    // cards the aggregate path reaches would be renamed, restaged and 26 of
+    // them revalued to $0 the moment it was allowed to write. Two writers with
+    // different ideas of what a card means is worse than either alone.
+    if (cardGate.open) {
+      const ownedPerInvoice = matchingCards.filter(card => invoiceNumbersInCardName(card.name).length > 0);
+      for (const card of ownedPerInvoice) {
+        reviewedCards.add(card.id);
+        report({ customerId: customer.id, jobberClientId: customer.jobberClientId, ...cardInfo(card), contactId,
+          action: "hold", reason: "Card names an invoice and belongs to the per-invoice writer; the per-customer aggregate leaves it alone" });
+      }
+      if (ownedPerInvoice.length) return;
     }
 
     if (matchingCards.length > 1) {
@@ -846,6 +923,15 @@ export async function syncGhlInvoicePipeline(opts: {
       // appearing straight in Overdue can enrol the customer and fire reminders
       // at them, while the Sent transition provably cannot. See
       // lib/ghl-card-creation-plan.ts for the full argument.
+      // ...unless the per-invoice writer is on, in which case creating cards is
+      // its job and a second, per-customer proposal for the same customer is
+      // just noise in the log someone has to read every morning.
+      if (cardGate.open) {
+        report({ customerId: customer.id, jobberClientId: customer.jobberClientId, contactId,
+          candidateContactIds: candidateIds, storedInvoiceIds: ownInvoices.map(inv => inv.jobberInvoiceId),
+          action: "hold", reason: "No existing card; card creation belongs to the per-invoice writer" });
+        return;
+      }
       source ??= readPhoneInvoiceEvidence();
       const evidence = await source;
       sourceObservedAt ??= new Date().toISOString();
