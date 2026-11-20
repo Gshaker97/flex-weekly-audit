@@ -3,6 +3,14 @@ import { invoiceReminderClock } from "./invoice-reminder-clock";
 
 export interface PhoneInvoiceEvidence {
   id: string;
+  /**
+   * The human invoice number, e.g. "7226". Read live alongside the balance,
+   * because it is how a per-invoice pipeline card is matched to its invoice:
+   * a card named "... #7226 ..." IS invoice 7226's card. Taking the number from
+   * the local cache instead would let a stale row point a card at the wrong
+   * invoice, so it comes from the same read as the money.
+   */
+  invoiceNumber: string | null;
   client: { id: string } | null;
   invoiceStatus: string | null;
   amounts: { total: number | null; invoiceBalance: number | null } | null;
@@ -16,7 +24,7 @@ export async function readPhoneInvoiceEvidence(): Promise<PhoneInvoiceEvidence[]
   const query = `query PhoneInvoiceExit($after: String) {
     invoices(first: 25, after: $after) {
       pageInfo { hasNextPage endCursor }
-      nodes { id invoiceStatus amounts { total invoiceBalance }
+      nodes { id invoiceNumber invoiceStatus amounts { total invoiceBalance }
         issuedDate createdAt dueDate client { id } }
     }
   }`;

@@ -16,7 +16,7 @@ const owner = { id: "customer-a", jobberClientId: "jobber-a", email: "owner@exam
 const contact = { id: "contact-a", email: owner.email, phone: null };
 const card = { id: "card-a", contactId: contact.id, pipelineId: "pipeline", pipelineStageId: "overdue", status: "open", monetaryValue: 100, name: "Invoice #1" };
 const cached = { id: "local-invoice", jobberInvoiceId: "source-invoice", customerId: owner.id, invoiceNumber: "1", clientName: "Synthetic", invoiceStatus: "past_due", total: 100, amountDue: 100, issuedAt: new Date("2026-05-01"), dueAt: new Date("2026-06-01"), createdAtJobber: null };
-const paid = { id: cached.jobberInvoiceId, client: { id: owner.jobberClientId }, invoiceStatus: "paid", amounts: { total: 100, invoiceBalance: 0 }, issuedDate: "2026-05-01", dueDate: "2026-06-01", createdAt: null };
+const paid = { id: cached.jobberInvoiceId, client: { id: owner.jobberClientId }, invoiceStatus: "paid", amounts: { total: 100, invoiceBalance: 0 }, issuedDate: "2026-05-01", dueDate: "2026-06-01", createdAt: null, invoiceNumber: "1000" };
 const debt = { ...paid, invoiceStatus: "past_due", amounts: { total: 100, invoiceBalance: 100 } };
 let customers: any[], contacts: any[], cards: any[], invoices: any[], source: any[], writes: any[], reviews: GhlInvoiceReview[];
 let sourceReads: number;

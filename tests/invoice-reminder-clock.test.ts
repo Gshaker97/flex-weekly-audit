@@ -5,7 +5,7 @@ import { phoneSourcePlan, PhoneInvoiceEvidence } from "../lib/ghl-phone-state";
 
 const invoice: PhoneInvoiceEvidence = { id: "synthetic-invoice", client: { id: "synthetic-owner" },
   invoiceStatus: "awaiting_payment", amounts: { total: 100, invoiceBalance: 100 },
-  issuedDate: "2026-11-01", dueDate: "2026-11-08", createdAt: "2026-10-31T12:00:00Z" };
+  issuedDate: "2026-11-01", dueDate: "2026-11-08", createdAt: "2026-10-31T12:00:00Z", invoiceNumber: "1000" };
 const plan = (now: string, patches: Partial<PhoneInvoiceEvidence>[] = [{}]) =>
   phoneSourcePlan("synthetic-owner", [invoice.id], patches.map(p => ({ ...invoice, ...p })), new Date(now));
 

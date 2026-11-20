@@ -42,6 +42,8 @@ import { phoneSourcePlan, readPhoneInvoiceEvidence } from "./ghl-phone-state";
 import { canonicalPhone, matchPhoneCustomer, phoneMayShareOwner } from "./ghl-phone-match";
 import { log, logError } from "./log";
 import { planCardCreation, describeCardCreation, CARD_CREATION_STAGE } from "./ghl-card-creation-plan";
+import { planInvoiceCards, PROTECTED_STAGES, type InvoiceCardPlan, type LegacySendingEvidence } from "./ghl-invoice-card-plan";
+import { invoiceReminderClock } from "./invoice-reminder-clock";
 
 // Backfill scope: when set to a Date, invoices are pulled in full but limited to
 // those issued on/after it (instead of the incremental updatedAt filter). null =
@@ -663,12 +665,34 @@ export interface GhlInvoiceReview {
   to?: { stageId: string; monetaryValue: number; name?: string };
 }
 
+/**
+ * One customer's per-invoice card plan. Reporting only, and only produced when
+ * a caller asks for it.
+ */
+export interface InvoiceCardPlanReport {
+  customerId: string;
+  jobberClientId: string;
+  contactId: string;
+  plan: InvoiceCardPlan;
+}
+
 // Existing cards only. Never delete duplicates/old cards, infer payment from
 // absence, use a duplicate-create error as identity, or reopen won/lost cards.
 export async function syncGhlInvoicePipeline(opts: {
   mode?: GhlInvoiceWriteMode;
   report?: (entry: GhlInvoiceReview) => void;
   writer?: Pick<SyncRunWriter, "prepare" | "assertPending" | "confirm" | "block"> & Partial<Pick<SyncRunWriter, "readCycleHistory">>;
+  /**
+   * Ask for the ONE CARD PER INVOICE plan, chosen by the owner 2026-11-20.
+   *
+   * Opt-in on purpose. Without this callback the block is skipped entirely - no
+   * extra reads, no extra log lines - so a deployed sync behaves exactly as it
+   * did before the per-invoice work existed. Nothing here writes: the plan is
+   * computed and handed back, and the per-customer path below is untouched.
+   */
+  perInvoiceReport?: (entry: InvoiceCardPlanReport) => void;
+  /** Proof the legacy workflow's sending is off; without it no Overdue move is planned. */
+  legacySending?: LegacySendingEvidence | null;
 } = {}): Promise<number> {
   const mode = opts.mode ?? process.env.GHL_INVOICE_WRITE_MODE ?? "paid_only";
   if (!["review", "paid_only", "sync"].includes(mode)) throw new Error("Invalid GHL_INVOICE_WRITE_MODE");
@@ -683,6 +707,12 @@ export async function syncGhlInvoicePipeline(opts: {
   const overdueId = refs.stageIdByName[GHL_STAGE_OVERDUE.toLowerCase()];
   const paidId = refs.stageIdByName[GHL_STAGE_PAID.toLowerCase()];
   if (!sentId || !overdueId || !paidId) throw new Error("Required invoice stages missing");
+  // refs only keeps lowercased stage names, so recover the canonical spelling
+  // for the stages we reason about and pass anything else through as-is.
+  const canonicalStages = [GHL_STAGE_SENT, GHL_STAGE_OVERDUE, GHL_STAGE_PAID, ...PROTECTED_STAGES];
+  const stageNameById = new Map<string, string>(
+    Object.entries(refs.stageIdByName).map(([lower, id]) =>
+      [id, canonicalStages.find(name => name.toLowerCase() === lower) ?? lower]));
   const now = new Date();
   const customers = await prisma.customer.findMany();
   const invoices = await prisma.invoiceRecord.findMany({ include: { customer: true } });
@@ -760,6 +790,46 @@ export async function syncGhlInvoicePipeline(opts: {
     const identityHold = strictGhlIdentityHold(customer, customers, contacts, contactId);
     if (identityHold) { holdCards(identityHold, candidateIds, customer); return; }
     const matchingCards = cards.filter(card => card.contactId === contactId);
+
+    // ONE CARD PER INVOICE - report only, and only when asked for.
+    if (opts.perInvoiceReport) {
+      try {
+        source ??= readPhoneInvoiceEvidence();
+        const evidence = await source;
+        sourceObservedAt ??= new Date().toISOString();
+        const mine = evidence.filter(inv => inv.client?.id === customer.jobberClientId);
+        const clocks: Record<string, { daysPastDue: number; isOverdue: boolean; sentOn: string } | null> = {};
+        for (const inv of mine) {
+          const clock = invoiceReminderClock(inv.issuedDate, inv.dueDate, now);
+          clocks[inv.id] = clock
+            ? { daysPastDue: clock.daysPastDue, isOverdue: clock.isOverdue, sentOn: clock.sentOn }
+            : null;
+        }
+        opts.perInvoiceReport({
+          customerId: customer.id, jobberClientId: customer.jobberClientId, contactId,
+          plan: planInvoiceCards({
+            contactId, now, clocks, legacySending: opts.legacySending ?? null,
+            legacyWorkflowId: process.env.GHL_LEGACY_INVOICE_WORKFLOW_ID ?? "",
+            label: ownInvoices[0]?.clientName ?? customer.companyName ?? customer.name ?? customer.jobberClientId,
+            invoices: mine.map(inv => ({
+              invoiceId: inv.id, invoiceNumber: inv.invoiceNumber, status: inv.invoiceStatus,
+              totalDollars: inv.amounts?.total ?? null, balanceDollars: inv.amounts?.invoiceBalance ?? null,
+              issuedDate: inv.issuedDate, dueDate: inv.dueDate,
+            })),
+            cards: matchingCards.map(card => ({
+              id: card.id, name: card.name ?? null, status: card.status ?? null,
+              stageName: stageNameById.get(card.pipelineStageId ?? "") ?? null,
+              monetaryValue: card.monetaryValue ?? null,
+            })),
+          }),
+        });
+      } catch (err: any) {
+        // A failed plan must never change what the per-customer path does next.
+        report({ customerId: customer.id, jobberClientId: customer.jobberClientId, contactId,
+          action: "hold", reason: `Per-invoice plan unavailable: ${err?.message ?? err}` });
+      }
+    }
+
     if (matchingCards.length > 1) {
       holdCards("Multiple existing cards, including closed statuses", candidateIds, customer); return;
     }

@@ -60,7 +60,7 @@ function mock(contacts: any[] = [contact], opportunities: any[] = [opportunity],
 function database(customers: any[] = [customer], status = "past_due") {
   sourceEvidence = customers.map((c, i) => ({ id: `jobber-inv-${i}`, client: { id: c.jobberClientId },
     invoiceStatus: status, amounts: { total: 100, invoiceBalance: status === "paid" ? 0 : 100 },
-    issuedDate: "2026-05-01", createdAt: null, dueDate: "2026-06-01" }));
+    issuedDate: "2026-05-01", createdAt: null, dueDate: "2026-06-01", invoiceNumber: "1000" }));
   (prisma.customer as any).findMany = async () => customers;
   (prisma.invoiceRecord as any).findMany = async ({ where }: any) => {
     const rows = customers.map((c, i) => ({ id: `inv-${i}`, jobberInvoiceId: `jobber-inv-${i}`, customerId: c.id, customer: c, invoiceNumber: "123", clientName: "Synthetic", invoiceStatus: status,
@@ -241,7 +241,7 @@ test("phone payment exit uses explicit fresh paid evidence", async () => {
   database([customer], "paid"); mock([contact], [{ ...opportunity, pipelineStageId: "overdue" }]);
   await syncGhlInvoicePipeline(); assert.deepEqual(writes.map(w => w.body.pipelineStageId), ["paid"]);
 });
-const paidEvidence = (): PhoneInvoiceEvidence => ({ id: "jobber-inv-0", client: { id: customer.jobberClientId }, invoiceStatus: "paid", amounts: { total: 100, invoiceBalance: 0 }, issuedDate: "2026-05-01", createdAt: null, dueDate: "2026-06-01" });
+const paidEvidence = (): PhoneInvoiceEvidence => ({ id: "jobber-inv-0", client: { id: customer.jobberClientId }, invoiceStatus: "paid", amounts: { total: 100, invoiceBalance: 0 }, issuedDate: "2026-05-01", createdAt: null, dueDate: "2026-06-01", invoiceNumber: "1000" });
 test("payment predicate rejects empty, omitted, partial, unknown, old, zero and void evidence", () => {
   const now = new Date("2026-11-06T00:00:00Z");
   const decide = (rows: any[], ids = ["jobber-inv-0"]) => phoneExitStage(customer.jobberClientId, ids, rows, now);

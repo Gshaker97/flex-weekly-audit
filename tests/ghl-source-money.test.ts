@@ -6,7 +6,7 @@ const now = new Date("2026-11-07T00:00:00Z");
 const invoice: PhoneInvoiceEvidence = {
   id: "synthetic-invoice", client: { id: "synthetic-client" }, invoiceStatus: "past_due",
   amounts: { total: 100, invoiceBalance: 100 }, issuedDate: "2026-05-01",
-  createdAt: null, dueDate: "2026-06-01",
+  createdAt: null, dueDate: "2026-06-01", invoiceNumber: "1000",
 };
 const plan = (source: PhoneInvoiceEvidence[]) => phoneSourcePlan("synthetic-client", [invoice.id], source, now);
 const invalidAmounts: Array<[string, unknown]> = [
