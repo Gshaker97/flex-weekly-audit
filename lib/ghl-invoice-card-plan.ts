@@ -5,22 +5,34 @@
  * Pipeline actually contains: 316 cards in three different shapes, written by
  * three different things that disagree about what a card even is.
  *
- *   169  "<name> - N overdue/unpaid invoice(s)"   our sync, one per CUSTOMER
+ *   169  "<name> - N overdue/unpaid invoice(s)"   this sync, one per CUSTOMER
  *   108  a bare customer name                     placed by hand
- *    39  "... #7226 ..."                          Zapier, one per INVOICE
+ *    39  "Invoice #7226 - <name>"                 this sync, one per INVOICE
  *
- * The per-invoice grain is the correct one, and Zapier had it right. The whole
- * reminder ladder is per invoice - day 10, 15, 20, 21, 25, 30, 35 past due on
- * THAT invoice - and one card for a customer can never say "invoice A is at day
- * 15 and invoice B is at day 3". That mismatch is why the text ladder's
- * eligibility check ("is this customer's card in the Overdue stage?") fitted so
- * badly and held 28 of 42 invoices.
+ * ALL THREE SHAPES ARE OURS OR MANUAL, and the per-invoice ones are OUR OWN
+ * EARLIER WORK. Traced 2026-11-20: `opportunityName()` produced exactly
+ * `Invoice #<number> - <client>` from commit 556e0c9 (2026-06-19) until
+ * d235ff5 (2026-11-06) removed `createOpportunity` and replaced it with the
+ * hold "No existing card; creation disabled". The last such card was created
+ * 2026-11-05, the day before. Their timestamps are this service's hourly cron:
+ * 38 of 39 fell at 8-12 minutes past the hour, all 39 on a weekday.
  *
- * ONE WRITER, AND IT HAS TO BE THIS ONE. Zapier created those 39 cards between
- * July and November and then never moved them: 38 of 39 still sit in "Invoice
- * Sent", and 26 of them show money that has since been paid. An event-driven
- * Zap cannot recover from a missed event. This runs on a clock, re-reads Jobber
- * live every time, and therefore catches up on its own.
+ * The owner's four Zapier Zaps are NOT the source. They identify an opportunity
+ * by CONTACT - first name, last name, phone, email - and put the invoice number
+ * in the Notes, so they are per-customer writers too. All four have been off
+ * since about 2026-09-21.
+ *
+ * So this is a RESTORATION, not a new idea, and it is right for the same reason
+ * it was right the first time: the whole reminder ladder is per invoice - day
+ * 10, 15, 20, 21, 25, 30, 35 past due on THAT invoice - and one card for a
+ * customer can never say "invoice A is at day 15 and invoice B is at day 3".
+ * That mismatch is why the text ladder's eligibility check ("is this customer's
+ * card in the Overdue stage?") fitted so badly and held 28 of 42 invoices.
+ *
+ * WHAT THE OLD VERSION GOT WRONG, and this one does not: it created cards
+ * DIRECTLY IN "Invoice Overdue" for a past-due invoice. That is the opportunity
+ * event the legacy Fixed Automation triggers on, so the old sync was itself a
+ * feed into the legacy text ladder. See the Overdue gate below.
  *
  * ADOPT, DO NOT OVERWRITE. A card already named "#7226" IS invoice 7226's card.
  * This plan keeps that name and corrects only the stage and the amount. It never
@@ -133,6 +145,17 @@ const cents = (v: unknown): number | null => {
 
 /** Our own per-customer card format, which this plan must never overwrite. */
 const PER_CUSTOMER = /\d+\s+(overdue|unpaid)\s+invoice/i;
+
+/**
+ * The name a per-invoice card carries: `Invoice #7226 — Someone`.
+ *
+ * This is not a new convention. It is exactly what `opportunityName()` produced
+ * in this file's own history, from 2026-06-19 until card creation was removed
+ * on 2026-11-06, and the 39 cards it left on the board still read this way.
+ */
+export function invoiceCardName(invoiceNumber: string, label: string): string {
+  return `Invoice #${invoiceNumber.trim()} — ${label.trim()}`;
+}
 
 /** Every invoice number a card's name claims. More than one is an ambiguity. */
 export function invoiceNumbersInCardName(name: string | null | undefined): readonly string[] {
@@ -260,7 +283,13 @@ export function planInvoiceCards(input: InvoiceCardInput): InvoiceCardPlan {
       actions.push(Object.freeze({
         state: "create", invoiceId: invoice.invoiceId, invoiceNumber: number,
         desiredStage: want.stage, stage: STAGE_SENT, monetaryValue: want.balance,
-        name: `${input.label.trim()} - invoice #${number}`,
+        // The historical format, restored exactly. This sync created one card
+        // per invoice named `Invoice #<number> — <client>` from 2026-06-19
+        // until commit d235ff5 removed creation on 2026-11-06, and 39 of those
+        // cards are still on the board. Matching that spelling means a new card
+        // is indistinguishable from them, the next run's matcher finds it, and
+        // nobody has to learn a second convention.
+        name: invoiceCardName(number, input.label),
         reasons: sorted(overdue ? ["created_in_sent_not_overdue_to_avoid_legacy_enrollment"] : []),
       }));
       continue;

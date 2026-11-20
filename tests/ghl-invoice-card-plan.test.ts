@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   planInvoiceCards, desiredStageForInvoice, legacySendingIsOff, invoiceNumbersInCardName,
-  STAGE_SENT, STAGE_OVERDUE, STAGE_PAID, PROTECTED_STAGES,
+  STAGE_SENT, STAGE_OVERDUE, STAGE_PAID, PROTECTED_STAGES, invoiceCardName,
   type InvoiceCardInput, type InvoiceFact, type ExistingCard, type LegacySendingEvidence,
 } from "../lib/ghl-invoice-card-plan";
 
@@ -259,9 +259,23 @@ test("a malformed input plans nothing rather than throwing", () => {
   }
 });
 
-test("a new card's name carries the invoice number and no contact detail", () => {
+test("a new card is named the way this sync has always named them", () => {
+  // `Invoice #7226 \u2014 Someone` is the exact format opportunityName() produced
+  // from 2026-06-19 until creation was removed on 2026-11-06, and the 39 cards
+  // still on the board read this way. A new card must be indistinguishable from
+  // them, or the next run will not match its own work.
   const p = plan({ cards: [] });
   const a = p.actions[0];
-  assert.equal(a.state === "create" && a.name, "Someone - invoice #7226");
+  assert.equal(a.state === "create" && a.name, "Invoice #7226 \u2014 Someone");
+  assert.equal(invoiceCardName("7226", "Someone"), "Invoice #7226 \u2014 Someone");
+  assert.equal(invoiceCardName(" 7226 ", "  Someone  "), "Invoice #7226 \u2014 Someone");
   assert.ok(!JSON.stringify(p).includes("@"));
+});
+
+test("a card this plan creates is one the NEXT run can find again", () => {
+  // The round trip that makes adopt-not-overwrite work at all.
+  const created = invoiceCardName("7226", "Someone");
+  assert.deepEqual([...invoiceNumbersInCardName(created)], ["7226"]);
+  const next = plan({ cards: [card({ name: created })] });
+  assert.equal(next.actions[0].state, "adopt");
 });
