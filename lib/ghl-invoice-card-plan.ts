@@ -74,6 +74,36 @@ export const PROTECTED_STAGES: readonly string[] = Object.freeze([
 export const COLLECTIONS_CUTOFF = "2026-01-01" as const;
 
 /**
+ * How far back the board looks. The owner's scope, 2026-11-20: "all sent and
+ * unpaid, overdue or whatever jobber status's it as invoices from the past 4
+ * months to today should be added."
+ *
+ * A ROLLING window, not a fixed date, so it keeps meaning the same thing in
+ * March as it does today without anyone editing it.
+ */
+export const DEFAULT_LOOKBACK_MONTHS = 4;
+
+/**
+ * The first issue date still in scope: `months` back from `now`, and never
+ * earlier than the Collections cutoff, so the new window can only ever narrow
+ * the old boundary and never quietly widen it.
+ *
+ * Month arithmetic by calendar month, clamped to the last day of the target
+ * month: 4 months back from 31 October is 30 June, not 1 July. Done in UTC
+ * because an invoice's issue date is a plain calendar day with no timezone.
+ */
+export function invoiceWindowStart(now: Date, months = DEFAULT_LOOKBACK_MONTHS): string {
+  if (!(now instanceof Date) || !Number.isFinite(now.getTime())) return COLLECTIONS_CUTOFF;
+  if (!Number.isSafeInteger(months) || months < 1 || months > 120) return COLLECTIONS_CUTOFF;
+  const y = now.getUTCFullYear(), m = now.getUTCMonth(), d = now.getUTCDate();
+  const target = new Date(Date.UTC(y, m - months, 1));
+  const lastDay = new Date(Date.UTC(target.getUTCFullYear(), target.getUTCMonth() + 1, 0)).getUTCDate();
+  const start = new Date(Date.UTC(target.getUTCFullYear(), target.getUTCMonth(), Math.min(d, lastDay)));
+  const day = start.toISOString().slice(0, 10);
+  return day < COLLECTIONS_CUTOFF ? COLLECTIONS_CUTOFF : day;
+}
+
+/**
  * Proof that the legacy workflow can no longer send. Deliberately not a boolean
  * and not an environment variable: "the workflow is off" is a claim about the
  * outside world, so it has to carry who checked, when, and against which
@@ -183,7 +213,9 @@ export function legacySendingIsOff(
  * time instead of summed over a customer.
  */
 export function desiredStageForInvoice(
-  invoice: InvoiceFact, clock: { daysPastDue: number; isOverdue: boolean; sentOn: string } | null
+  invoice: InvoiceFact, clock: { daysPastDue: number; isOverdue: boolean; sentOn: string } | null,
+  /** First issue date in scope. Required, so no caller can forget the window. */
+  windowStart: string = COLLECTIONS_CUTOFF
 ): { stage: string; balance: number } | { stage: null; reason: string } {
   const total = cents(invoice.totalDollars);
   const balance = cents(invoice.balanceDollars);
@@ -192,7 +224,10 @@ export function desiredStageForInvoice(
   const status = invoice.status?.toLowerCase() ?? null;
   if (status === "paid" && balance === 0) return { stage: STAGE_PAID, balance: 0 };
   if (!clock) return { stage: null, reason: "invoice_dates_unusable" };
-  if (clock.sentOn < COLLECTIONS_CUTOFF) return { stage: null, reason: "before_collections_cutoff" };
+  // A malformed window is treated as the widest safe boundary, never as "no
+  // boundary": an unreadable setting must not silently pull in years of history.
+  const start = DAY.test(windowStart) && windowStart >= COLLECTIONS_CUTOFF ? windowStart : COLLECTIONS_CUTOFF;
+  if (clock.sentOn < start) return { stage: null, reason: "outside_the_lookback_window" };
   if (total === 0) return { stage: null, reason: "zero_total_invoice" };
   if (balance > 0 && (status === "awaiting_payment" || status === "past_due")) {
     // Jobber occasionally labels an invoice past_due before its own due date.
@@ -212,6 +247,11 @@ export type InvoiceCardInput = Readonly<{
   cards: readonly ExistingCard[];
   /** One per invoice id, from the live invoice clock. */
   clocks: Readonly<Record<string, { daysPastDue: number; isOverdue: boolean; sentOn: string } | null>>;
+  /**
+   * First issue date in scope, from `invoiceWindowStart`. Omitted means the
+   * Collections cutoff, which is wider - callers that care must pass it.
+   */
+  windowStart?: string;
   /** The workflow whose sending must be off before any Overdue move. */
   legacyWorkflowId: string;
   legacySending?: LegacySendingEvidence | null;
@@ -252,13 +292,14 @@ export function planInvoiceCards(input: InvoiceCardInput): InvoiceCardPlan {
     if (!number) { hold("invoice_number_missing"); continue; }
     if ((numberCounts.get(number) ?? 0) > 1) { hold("invoice_number_is_not_unique"); continue; }
 
-    const want = desiredStageForInvoice(invoice, input.clocks?.[invoice.invoiceId] ?? null);
+    const want = desiredStageForInvoice(invoice, input.clocks?.[invoice.invoiceId] ?? null,
+      input.windowStart ?? invoiceWindowStart(now));
     const matches = input.cards.filter(card => invoiceNumbersInCardName(card.name).includes(number));
     for (const card of matches) claimed.add(card.id);
 
     if (want.stage === null) {
       // Out of scope is not a fault; everything else is.
-      if (want.reason === "before_collections_cutoff" || want.reason === "zero_total_invoice") {
+      if (want.reason === "outside_the_lookback_window" || want.reason === "zero_total_invoice") {
         actions.push(Object.freeze({ state: "skip", invoiceId: invoice.invoiceId, invoiceNumber: number, reasons: sorted([want.reason]) }));
       } else hold(want.reason);
       continue;

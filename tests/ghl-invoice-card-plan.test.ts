@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   planInvoiceCards, desiredStageForInvoice, legacySendingIsOff, invoiceNumbersInCardName,
   STAGE_SENT, STAGE_OVERDUE, STAGE_PAID, PROTECTED_STAGES, invoiceCardName,
+  COLLECTIONS_CUTOFF, DEFAULT_LOOKBACK_MONTHS, invoiceWindowStart,
   type InvoiceCardInput, type InvoiceFact, type ExistingCard, type LegacySendingEvidence,
 } from "../lib/ghl-invoice-card-plan";
 
@@ -187,10 +188,10 @@ test("a number shared by two invoices cannot identify a card", () => {
   for (const a of p.actions) assert.ok(a.reasons.includes("invoice_number_is_not_unique"));
 });
 
-test("an invoice before the collections cutoff is skipped, not held", () => {
+test("an invoice older than the window is skipped, not held", () => {
   const p = plan({ clocks: { "inv-1": { ...openClock, sentOn: "2025-12-31" } } });
   assert.equal(p.actions[0].state, "skip");
-  assert.ok(p.actions[0].reasons.includes("before_collections_cutoff"));
+  assert.ok(p.actions[0].reasons.includes("outside_the_lookback_window"));
 });
 
 test("a paid invoice with no card needs none", () => {
@@ -278,4 +279,75 @@ test("a card this plan creates is one the NEXT run can find again", () => {
   assert.deepEqual([...invoiceNumbersInCardName(created)], ["7226"]);
   const next = plan({ cards: [card({ name: created })] });
   assert.equal(next.actions[0].state, "adopt");
+});
+
+// --- the rolling lookback window -----------------------------------------
+
+test("the window is four calendar months back from today", () => {
+  assert.equal(invoiceWindowStart(new Date("2026-11-20T19:00:00Z")), "2026-07-20");
+  assert.equal(invoiceWindowStart(new Date("2027-03-15T00:00:00Z")), "2026-11-15");
+});
+
+test("the window clamps to the last day of a shorter month", () => {
+  // Four months back from 31 October is 30 June, not 1 July.
+  assert.equal(invoiceWindowStart(new Date("2026-10-31T12:00:00Z")), "2026-06-30");
+  // And from 31 December it is 31 August, which does have a 31st.
+  assert.equal(invoiceWindowStart(new Date("2026-12-31T12:00:00Z")), "2026-08-31");
+  // Leap-year February, four months on from 29 February 2028.
+  assert.equal(invoiceWindowStart(new Date("2028-06-29T12:00:00Z"), 4), "2028-02-29");
+  assert.equal(invoiceWindowStart(new Date("2028-06-30T12:00:00Z"), 4), "2028-02-29");
+});
+
+test("the window never reaches back past the Collections cutoff", () => {
+  // A 60-month lookback would be 2021, which is not on the table.
+  assert.equal(invoiceWindowStart(new Date("2026-11-20T00:00:00Z"), 60), COLLECTIONS_CUTOFF);
+  assert.equal(invoiceWindowStart(new Date("2026-03-01T00:00:00Z"), 4), COLLECTIONS_CUTOFF);
+});
+
+test("a nonsense window falls back to the cutoff, never to no window at all", () => {
+  for (const months of [0, -1, 0.5, Number.NaN, 121, Infinity]) {
+    assert.equal(invoiceWindowStart(new Date("2026-11-20T00:00:00Z"), months), COLLECTIONS_CUTOFF, String(months));
+  }
+  assert.equal(invoiceWindowStart(new Date("not a date")), COLLECTIONS_CUTOFF);
+});
+
+test("an invoice issued before the window is out of scope, not held as a fault", () => {
+  const clock = { daysPastDue: 200, isOverdue: true, sentOn: "2026-03-01" };
+  const out = desiredStageForInvoice(
+    { invoiceId: "i", invoiceNumber: "7000", status: "past_due", totalDollars: 100,
+      balanceDollars: 100, issuedDate: "2026-03-01", dueDate: "2026-04-01" }, clock, "2026-07-20");
+  assert.deepEqual(out, { stage: null, reason: "outside_the_lookback_window" });
+});
+
+test("an invoice inside the window keeps its stage", () => {
+  const clock = { daysPastDue: 40, isOverdue: true, sentOn: "2026-09-01" };
+  const out = desiredStageForInvoice(
+    { invoiceId: "i", invoiceNumber: "7000", status: "past_due", totalDollars: 100,
+      balanceDollars: 100, issuedDate: "2026-09-01", dueDate: "2026-10-01" }, clock, "2026-07-20");
+  assert.deepEqual(out, { stage: "Invoice Overdue", balance: 100 });
+});
+
+test("a malformed window is treated as the widest SAFE boundary, not as no boundary", () => {
+  const facts = { invoiceId: "i", invoiceNumber: "7000", status: "past_due" as const, totalDollars: 100,
+    balanceDollars: 100, issuedDate: "2025-06-01", dueDate: "2025-07-01" };
+  const clock = { daysPastDue: 500, isOverdue: true, sentOn: "2025-06-01" };
+  for (const window of ["", "yesterday", "2025-01-01", "20260720"]) {
+    // 2025 is before the Collections cutoff either way, so it stays out.
+    assert.deepEqual(desiredStageForInvoice(facts, clock, window),
+      { stage: null, reason: "outside_the_lookback_window" }, window);
+  }
+});
+
+test("the plan skips an out-of-window invoice and creates nothing for it", () => {
+  const result = planInvoiceCards({
+    contactId: "contact-1", label: "Someone", legacyWorkflowId: "w", windowStart: "2026-07-20",
+    now: new Date("2026-11-20T19:00:00Z"),
+    invoices: [{ invoiceId: "old", invoiceNumber: "6000", status: "past_due", totalDollars: 100,
+      balanceDollars: 100, issuedDate: "2026-02-01", dueDate: "2026-03-01" }],
+    cards: [],
+    clocks: { old: { daysPastDue: 260, isOverdue: true, sentOn: "2026-02-01" } },
+  });
+  assert.deepEqual(result.summary, { adopt: 0, create: 0, hold: 0, skip: 1, untouched: 0 });
+  assert.deepEqual(result.actions[0], { state: "skip", invoiceId: "old", invoiceNumber: "6000",
+    reasons: ["outside_the_lookback_window"] });
 });

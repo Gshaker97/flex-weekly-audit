@@ -42,8 +42,8 @@ import { phoneSourcePlan, readPhoneInvoiceEvidence } from "./ghl-phone-state";
 import { canonicalPhone, matchPhoneCustomer, phoneMayShareOwner } from "./ghl-phone-match";
 import { log, logError } from "./log";
 import { planCardCreation, describeCardCreation, CARD_CREATION_STAGE } from "./ghl-card-creation-plan";
-import { invoiceNumbersInCardName, planInvoiceCards, PROTECTED_STAGES,
-  type InvoiceCardPlan, type LegacySendingEvidence } from "./ghl-invoice-card-plan";
+import { DEFAULT_LOOKBACK_MONTHS, invoiceNumbersInCardName, invoiceWindowStart, planInvoiceCards,
+  PROTECTED_STAGES, type InvoiceCardPlan, type LegacySendingEvidence } from "./ghl-invoice-card-plan";
 import { applyInvoiceCardPlan, claimedInvoiceIdsFromHistory, invoiceCardWriteGate,
   legacySendingFromEnv, type InvoiceCardWriteReport } from "./ghl-invoice-card-writer";
 import { invoiceReminderClock } from "./invoice-reminder-clock";
@@ -767,6 +767,13 @@ export async function syncGhlInvoicePipeline(opts: {
   if (cardGate.open && !cardWritesEligible) {
     report({ action: "hold", reason: "Per-invoice card writes are enabled but no durable writer with cycle history was admitted" });
   }
+  // How far back the board looks. Rolling, computed once per run so every
+  // customer is judged against the same boundary. A malformed setting falls
+  // back to the default rather than widening the window.
+  const lookbackRaw = process.env.GHL_INVOICE_LOOKBACK_MONTHS?.trim();
+  const lookbackMonths = lookbackRaw && /^\d{1,3}$/.test(lookbackRaw) ? Number(lookbackRaw) : DEFAULT_LOOKBACK_MONTHS;
+  const windowStart = invoiceWindowStart(now, lookbackMonths);
+  if (perInvoiceActive) log(`[ghl-card] lookback ${lookbackMonths} months; invoices issued on or after ${windowStart} are in scope`);
   const cardSpend = { remaining: cardGate.open ? cardGate.budget : 0 };
   let cardClaims: Set<string> | undefined;
   let cardWritesHalted = false;
@@ -838,7 +845,7 @@ export async function syncGhlInvoicePipeline(opts: {
           monetaryValue: card.monetaryValue ?? null,
         }));
         const plan = planInvoiceCards({
-            contactId, now, clocks, legacySending: opts.legacySending ?? legacySendingFromEnv(),
+            contactId, now, clocks, windowStart, legacySending: opts.legacySending ?? legacySendingFromEnv(),
             legacyWorkflowId: process.env.GHL_LEGACY_INVOICE_WORKFLOW_ID ?? "",
             label: ownInvoices[0]?.clientName ?? customer.companyName ?? customer.name ?? customer.jobberClientId,
             invoices: mine.map(inv => ({
