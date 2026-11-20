@@ -152,6 +152,12 @@ export interface GhlContact {
   /** Per-channel opt-out, exactly as GoHighLevel returns it. An ABSENT Email
    *  entry is NOT consent: the send path requires an explicit "inactive". */
   dndSettings?: Record<string, { status?: string | null } | null> | null;
+  /** Postal address, used only to tell apart several contacts that share an
+   *  email or phone. One person can be several Jobber clients, one per service
+   *  address, so the address is what distinguishes them. */
+  address1?: string | null;
+  city?: string | null;
+  postalCode?: string | null;
 }
 
 const lastTen = (value: string | null | undefined): string =>
@@ -507,6 +513,37 @@ export interface GhlOutboundMessage {
   channel: "email" | "sms";
   dateAdded: Date;
   body: string;
+}
+
+/**
+ * What the provider says became of ONE message we already sent. Read-only, one
+ * GET, no retry of the send and no write of any kind.
+ *
+ * This exists because our own HTTP 201 is not delivery. GoHighLevel accepts a
+ * message, queues it, and only later knows whether it arrived; a text to a
+ * disconnected number and an email that bounces both come back 201. So the
+ * audit asks the provider, and treats anything it cannot read as unconfirmed
+ * rather than delivered.
+ *
+ * `status` is passed through exactly as the provider returned it, lowercased.
+ * Null means the field was absent or unusable — which the audit must read as
+ * "unknown", never as "fine".
+ */
+export async function getMessageDeliveryStatus(
+  messageId: string,
+): Promise<{ complete: boolean; status: string | null }> {
+  if (typeof messageId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(messageId)) {
+    return { complete: false, status: null };
+  }
+  try {
+    const data = await ghlFetch<any>(`/conversations/messages/${encodeURIComponent(messageId)}`);
+    const message = data?.message ?? data;
+    const status = typeof message?.status === "string" ? message.status.trim().toLowerCase() : null;
+    return { complete: status !== null, status: status || null };
+  } catch {
+    // An unreadable outcome is not a failed delivery and not a successful one.
+    return { complete: false, status: null };
+  }
 }
 
 /**

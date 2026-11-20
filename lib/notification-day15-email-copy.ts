@@ -89,3 +89,27 @@ export function renderDay15EmailBody(
   if (!bodyMakesNoFeeClaim(body)) throw new Error("day15_email_rendered_body_claims_a_fee");
   return body;
 }
+
+/**
+ * The same approved words, as the HTML GoHighLevel actually accepts.
+ *
+ * WHY THIS EXISTS. GoHighLevel's `POST /conversations/messages` rejects an
+ * Email whose only content is the `message` field: it answers 422
+ * CONVERSATIONS_MSG_NO_CONTENT, "There is no message or attachments for this
+ * message. Skip sending." Observed live on 2026-11-17 with the exact Day 15
+ * payload. An Email must carry `html`. So the plain body stays the reviewed
+ * artefact — it is what the fee-claim and shape checks read — and this is the
+ * only permitted transformation of it on the way to the wire.
+ *
+ * It adds no words. It escapes the five HTML metacharacters and turns each
+ * newline into a line break, and nothing else. Deterministic, so the pre-send
+ * re-render produces a byte-identical result and drift is still detectable.
+ */
+export function day15EmailHtmlFromPlain(plainBody: string): string {
+  if (typeof plainBody !== "string" || !plainBody.length) throw new Error("day15_email_html_requires_a_body");
+  if (!bodyMakesNoFeeClaim(plainBody)) throw new Error("day15_email_html_body_claims_a_fee");
+  const escaped = plainBody
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  return escaped.split("\n").join("<br>\n");
+}

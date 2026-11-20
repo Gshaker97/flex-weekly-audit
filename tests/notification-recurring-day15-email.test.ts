@@ -253,11 +253,18 @@ test("one fee-free email per invoice, live balance and live link rendered", () =
   assert.equal(wire.emailTo, "owner@example.test");
   assert.equal(wire.subject, PROPOSED_DAY15_EMAIL_SUBJECT);
   assert.equal(wire.status, "pending");
+  // GoHighLevel refuses an Email carrying only `message` (422
+  // CONVERSATIONS_MSG_NO_CONTENT), so the content rides in `html`.
+  assert.equal(wire.message, undefined);
+  assert.equal(typeof wire.html, "string");
   // Live balance: Jobber's $240.50 rendered as 24050 minor units, plus the live link.
-  assert.match(wire.message, /USD 240\.50/);
-  assert.match(wire.message, /clienthub\.getjobber\.com/);
+  assert.match(wire.html, /USD 240\.50/);
+  assert.match(wire.html, /clienthub\.getjobber\.com/);
+  // The approved words, unchanged apart from line breaks.
+  assert.match(wire.html, /Thank you,<br>/);
+  assert.ok(wire.html.endsWith("Flexx Landscaping"));
   // No fee claim of any kind.
-  assert.doesNotMatch(wire.message, /fee|3%|charge/i);
+  assert.doesNotMatch(wire.html, /fee|3%|charge/i);
   assert.equal(f.db.rows[0].state, "accepted");
   assert.equal(f.db.rows[0].dayPastDue, 15);
   assert.equal(f.db.rows[0].channel, "email");
@@ -282,9 +289,20 @@ test("a zero balance is never emailed", () => clock(async tick => {
 
 // --- consent / opt-out ----------------------------------------------------
 
-test("a contact with no Email DND entry holds: unknown is not consent", () => clock(async tick => {
+// Changed 2026-11-18 by the account owner's decision: an absent Email entry is
+// permission to send. The explicit opt-out test below is unchanged and still
+// blocks, and a present-but-malformed entry still holds.
+test("a contact with no Email DND entry now sends: absence is permission", () => clock(async tick => {
   const f = fixture(tick);
   f.data.contacts[0].dndSettings = { SMS: { status: "inactive" } };
+  const r = await f.run().run();
+  assert.equal(f.state.posts, 1);
+  assert.equal(r.invoices[0].result?.state, "accepted");
+}));
+
+test("a present but unreadable Email entry still holds, with no post", () => clock(async tick => {
+  const f = fixture(tick);
+  f.data.contacts[0].dndSettings = { Email: { status: "opted_in" } };
   const r = await f.run().run();
   assert.equal(f.state.posts, 0);
   assert.notEqual(r.invoices[0].result?.state, "accepted");

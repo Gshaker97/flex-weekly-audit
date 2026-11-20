@@ -93,21 +93,89 @@ export const APPROVED_DAY15_SMS_BODY =
   "office at 602-329-7865.";
 
 /**
+ * OUR Day 15 text, approved by the account owner 2026-11-18, and the one the
+ * rollout uses. Pinned here beside the legacy copy so any drift is visible.
+ *
+ * It is the company's own written Day 15 wording with ONE clause changed, and
+ * the reason for the change is a measurement, not a preference. The policy
+ * document says "A late fee of 3% HAS BEEN APPLIED". Measured on 2026-11-18
+ * across the 27 unpaid invoices already past day 15, exactly TWO carried a Late
+ * Fee line item (#6872 and #6884, both charged correctly at 3%: $99 -> $101.97
+ * and $137 -> $141.11). For the other 25 the sentence would have been false,
+ * and the message shows a live Jobber balance with no fee in it — so the
+ * customer would read a fee claim while looking at an invoice that contradicts
+ * it. The owner chose the warning wording for everyone instead.
+ *
+ * So this copy WARNS and never ASSERTS. It names no amount, which is why it
+ * needs no currency policy and no rendering. Asserting the fee requires the
+ * `day15-fee-applied` policy and Jobber's arithmetic proof, untouched above.
+ */
+export const PROPOSED_DAY15_SMS_FEE_WARNING_BODY =
+  "This is your reminder that your invoice is past due. A late fee of 3% may apply, " +
+  "and we kindly ask this invoice be paid to avoid any late fees. If you have any " +
+  "questions or concerns please reach out to our office at 602-329-7865.";
+
+/**
+ * Pinned copy that deliberately names no amount, so there is nothing to render
+ * and nothing to render wrong. Both the legacy approved text and ours qualify.
+ * A single predicate because three separate places ask this question, and a
+ * copy of the answer in each is how the two drift apart.
+ */
+export function day15StaticCopyNamesNoAmount(body: unknown): boolean {
+  return body === APPROVED_DAY15_SMS_BODY || body === PROPOSED_DAY15_SMS_FEE_WARNING_BODY;
+}
+
+/**
  * The approved copy does not just warn about a fee -- it says the fee applies
  * "under your invoice terms". That is a claim about the invoice. If the terms
  * say nothing about a late fee, the sentence is not true, so the warning needs
  * its own evidence, taken from Jobber.
  */
-export type Day15TermsEvidence = Readonly<{
-  source: "jobber-invoice-terms";
-  invoiceId: string;
-  /** The terms text as Jobber returned it. Must itself support the claim. */
-  termsExcerpt: string;
-  /** Must be true, AND must be visible in termsExcerpt. Asserting it is not enough. */
-  statesLateFee: true;
-  observedAt: string;
-  evidenceRef: string;
-}>;
+/**
+ * What may back a "a late fee may apply" warning. TWO sources, since 2026-11-18
+ * on the account owner's instruction ("change that code to allow late fees
+ * regardless").
+ *
+ * Before that, only Jobber's own invoice-terms field counted, and the owner's
+ * written Late Fee policy explicitly did not. That was too strict: the fee is
+ * real and set by the company's published policy, and whether Jobber's terms
+ * field happens to repeat it is a bookkeeping detail, not the thing that makes
+ * the fee true.
+ *
+ * What did NOT change, and must not: the excerpt still has to SAY a late fee
+ * exists. `statesLateFee: true` is an assertion, not proof, so the text is read
+ * either way. A blank or silent policy still backs nothing. And a company
+ * policy cannot reach backwards: an invoice issued before the policy took
+ * effect was never subject to it, so `effectiveFrom` is compared against the
+ * invoice's issue date.
+ */
+export type Day15TermsEvidence =
+  | Readonly<{
+      source: "jobber-invoice-terms";
+      /** Must equal the invoice the reminder is about. */
+      invoiceId: string;
+      /** The terms text as Jobber returned it. Must itself support the claim. */
+      termsExcerpt: string;
+      /** Must be true, AND must be visible in termsExcerpt. Asserting it is not enough. */
+      statesLateFee: true;
+      observedAt: string;
+      evidenceRef: string;
+    }>
+  | Readonly<{
+      source: "company-late-fee-policy";
+      /** Where the policy lives, so a person can go and read the same words. */
+      policyRef: string;
+      /**
+       * The date the policy took effect, YYYY-MM-DD. An invoice issued before
+       * this date is not covered by it and the warning is refused.
+       */
+      effectiveFrom: string;
+      /** The policy wording that states the fee. Must itself support the claim. */
+      termsExcerpt: string;
+      statesLateFee: true;
+      observedAt: string;
+      evidenceRef: string;
+    }>;
 
 /**
  * A record that this homeowner agreed to receive billing texts.
@@ -221,17 +289,68 @@ export function bodyMakesNoFeeClaim(body: unknown): boolean {
   return !FEE_MENTION.test(body) && !FEE_ASSERTED.test(body) && !FEE_CONDITIONAL.test(body);
 }
 
+/**
+ * True only when the body WARNS about a fee and does not CLAIM one was charged.
+ *
+ * Exported so the copy can be asserted wherever it is used, against the one set
+ * of fee patterns in this file rather than a second copy of them elsewhere. The
+ * ledger's `eventKey` had exactly that shape of bug: an inlined duplicate of a
+ * definition that silently drifted from the original. One definition, many
+ * callers.
+ */
+export function day15SmsCopyWarnsWithoutClaiming(body: unknown): boolean {
+  if (typeof body !== "string" || !body.trim() || body.includes("\0")) return false;
+  if (Buffer.byteLength(body, "utf8") > 4000) return false;
+  // It has to mention a fee (otherwise it belongs under the no-fee-claim
+  // policy), say so conditionally, and never assert one was applied.
+  return FEE_MENTION.test(body) && FEE_CONDITIONAL.test(body) && !FEE_ASSERTED.test(body);
+}
+
 /** The terms text must itself mention a late fee. `statesLateFee: true` alone is a claim, not proof. */
 const TERMS_STATE_A_FEE = /\b(late fee|late charge|finance charge|past[- ]due (?:fee|charge)|3\s?%)\b/i;
-export function termsEvidenceSupportsWarning(evidence: Day15TermsEvidence | null, invoiceId: string): boolean {
-  if (!evidence || !keys(evidence, ["source", "invoiceId", "termsExcerpt", "statesLateFee", "observedAt", "evidenceRef"])) return false;
-  if (evidence.source !== "jobber-invoice-terms") return false;
-  if (!text(evidence.invoiceId) || evidence.invoiceId !== invoiceId) return false;
-  if (evidence.statesLateFee !== true) return false;
-  if (typeof evidence.termsExcerpt !== "string" || !evidence.termsExcerpt.trim() ||
-      evidence.termsExcerpt.length > 4000) return false;
-  if (!Number.isFinite(instant(evidence.observedAt)) || !text(evidence.evidenceRef)) return false;
-  return TERMS_STATE_A_FEE.test(evidence.termsExcerpt);
+const DAY = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * May this configuration warn that a late fee applies?
+ *
+ * `invoiceIssuedOn` is the invoice's own issue date and is REQUIRED for the
+ * company-policy source, because that is what stops the policy being applied
+ * retroactively. It is deliberately not optional-and-skipped: a missing date
+ * returns false rather than waving the check through, so plumbing it wrong
+ * fails closed instead of silently widening who can be warned about a fee.
+ */
+export function termsEvidenceSupportsWarning(
+  evidence: Day15TermsEvidence | null,
+  invoiceId: string,
+  invoiceIssuedOn?: string | null,
+): boolean {
+  if (!evidence || typeof evidence !== "object") return false;
+  // Shared requirements, whichever source it came from.
+  const shared = (e: { statesLateFee: unknown; termsExcerpt: unknown; observedAt: unknown; evidenceRef: unknown }) =>
+    e.statesLateFee === true &&
+    typeof e.termsExcerpt === "string" && !!e.termsExcerpt.trim() && e.termsExcerpt.length <= 4000 &&
+    Number.isFinite(instant(e.observedAt as string)) && text(e.evidenceRef as string) &&
+    // The words have to say it. This is the check that survived the widening.
+    TERMS_STATE_A_FEE.test(e.termsExcerpt);
+
+  if (evidence.source === "jobber-invoice-terms") {
+    if (!keys(evidence, ["source", "invoiceId", "termsExcerpt", "statesLateFee", "observedAt", "evidenceRef"])) return false;
+    if (!text(evidence.invoiceId) || evidence.invoiceId !== invoiceId) return false;
+    return shared(evidence);
+  }
+
+  if (evidence.source === "company-late-fee-policy") {
+    if (!keys(evidence, ["source", "policyRef", "effectiveFrom", "termsExcerpt", "statesLateFee", "observedAt", "evidenceRef"])) return false;
+    if (!text(evidence.policyRef)) return false;
+    if (typeof evidence.effectiveFrom !== "string" || !DAY.test(evidence.effectiveFrom)) return false;
+    // A policy covers invoices issued on or after the day it took effect, and
+    // no others. Without a readable issue date we cannot tell, so we refuse.
+    if (typeof invoiceIssuedOn !== "string" || !DAY.test(invoiceIssuedOn)) return false;
+    if (invoiceIssuedOn < evidence.effectiveFrom) return false;
+    return shared(evidence);
+  }
+
+  return false;
 }
 
 /**
@@ -294,7 +413,8 @@ function readiness(raw: string | undefined, review?: Day15PilotReview): { result
     // The approved static copy names no amount, so it needs no currency policy
     // and no balance placeholder. Anything else renders money and needs both.
     // `permitsUnknownCurrency` covers day 10 homeowner SMS only, never day 15.
-    const isApprovedStaticCopy = c.template?.body === APPROVED_DAY15_SMS_BODY;
+    // Either pinned text that names no amount: the legacy approved copy or ours.
+    const isApprovedStaticCopy = day15StaticCopyNamesNoAmount(c.template?.body);
     const currency = c.currencyPolicy;
     const validCurrency = keys(currency, ["accountId", "invoiceId", "currency", "minorUnitExponent", "evidenceRef"]) &&
       currency?.accountId === accountId && currency?.invoiceId === s?.scope?.invoiceId &&
@@ -335,8 +455,13 @@ function readiness(raw: string | undefined, review?: Day15PilotReview): { result
       check(!asserts, "may_apply_copy_must_not_assert_a_fee_was_applied");
       check(mentions && conditional, "may_apply_copy_must_state_the_condition_explicitly");
       check(c.feeEvidence === null, "may_apply_policy_requires_null_fee_evidence");
-      check(typeof invoiceId === "string" && termsEvidenceSupportsWarning(c.termsEvidence ?? null, invoiceId),
-        "jobber_invoice_terms_must_support_the_fee_warning");
+      // Either Jobber's invoice terms OR the company's written late-fee policy
+      // may back the warning (widened 2026-11-18 on the owner's instruction).
+      // The policy route needs the invoice's issue date so a policy cannot be
+      // applied to an invoice that predates it.
+      check(typeof invoiceId === "string" &&
+        termsEvidenceSupportsWarning(c.termsEvidence ?? null, invoiceId, s?.originalInvoice?.issuedDate ?? null),
+        "invoice_terms_or_written_policy_must_support_the_fee_warning");
       feeClaim = "not_claimed_gate_will_hold";
       claimedFacts = Object.freeze([]);
     } else if (t?.policy === "day15-no-fee-claim") {
@@ -410,7 +535,7 @@ export function renderDay15Body(config: Day15PilotConfig,
   snapshot: Readonly<{ balanceMinor: number; invoiceNumber?: string | null; dueOn: string }>): string {
   if (!minor(snapshot.balanceMinor)) throw new Error("day15_requires_positive_balance");
   // The approved static copy names no amount. Nothing to render, nothing to get wrong.
-  if (config.template.body === APPROVED_DAY15_SMS_BODY) return config.template.body;
+  if (day15StaticCopyNamesNoAmount(config.template.body)) return config.template.body;
   if (!config.currencyPolicy) throw new Error("monetary_rendering_requires_reviewed_currency");
   if (config.template.body.includes("{{invoiceNumber}}") && !snapshot.invoiceNumber) throw new Error("invoice_display_number_required");
   const balance = `${config.currencyPolicy.currency} ${Math.floor(snapshot.balanceMinor / 100)}.${String(snapshot.balanceMinor % 100).padStart(2, "0")}`;

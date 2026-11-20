@@ -30,6 +30,7 @@ export const INVOICE_LINKED_JOBS_QUERY = `query InvoiceLinkedJobs($id: EncodedId
     dueDate
     amounts { total invoiceBalance }
     client { id }
+    lineItems(first: 50) { totalCount nodes { name } }
     jobs(first: 25, after: $after) {
       totalCount
       pageInfo { hasNextPage endCursor }
@@ -86,6 +87,21 @@ export interface LinkedJobsResult {
   balanceCents: number | null;
   clientId: string | null;
   jobs: LinkedJob[];
+  /**
+   * The invoice's own line item names, trimmed, empties dropped.
+   *
+   * WHY THEY ARE HERE. Measured on 2026-11-18 across the 20 invoices then held
+   * as unverifiable: 1 of 20 jobs carried a title, 0 carried instructions, and
+   * 2 carried a note with any words in it. The notes themselves were not
+   * missing - those jobs had 26 and 34 of them - but all 152 inspected carried
+   * a photo and no message. Flexx crews document with pictures. Not one note in
+   * 266 contained a rework or warranty word, so there was no evidence being
+   * missed; it was never written. Line item names, by contrast, exist on all 20
+   * and say what was billed. They are the readable description of the work.
+   */
+  lineItemNames: string[];
+  /** False when the invoice carries more line items than one page could read. */
+  lineItemsComplete: boolean;
   /** False when any page cap was hit or any read failed. The caller must hold. */
   complete: boolean;
   reason: string | null;
@@ -138,7 +154,8 @@ async function readJobNotes(jobId: string, gql: JobberReader) {
 export async function readLinkedJobText(invoiceId: string, gql: JobberReader): Promise<LinkedJobsResult> {
   const result: LinkedJobsResult = {
     invoiceId, invoiceNumber: null, invoiceStatus: null, issuedDate: null, dueDate: null,
-    totalCents: null, balanceCents: null, clientId: null, jobs: [], complete: true, reason: null,
+    totalCents: null, balanceCents: null, clientId: null, jobs: [],
+    lineItemNames: [], lineItemsComplete: true, complete: true, reason: null,
   };
   // jobId -> node, so a job listed in both connections is one job.
   const seen = new Map<string, { node: any; archived: boolean }>();
@@ -162,6 +179,14 @@ export async function readLinkedJobText(invoiceId: string, gql: JobberReader): P
       result.totalCents = cents(invoice.amounts?.total);
       result.balanceCents = cents(invoice.amounts?.invoiceBalance);
       result.clientId = str(invoice.client?.id);
+      const lineItems = invoice.lineItems;
+      const names = Array.isArray(lineItems?.nodes) ? lineItems.nodes : [];
+      result.lineItemNames = names
+        .map((node: any) => str(node?.name))
+        .filter((name: string | null): name is string => typeof name === "string" && name.trim().length > 0)
+        .map((name: string) => name.trim());
+      // More line items than one page holds, rather than classifying a partial list.
+      result.lineItemsComplete = typeof lineItems?.totalCount !== "number" || lineItems.totalCount <= names.length;
     }
     for (const node of invoice.jobs?.nodes ?? []) {
       if (node?.id && !seen.has(node.id)) seen.set(node.id, { node, archived: false });

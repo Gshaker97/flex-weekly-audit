@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { planNotificationWorklist, NOTIFICATION_WORKLIST_LIMIT, type NotificationWorklistInvoice } from "../lib/notification-worklist";
-import { eventKey } from "../lib/notification-gate";
+import { milestonePlanKey } from "../lib/notification-gate";
 
 const NOW = new Date("2026-11-10T16:05:00.000Z");
 function invoice(id = "synthetic-invoice", tags: readonly string[] | null = []): NotificationWorklistInvoice {
@@ -14,10 +14,13 @@ function invoice(id = "synthetic-invoice", tags: readonly string[] | null = []):
 }
 const plan = (row = invoice(), at = NOW) => planNotificationWorklist([row], at);
 
-test("verified absence of the existing irrigation tag plans the maintenance branch and all six milestones", () => {
+test("verified absence of the existing irrigation tag plans the maintenance branch and all seven milestones", () => {
   const result = plan();
   assert.deepEqual(result.homeowner.map(x => x.dayPastDue), [10, 15, 20, 25, 30]);
-  assert.deepEqual(result.internalDigests.flatMap(d => d.members.map(x => x.dayPastDue)), [21]);
+  // TWO internal steps since 2026-11-18: the day 21 call and the day 35
+  // collections decision. Both are Angie's, and they fall on different dates,
+  // so they are two digests rather than one.
+  assert.deepEqual(result.internalDigests.flatMap(d => d.members.map(x => x.dayPastDue)), [21, 35]);
   assert.equal(result.homeowner[0].scheduledOn, "2026-11-10"); assert.equal(result.homeowner[0].timing, "current_window");
   assert.ok(result.homeowner.every(x => x.category === "maintenance" && !x.dispatchEligible));
   assert.equal(result.coverage, "supplied-invoices-only"); assert.equal(result.sourceCoverageVerified, false);
@@ -25,6 +28,7 @@ test("verified absence of the existing irrigation tag plans the maintenance bran
 test("exact irrigation tag retains only common homeowner Day10/15 and internal Day21", () => {
   const result = plan(invoice("irrigation", ["irrigation"]));
   assert.deepEqual(result.homeowner.map(x => x.dayPastDue), [10, 15]);
+  // Irrigation has no day 35: its ladder stops at the day 21 call.
   assert.equal(result.internalDigests.length, 1); assert.equal(result.internalDigests[0].members[0].dayPastDue, 21);
   assert.ok(result.homeowner.every(x => x.category === "irrigation"));
 });
@@ -70,15 +74,20 @@ test("all conditional copy remains unapproved and required effects are never ass
 test("multiple invoices share one future Angie digest without losing any per-invoice key", () => {
   const rows = [invoice("one", []), invoice("two", ["irrigation"]), invoice("three", null)];
   const result = planNotificationWorklist(rows, NOW), digest = result.internalDigests[0];
-  assert.equal(result.internalDigests.length, 1); assert.equal(digest.members.length, 3);
+  // Day 21 groups all three; day 35 is its own digest and covers only the two
+  // maintenance invoices, since irrigation has no day 35.
+  assert.equal(result.internalDigests.length, 2); assert.equal(digest.members.length, 3);
+  assert.equal(digest.members[0].dayPastDue, 21);
+  assert.deepEqual(result.internalDigests[1].members.map(x => x.dayPastDue), [35, 35]);
   assert.equal(digest.recipientRole, "angie"); assert.equal(digest.templateApproval, "unresolved"); assert.equal(digest.dispatchEligible, false);
-  assert.deepEqual(digest.members.map(x => x.eventKey).sort(), rows.map(row => eventKey({ ...row, dayPastDue: 21, audience: "internal" })).sort());
+  assert.deepEqual(digest.members.map(x => x.eventKey).sort(), rows.map(row => milestonePlanKey({ ...row, dayPastDue: 21, audience: "internal" })).sort());
   assert.ok(digest.runtimeChecks.includes("durably_claim_digest_and_every_member_without_partial_replay"));
 });
 test("separate dates, accounts and locations never merge into one internal digest", () => {
   const a = invoice("a"), b = { ...invoice("b"), dueDate: "2026-11-01" }, c = { ...invoice("c"), accountId: "other-account" },
     d = { ...invoice("d"), locationId: "other-location" };
-  assert.equal(planNotificationWorklist([a, b, c, d], NOW).internalDigests.length, 4);
+  // Four invoices x two internal steps, none of which may merge: 8 digests.
+  assert.equal(planNotificationWorklist([a, b, c, d], NOW).internalDigests.length, 8);
 });
 test("same-contact customer conflicts preserve all invoice events and never choose a winner", () => {
   const a = invoice("a"), b = { ...invoice("b"), homeownerContactId: a.homeownerContactId };

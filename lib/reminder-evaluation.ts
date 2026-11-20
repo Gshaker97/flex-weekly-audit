@@ -4,6 +4,7 @@ import { day15EmailAmountsArePositive, day15EmailIssueWindow } from "./reminder-
 import { classifyLinkedJobRework } from "./reminder-rework-notes";
 import type { LinkedJobsResult } from "./reminder-job-notes-source";
 import { nativeSmsOverlapHolds, type NativeSmsAttestation } from "./reminder-native-sms-overlap";
+import { chooseDestinationByAddress, type AddressParts } from "./reminder-destination-address";
 
 /**
  * Evaluate-only reminder runner.
@@ -59,6 +60,27 @@ export interface SourceInvoice {
   clientId: string | null;
   clientTags: readonly string[] | null;
   lineItemNames: readonly string[] | null;
+  /**
+   * Every email address Jobber holds on the invoice's client, lowercased, as
+   * read live in this same decision. `null` means the list could not be read.
+   *
+   * WHY. Until this existed, the Day 15 email destination came from a
+   * GoHighLevel contact matched on the CACHED customer email or phone, and
+   * nothing compared it with the address Jobber actually bills. A phone-only
+   * match could therefore produce an email address Jobber has never held. Jobber
+   * decides who owes; it also decides where the bill goes.
+   */
+  clientBillingEmails?: readonly string[] | null;
+  /**
+   * Every service address Jobber holds for the client that owns this invoice,
+   * read live in this same decision. `null` means they could not be read.
+   *
+   * WHY. Several GoHighLevel contacts match one email whenever a customer is
+   * several Jobber clients, one per service address — measured 2026-11-18, 32
+   * emails in this account cover more than one client. The address is the only
+   * thing that says which contact is this invoice's. Unreadable is not "none".
+   */
+  clientPropertyAddresses?: readonly AddressParts[] | null;
 }
 export interface DestinationContact {
   /**
@@ -77,6 +99,10 @@ export interface DestinationContact {
   dnd: boolean;
   phone: string | null;
   email: string | null;
+  /** Compared with the Jobber property address to break an email/phone tie. */
+  street1?: string | null;
+  city?: string | null;
+  postalCode?: string | null;
 }
 export interface DestinationCard { id: string; stage: string | null; status: string | null }
 
@@ -125,7 +151,17 @@ export interface ReminderEvaluationReaders {
    * "nothing was sent".
    */
   sendHistory?(candidate: ReminderCandidate,
-    context?: { issuedDate: string | null }): Promise<SendHistory | null>;
+    context?: {
+      issuedDate: string | null;
+      /**
+       * The contact the evaluation settled on, when several matched the email
+       * or phone and the Jobber property address resolved which one. Without
+       * it the reader cannot read a history at all for those rows, because it
+       * would not know whose history to read. The reader still verifies this id
+       * is one of the exact matches; it is a tie-break, not a free choice.
+       */
+      contactId?: string | null;
+    }): Promise<SendHistory | null>;
   /**
    * Every job Jobber links to this invoice, with each job's own notes. Required
    * by the Day 15 email path: the warranty / no-charge rule is re-read from
@@ -215,6 +251,25 @@ export async function evaluateReminders(input: {
    * this module does not decide channel policy. Absent, null or empty holds.
    */
   milestoneChannels?(step: { dayPastDue: number; audience: string }): readonly SendChannel[] | null;
+  /**
+   * Told the destination this evaluation settled on, for a caller that has to
+   * ACT on the result rather than report it.
+   *
+   * WHY IT IS A CALLBACK AND NOT A FIELD ON THE ROW. Rows are printed to logs
+   * and recorded against the run, so they deliberately carry no phone number,
+   * no email address and no contact id. A caller that must actually send needs
+   * exactly that, and only in memory. Keeping it out here means adding a
+   * destination to a row can never be the accidental way a customer's phone
+   * number reaches a log file.
+   *
+   * It fires only once a single contact has been resolved - never for an
+   * ambiguous or missing destination - and it is told nothing about whether the
+   * row ended up eligible. The caller must still read the row's decision; being
+   * told a destination is not permission to use it.
+   */
+  onDestinationResolved?(detail: Readonly<{
+    jobberInvoiceId: string; contactId: string; phone: string | null; email: string | null;
+  }>): void;
   /**
    * MIRRORS the send path's `feeClaimFreeDay15` exemption in notification-gate.ts.
    *
@@ -366,27 +421,69 @@ export async function evaluateReminders(input: {
     const contacts = await readers.matchContacts(candidate);
     let contactTags: readonly string[] | null = null;
     let soleContactId: string | null = null;
+    // Several contacts can match one email or phone because one person may be
+    // several Jobber clients, one per service address. Nothing is merged; the
+    // address Jobber holds for THIS invoice's client decides, and only when it
+    // points at exactly one of them. Anything less still holds.
+    const chosen = contacts.length > 1
+      ? chooseDestinationByAddress({
+          contacts: contacts.map(contact => ({
+            id: contact.id, street1: contact.street1,
+            city: contact.city, postalCode: contact.postalCode,
+          })),
+          propertyAddresses: Object.prototype.hasOwnProperty.call(source, "clientPropertyAddresses")
+            ? source.clientPropertyAddresses ?? null
+            : null,
+        })
+      : null;
+    const resolved = chosen?.contactId
+      ? contacts.filter(contact => contact.id === chosen.contactId)
+      : contacts;
     if (contacts.length === 0) {
       holds.push("no_exact_destination_contact");
-    } else if (contacts.length > 1) {
-      // Not merged, not chosen. Held, with the count visible.
-      holds.push(`ambiguous_destination_contacts: ${contacts.length} exact matches, not merged`);
+    } else if (resolved.length !== 1) {
+      // Not merged, not guessed. Held, with the count and the reason visible.
+      holds.push(`ambiguous_destination_contacts: ${contacts.length} exact matches, not merged` +
+        (chosen ? ` (${chosen.reason})` : ""));
     } else {
-      const contact = contacts[0];
+      const contact = resolved[0];
       contactTags = contact.tags;
       soleContactId = contact.id;
+      // Handed to the caller in memory only. Never placed on the row, which is
+      // logged and recorded. A thrown callback must not change an evaluation.
+      try {
+        input.onDestinationResolved?.({
+          jobberInvoiceId: candidate.jobberInvoiceId, contactId: contact.id,
+          phone: contact.phone ?? null, email: contact.email ?? null,
+        });
+      } catch { /* a caller's bookkeeping failure is not an evaluation outcome */ }
       // The opt-out check is NOT part of the relaxation and always runs.
       if (contact.dnd) holds.push("destination_contact_opted_out");
       // Email consent, read exactly as the sender reads it. Absent is unknown,
       // and unknown is not consent.
       if (day15EmailPath) {
+        // The address has to be an address, and it has to be one Jobber bills.
+        const destination = typeof contact.email === "string" ? contact.email.trim().toLowerCase() : "";
+        if (!destination || !/^[^\s@]+@[^\s@.]+(?:\.[^\s@.]+)+$/.test(destination)) {
+          holds.push("destination_contact_has_no_email");
+        } else if (!Object.prototype.hasOwnProperty.call(source, "clientBillingEmails") ||
+            source.clientBillingEmails === null || !Array.isArray(source.clientBillingEmails)) {
+          holds.push("jobber_billing_emails_unreadable");
+        } else if (!source.clientBillingEmails.length) {
+          holds.push("jobber_holds_no_billing_email");
+        } else if (!source.clientBillingEmails
+            .some(address => typeof address === "string" && address.trim().toLowerCase() === destination)) {
+          holds.push("destination_email_not_a_jobber_billing_email");
+        }
         const status = typeof contact.emailDndStatus === "string"
           ? contact.emailDndStatus.toLowerCase() : null;
+        // Blank is permission to send, by the account owner's decision of
+        // 2026-11-18. An explicit opt-out always blocks; a value we cannot read
+        // still holds, because unreadable is not blank.
         if (status === "active" || status === "permanent") {
           holds.push("destination_contact_email_opted_out");
-        } else if (status !== "inactive") {
-          holds.push(`destination_contact_email_consent_unknown: ` +
-            `${status === null ? "no Email entry in GoHighLevel" : status}`);
+        } else if (status !== null && status !== "inactive") {
+          holds.push(`destination_contact_email_consent_unknown: ${status}`);
         }
       }
       if (!day15EmailPath) {
@@ -506,7 +603,8 @@ export async function evaluateReminders(input: {
     }
 
     const history = readers.sendHistory
-      ? await readers.sendHistory(candidate, { issuedDate: source.issuedDate })
+      ? await readers.sendHistory(candidate,
+          { issuedDate: source.issuedDate, contactId: soleContactId })
       : null;
     if (!history) {
       holds.push("send_history_unavailable: cannot prove this milestone was not already sent");

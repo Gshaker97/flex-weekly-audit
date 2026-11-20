@@ -15,12 +15,27 @@ import { recordReminderEvaluation } from "../lib/reminder-evaluation-store";
 import { COLLECTIONS_SINCE } from "../lib/lateInvoices";
 
 /**
- * Which channels a milestone uses. OBSERVED in the GoHighLevel "Fixed
- * Automation" workflow on 2026-11-13 - day 21 has both an email step and an
- * internal SMS step - and NOT approved policy. It is not pinned anywhere and it
- * cannot cause a send: this entrypoint has no send path. It exists only to key
- * duplicate suppression per channel, so an email already sent cannot cancel the
- * SMS and vice versa. Needs confirmation before any cutover.
+ * Which channels a milestone uses, FOR DUPLICATE SUPPRESSION ONLY. Originally
+ * OBSERVED in the GoHighLevel "Fixed Automation" workflow on 2026-11-13, where
+ * day 21 has both an email step and an internal SMS step. It cannot cause a
+ * send: this entrypoint has no send path. It exists to key prior-send checks per
+ * channel, so an email already sent cannot cancel the SMS and vice versa.
+ *
+ * DAY 21 IS NOW A TASK ONLY - decided by the account owner on 2026-11-19 and
+ * pinned in `notification-ladder-sender-policy.ts`. Day 21 delivers one task for
+ * Angie and no customer message at all.
+ *
+ * Day 21 deliberately still declares both channels HERE, and that is not a
+ * contradiction. These channels describe the LEGACY messages this run must look
+ * for in the history: the workflow has been sending a day 21 email and internal
+ * SMS for months, and the evaluator has to keep recognising them to report
+ * honestly on what already went out. Declaring no channel would not say "this
+ * is a task" - the evaluator holds an empty channel policy as
+ * `milestone_channels_undeclared`, which would read as a fault rather than a
+ * task.
+ *
+ * What delivers is decided by `ladderDelivery()`, never by this list. Any runner
+ * that acts must ask the policy, not infer intent from these channels.
  */
 const MILESTONE_CHANNELS = (step: { dayPastDue: number; audience: string }): readonly SendChannel[] =>
   step.dayPastDue === 21 ? ["email", "sms"] : ["sms"];

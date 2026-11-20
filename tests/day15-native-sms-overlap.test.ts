@@ -154,6 +154,7 @@ const SOURCE = {
   invoiceStatus: "past_due", totalCents: 16000, balanceCents: 16000,
   issuedDate: ISSUED, dueDate: "2026-11-10",
   clientId: "cli-1", clientTags: ["Maintenance"], lineItemNames: ["Lawn service"],
+  clientBillingEmails: ["a@example.com"],
 };
 const CANDIDATE = { jobberInvoiceId: "inv-1", invoiceNumber: "7226", clientName: "A",
   jobberClientId: "cli-1", email: "a@example.com", phone: "+16025550100" };

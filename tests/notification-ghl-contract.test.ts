@@ -16,7 +16,8 @@ const binding = (channel: "sms" | "email" = "sms"): GhlMessageBinding => ({
   accountId: "synthetic-account", locationId: "synthetic-location", contactId: "synthetic-contact", channel,
   destination: channel === "sms" ? "+16025550111" : "homeowner@example.test",
   sender: channel === "sms" ? "+16025550122" : "billing@example.test",
-  eventKey: '["notification-v1","synthetic-account","invoice-1",10,"homeowner"]', invoiceId: "invoice-1", bodyHash: digest(BODY),
+  eventKey: JSON.stringify(["notification-v2", "synthetic-account", "invoice-1", 10, "homeowner", channel]),
+  invoiceId: "invoice-1", bodyHash: digest(BODY),
 });
 function contact(patch: Record<string, unknown> = {}) {
   return { contact: { id: "synthetic-contact", locationId: "synthetic-location", phone: "+16025550111",
@@ -76,10 +77,12 @@ for (const channel of ["sms", "email"] as const) {
       const blocked = { contact: { ...body.contact, dndSettings: { [key]: { status } } } };
       assert.equal(parseGhlRecipient({ version: VERSION, body: blocked, expected }).state, "blocked");
     }
+    // 2026-11-18: an absent channel entry is permission to send on BOTH channels,
+    // by the account owner's decision. It was previously SMS-only.
     delete (body.contact as Record<string, unknown>).dndSettings;
     const missing = parseGhlRecipient({ version: VERSION, body, expected });
-    assert.equal(missing.state, channel === "sms" ? "allowed" : "held");
-    assert.deepEqual(missing.reasons, channel === "sms" ? [] : ["channel_dnd_unknown"]);
+    assert.equal(missing.state, "allowed");
+    assert.deepEqual(missing.reasons, []);
     for (const malformed of [undefined, null, 0, "false"]) {
       const result = parseGhlRecipient({ version: VERSION, body: contact({ dnd: malformed }), expected });
       assert.equal(result.state, "held");
@@ -170,13 +173,23 @@ test("all selected-channel case variants and conflicts hold before SMS omission;
   const nonenumerableAlias = Object.defineProperty({}, "Sms", { value: { status: "active" } });
   assert.equal(parseGhlRecipient({ version: VERSION, body: contact({ dndSettings: nonenumerableAlias }), expected: binding() }).state, "held");
 });
-test("Email omission stays held and canonical unrelated-channel settings remain independent", () => {
+test("Email omission now sends, and unrelated-channel settings stay independent", () => {
+  // Changed 2026-11-18: an absent Email entry is permission. A global dnd still
+  // blocks regardless, which is what the `global === true` branch pins.
   for (const absentSettings of [false, true]) for (const global of [false, true, "absent"] as const) {
     const body = contact({ dnd: global, dndSettings: { SMS: { status: "inactive" } } });
     if (absentSettings) delete (body.contact as Record<string, unknown>).dndSettings;
     if (global === "absent") delete (body.contact as Record<string, unknown>).dnd;
     const result = parseGhlRecipient({ version: VERSION, body, expected: binding("email") });
-    assert.equal(result.state, global === true ? "blocked" : "held"); assert.ok(result.reasons.includes("channel_dnd_unknown"));
+    assert.equal(result.state, global === true ? "blocked" : "allowed");
+    assert.ok(!result.reasons.includes("channel_dnd_unknown"));
+  }
+  // A PRESENT but unreadable Email entry is still not an absent one.
+  for (const status of ["", "opted_in", "Inactive", "unknown"]) {
+    const held = parseGhlRecipient({ version: VERSION,
+      body: contact({ dndSettings: { Email: { status } } }), expected: binding("email") });
+    assert.equal(held.state, "held", status);
+    assert.ok(held.reasons.includes("channel_dnd_unknown"), status);
   }
   for (const other of [undefined, null, {}, { status: "active" }, { status: "permanent" }, { status: "unknown" }]) {
     assert.equal(parseGhlRecipient({ version: VERSION, body: contact({ dndSettings: { Email: other } }), expected: binding() }).state, "allowed");
@@ -204,7 +217,8 @@ test("inbound-only DND neither creates nor removes an outbound SMS override", ()
     const body = contact({ inboundDndSettings: { all: { status } } });
     delete (body.contact as Record<string, unknown>).dnd; delete (body.contact as Record<string, unknown>).dndSettings;
     assert.equal(parseGhlRecipient({ version: VERSION, body, expected: binding() }).state, "allowed");
-    assert.equal(parseGhlRecipient({ version: VERSION, body, expected: binding("email") }).state, "held");
+    // Email with no entry at all now sends, as SMS already did (2026-11-18).
+    assert.equal(parseGhlRecipient({ version: VERSION, body, expected: binding("email") }).state, "allowed");
     assert.equal(parseGhlRecipient({ version: VERSION, body: { contact: { ...body.contact, dnd: true } }, expected: binding() }).state, "blocked");
     assert.equal(parseGhlRecipient({ version: VERSION, body: { contact: { ...body.contact, dndSettings: { SMS: {} } } }, expected: binding() }).state, "held");
   }

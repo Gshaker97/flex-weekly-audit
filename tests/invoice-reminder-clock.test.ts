@@ -70,10 +70,34 @@ test("one overdue invoice retains precedence over a later unpaid cycle", () => {
 
 test("first text is due plus ten, not stage entry plus ten; no Day 2 text", () => {
   const steps = invoiceReminderMilestones("maintenance", "2026-11-01", "2026-11-08", new Date("2026-11-09T12:00:00Z"))!;
-  assert.deepEqual(steps.map(s => s.dayPastDue), [10, 15, 20, 21, 25, 30]);
+  assert.deepEqual(steps.map(s => s.dayPastDue), [10, 15, 20, 21, 25, 30, 35]);
   assert.equal(steps[0].scheduledOn, "2026-11-18");
   assert.equal(steps.find(s => s.dayPastDue === 21)?.audience, "internal");
   assert.ok(steps.every(s => s.timing === "future"));
+});
+
+/**
+ * Day 35 is the collections DECISION, added 2026-11-18. The policy says an
+ * unpaid invoice goes to collections at 35 days; that is a person's call, so
+ * the step is internal and raises a task rather than referring anything.
+ */
+test("day 35 is an internal collections step, not a customer text", () => {
+  const steps = invoiceReminderMilestones("maintenance", "2026-11-01", "2026-11-08", new Date("2026-11-09T12:00:00Z"))!;
+  const day35 = steps.find(s => s.dayPastDue === 35)!;
+  assert.equal(day35.audience, "internal");
+  assert.equal(day35.scheduledOn, "2026-12-13");
+  assert.deepEqual([...day35.requiredFacts], ["collections_after_day_35_policy"]);
+  // Both internal steps, and only those two, are internal.
+  assert.deepEqual(steps.filter(s => s.audience === "internal").map(s => s.dayPastDue), [21, 35]);
+});
+
+test("the ladder matches the written policy's day numbers exactly", () => {
+  // Jobber emails at 3 and 6 (Jobber's own, not ours), texts at 10/15/20/25/30,
+  // a call at 21, collections at 35. Nothing between, nothing after.
+  const steps = invoiceReminderMilestones("maintenance", "2026-11-01", "2026-11-08", new Date("2026-11-09T12:00:00Z"))!;
+  const texts = steps.filter(s => s.audience === "homeowner").map(s => s.dayPastDue);
+  assert.deepEqual(texts, [10, 15, 20, 25, 30]);
+  assert.ok(!steps.some(s => s.dayPastDue === 3 || s.dayPastDue === 6), "days 3 and 6 are Jobber's own emails");
 });
 
 test("irrigation has only two homeowner texts and day21 internal prompt", () => {

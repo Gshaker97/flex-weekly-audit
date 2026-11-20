@@ -41,6 +41,7 @@ import {
 import { phoneSourcePlan, readPhoneInvoiceEvidence } from "./ghl-phone-state";
 import { canonicalPhone, matchPhoneCustomer, phoneMayShareOwner } from "./ghl-phone-match";
 import { log, logError } from "./log";
+import { planCardCreation, describeCardCreation, CARD_CREATION_STAGE } from "./ghl-card-creation-plan";
 
 // Backfill scope: when set to a Date, invoices are pulled in full but limited to
 // those issued on/after it (instead of the incremental updatedAt filter). null =
@@ -759,8 +760,39 @@ export async function syncGhlInvoicePipeline(opts: {
     const identityHold = strictGhlIdentityHold(customer, customers, contacts, contactId);
     if (identityHold) { holdCards(identityHold, candidateIds, customer); return; }
     const matchingCards = cards.filter(card => card.contactId === contactId);
-    if (matchingCards.length !== 1) {
-      holdCards(matchingCards.length ? "Multiple existing cards, including closed statuses" : "No existing card; creation disabled", candidateIds, customer); return;
+    if (matchingCards.length > 1) {
+      holdCards("Multiple existing cards, including closed statuses", candidateIds, customer); return;
+    }
+    if (!matchingCards.length) {
+      // A customer with unpaid invoices and no card is INVISIBLE on a board
+      // whose whole purpose is showing who owes money, and the reminder
+      // evaluator will not text anyone whose card is not in the Overdue stage.
+      // So instead of reporting "creation disabled" and moving on, work out
+      // what the card would be and report it.
+      //
+      // Still a read: this branch plans and never creates. The target stage is
+      // always "Invoice Sent" and never "Invoice Overdue", because the legacy
+      // Fixed Automation workflow is triggered by an opportunity event - a card
+      // appearing straight in Overdue can enrol the customer and fire reminders
+      // at them, while the Sent transition provably cannot. See
+      // lib/ghl-card-creation-plan.ts for the full argument.
+      source ??= readPhoneInvoiceEvidence();
+      const evidence = await source;
+      sourceObservedAt ??= new Date().toISOString();
+      const plan = phoneSourcePlan(customer.jobberClientId, ownInvoices.map(inv => inv.jobberInvoiceId), evidence, now);
+      const label = ownInvoices[0]?.clientName ?? customer.companyName ?? customer.name ?? customer.jobberClientId;
+      const creation = planCardCreation({ contactId, existingCardCount: 0, label,
+        verified: plan ? { stage: plan.stage, total: plan.total, count: plan.count } : null });
+      const owner = { customerId: customer.id, jobberClientId: customer.jobberClientId, contactId,
+        candidateContactIds: candidateIds, storedInvoiceIds: ownInvoices.map(inv => inv.jobberInvoiceId) };
+      // Reported as a hold, not as "planned": "planned" already means a write
+      // this run is about to make, and no creation write exists yet.
+      report(creation.state === "create"
+        ? { ...owner, action: "hold", to: { stageId: refs.stageIdByName[CARD_CREATION_STAGE.toLowerCase()],
+              monetaryValue: creation.monetaryValue, name: creation.name },
+            reason: `No existing card; creation writes not enabled: ${describeCardCreation(creation)}` }
+        : { ...owner, action: "hold", reason: `No existing card; ${describeCardCreation(creation)}` });
+      return;
     }
     const card = matchingCards[0];
     reviewedCards.add(card.id);

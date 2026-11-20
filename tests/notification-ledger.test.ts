@@ -120,7 +120,7 @@ test("reservation snapshots and hashes the exact event, body and destination", a
   assert.equal(row.bodyHash, notificationBodyDigest(body));
   assert.equal(row.eventHash, notificationEventHash(input().event));
   assert.equal(row.destinationHash, notificationDestinationHash(input().event));
-  assert.equal(row.eventKey, JSON.stringify(["notification-v1", "synthetic-account", "synthetic-invoice", 10, "homeowner"]));
+  assert.equal(row.eventKey, JSON.stringify(["notification-v2", "synthetic-account", "synthetic-invoice", 10, "homeowner", "sms"]));
   assert.equal(Object.isFrozen(result.reservation), true);
   assert.equal(Object.isFrozen(ledger), true);
   assert.equal(await ledger.assertReserved(result.reservation), true);
@@ -488,12 +488,12 @@ function day21Internal(patch: Partial<Event> = {}): NotificationReservationInput
     contactId: base.event.contactId };
 }
 
-test("pilot: the reservation key is the immutable invoice id, milestone and audience", async () => {
+test("pilot: the reservation key is the immutable invoice id, milestone, audience and channel", async () => {
   const db = new FakeDatabase(), request = day21Internal();
   const handle = await reserve(createNotificationLedger(db), request);
   const row = db.rows.get(handle.id)!;
-  assert.equal(row.eventKey, JSON.stringify(["notification-v1", "synthetic-account",
-    "jobber-invoice-encoded-id-post-cutover", 21, "internal"]));
+  assert.equal(row.eventKey, JSON.stringify(["notification-v2", "synthetic-account",
+    "jobber-invoice-encoded-id-post-cutover", 21, "internal", "email"]));
   assert.equal(row.channel, "email");
   // The invoice id in the key is Jobber's encoded id, which never changes. The
   // due date, owner, destination and template are deliberately NOT in the key.

@@ -35,7 +35,7 @@ import { createNotificationRunner, type NotificationRunnerDependencies, type Not
 import { readNotificationHistory, projectAccessibleGhlExternalHistory, composeAccessibleGhlExternalAttempts,
   NOTIFICATION_HISTORY_CONTRACT } from "./notification-history";
 import { DAY15_EMAIL_TEMPLATE_POLICY, PROPOSED_DAY15_EMAIL_BODY, PROPOSED_DAY15_EMAIL_SUBJECT,
-  day15EmailCopyIsFeeClaimFree, day15EmailTemplateShapeIsExact, renderDay15EmailBody } from "./notification-day15-email-copy";
+  day15EmailCopyIsFeeClaimFree, day15EmailHtmlFromPlain, day15EmailTemplateShapeIsExact, renderDay15EmailBody } from "./notification-day15-email-copy";
 import type { RecurringNotificationReadScope } from "./notification-recurring-coordinator";
 import type { NotificationInventoryIO } from "./notification-inventory";
 import type { NotificationRecurringSourceIO } from "./notification-source";
@@ -273,8 +273,12 @@ export function createRecurringDay15EmailService(options: Readonly<{
                   throw new Error("Cohort email identity unavailable");
                 // Live balance and live link, rendered together. A zero or paid balance
                 // throws here rather than producing a message.
-                const body = renderDay15EmailBody(p.template.body,
-                  { balanceMinor: s.balanceMinor, currency: p.currency }, await readInvoiceLink(s.invoiceId));
+                // GoHighLevel refuses an Email that carries only `message`, so the
+                // wire body is the HTML form of the same approved words. The plain
+                // render stays the reviewed artefact and is what the fee-claim and
+                // shape checks read.
+                const body = day15EmailHtmlFromPlain(renderDay15EmailBody(p.template.body,
+                  { balanceMinor: s.balanceMinor, currency: p.currency }, await readInvoiceLink(s.invoiceId)));
                 renderedBody = body;
                 const event: Event = immutableEvent({ accountId: s.accountId, invoiceId: s.invoiceId, ownerId: s.ownerId,
                   homeownerContactId: s.homeownerContactId, sourceRevision: s.sourceRevision, ownerRevision: s.ownerRevision,
@@ -282,7 +286,7 @@ export function createRecurringDay15EmailService(options: Readonly<{
                   dayPastDue: 15, audience: "homeowner", recipientId: s.homeownerContactId, contactId: s.homeownerContactId,
                   channel: "email", destination, templateId: p.template.id, templateVersion: p.template.version,
                   bodyDigest: sha(body), claimedFacts: [] });
-                return { event, body, contentType: "text/plain", subject: p.template.subject,
+                return { event, body, contentType: "text/html", subject: p.template.subject,
                   sender: { accountId: p.accountId, locationId: p.locationId, channel: "email" as const, sender: p.sender,
                     scope: "conversations/message.write" as const, approved: true as const, validated: true as const,
                     evidenceRef: saved.sourceRef },
@@ -294,8 +298,8 @@ export function createRecurringDay15EmailService(options: Readonly<{
                 if (inspectNotificationSourceDestinations(handle).email !== event.destination)
                   throw new Error("Email identity changed");
                 // The balance, the dates and the link must all still describe this invoice.
-                const rerendered = renderDay15EmailBody(p.template.body,
-                  { balanceMinor: s.balanceMinor, currency: p.currency }, await readInvoiceLink(s.invoiceId));
+                const rerendered = day15EmailHtmlFromPlain(renderDay15EmailBody(p.template.body,
+                  { balanceMinor: s.balanceMinor, currency: p.currency }, await readInvoiceLink(s.invoiceId)));
                 if (sha(rerendered) !== event.bodyDigest) throw new Error("Source render drift");
                 // Overlap with the legacy GoHighLevel Day 15 text ladder, checked HERE,
                 // in the final pre-send read, against the same exact authenticated
@@ -346,7 +350,7 @@ export function createRecurringDay15EmailService(options: Readonly<{
               review: async (construction, event, binding) => {
                 verify();
                 if (mode !== "attempt" || !construction.request || renderedBody === null ||
-                    construction.request.body.message !== renderedBody ||
+                    construction.request.body.html !== renderedBody ||
                     event.bodyDigest !== sha(renderedBody) || event.channel !== "email" || binding.sender !== p.sender)
                   throw new Error("Exact standing content/action mismatch");
                 const requestSha256 = sha(construction.request.serializedBody), at = Date.now();

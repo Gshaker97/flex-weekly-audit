@@ -483,8 +483,8 @@ function evidenceFor(event: Event, feeClaimFree: boolean | undefined): Evidence 
     template: { ...p, approved: true, accountId: event.accountId, id: event.templateId, version: event.templateVersion,
       bodyDigest: event.bodyDigest, audience: event.audience, dayPastDue: event.dayPastDue, channel: event.channel,
       claimedFacts: event.claimedFacts, ...(feeClaimFree === undefined ? {} : { feeClaimFree }) },
-    channelAuthorization: { ...p, approved: true, eventKey: JSON.stringify(["notification-v1", event.accountId,
-      event.invoiceId, event.dayPastDue, event.audience]), recipientId: event.recipientId, channel: event.channel,
+    channelAuthorization: { ...p, approved: true, eventKey: JSON.stringify(["notification-v2", event.accountId,
+      event.invoiceId, event.dayPastDue, event.audience, event.channel]), recipientId: event.recipientId, channel: event.channel,
       destination: event.destination },
     facts: [], attempts: { ...p, accountId: event.accountId, historyComplete: true, records: [] } };
 }

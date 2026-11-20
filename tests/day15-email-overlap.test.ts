@@ -1,39 +1,73 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { eventKey } from "../lib/notification-gate";
+import { eventKey, milestonePlanKey } from "../lib/notification-gate";
 
 /**
- * The overlap guarantees the Day 15 email relies on, asserted rather than
+ * The overlap guarantees the Day 15 reminder relies on, asserted rather than
  * described. The ledger admits one reservation per event key, so two messages
  * that share a key cannot both go out, whichever one gets there first.
+ *
+ * CHANGED 2026-11-18, on the account owner's explicit approval: a Day 15
+ * reminder now goes out on BOTH channels, one text and one email. The key
+ * therefore carries the channel, and the two are separate events.
+ *
+ * What that does NOT relax: a text already sent still suppresses our text, and
+ * an email already sent still suppresses our email, each on its own evidence
+ * from GoHighLevel. Removing the shared key removed a tie between two DIFFERENT
+ * channels, not the per-channel duplicate protection. The tests below pin both
+ * halves of that.
  */
 const base = { accountId: "acct-1", invoiceId: "inv-1" } as const;
-const day15Homeowner = { ...base, dayPastDue: 15, audience: "homeowner" as const };
+const day15Homeowner = { ...base, dayPastDue: 15, audience: "homeowner" as const,
+  channel: "email" as const };
 
-test("Day 15 SMS and Day 15 email are ONE event, so only one can ever send", () => {
-  // The key deliberately carries no channel. This is what makes the old GHL
-  // Day 15 SMS and the new Day 15 email mutually exclusive in both directions.
-  assert.equal(eventKey(day15Homeowner), eventKey({ ...day15Homeowner }));
-  const key = eventKey(day15Homeowner);
-  assert.ok(!key.includes("sms"));
-  assert.ok(!key.includes("email"));
+test("Day 15 text and Day 15 email are two events, so both can send", () => {
+  const email = eventKey({ ...day15Homeowner, channel: "email" });
+  const sms = eventKey({ ...day15Homeowner, channel: "sms" });
+  assert.notEqual(email, sms);
+  assert.ok(email.includes("email"));
+  assert.ok(sms.includes("sms"));
+});
+
+test("the SAME channel is still ONE event, so neither channel can send twice", () => {
+  assert.equal(eventKey({ ...day15Homeowner, channel: "email" }),
+               eventKey({ ...day15Homeowner, channel: "email" }));
+  assert.equal(eventKey({ ...day15Homeowner, channel: "sms" }),
+               eventKey({ ...day15Homeowner, channel: "sms" }));
+});
+
+test("a planning key is never a ledger key, on either channel", () => {
+  // The worklist plans a milestone; the ledger records a message. If these ever
+  // collided, a planned item could occupy a real send's only reservation.
+  const plan = milestonePlanKey(day15Homeowner);
+  assert.notEqual(plan, eventKey({ ...day15Homeowner, channel: "email" }));
+  assert.notEqual(plan, eventKey({ ...day15Homeowner, channel: "sms" }));
+  // And the planning key stays channel-blind: one milestone is one plan item.
+  const asSms = { ...day15Homeowner, channel: "sms" as const };
+  assert.equal(plan, milestonePlanKey(asSms));
 });
 
 test("Day 21 keeps its own event and is untouched by anything at Day 15", () => {
-  const day21Internal = { ...base, dayPastDue: 21, audience: "internal" as const };
-  const day21Homeowner = { ...base, dayPastDue: 21, audience: "homeowner" as const };
+  const day21Internal = { ...base, dayPastDue: 21, audience: "internal" as const, channel: "email" as const };
+  const day21Homeowner = { ...base, dayPastDue: 21, audience: "homeowner" as const, channel: "email" as const };
   assert.notEqual(eventKey(day21Internal), eventKey(day15Homeowner));
   assert.notEqual(eventKey(day21Homeowner), eventKey(day15Homeowner));
   // And the two Day 21 audiences stay separate from each other.
   assert.notEqual(eventKey(day21Internal), eventKey(day21Homeowner));
 });
 
-test("another invoice's Day 15 never blocks this one", () => {
-  assert.notEqual(eventKey({ ...day15Homeowner, invoiceId: "inv-2" }), eventKey(day15Homeowner));
+test("another invoice's Day 15 never blocks this one, on either channel", () => {
+  for (const channel of ["email", "sms"] as const) {
+    assert.notEqual(eventKey({ ...day15Homeowner, channel, invoiceId: "inv-2" }),
+                    eventKey({ ...day15Homeowner, channel }));
+  }
 });
 
-test("Day 10 stays a separate event from Day 15", () => {
-  assert.notEqual(eventKey({ ...day15Homeowner, dayPastDue: 10 }), eventKey(day15Homeowner));
+test("Day 10 stays a separate event from Day 15, on either channel", () => {
+  for (const channel of ["email", "sms"] as const) {
+    assert.notEqual(eventKey({ ...day15Homeowner, channel, dayPastDue: 10 }),
+                    eventKey({ ...day15Homeowner, channel }));
+  }
 });
 
 /**
@@ -50,6 +84,7 @@ const SOURCE = {
   invoiceStatus: "past_due", totalCents: 13700, balanceCents: 13700,
   issuedDate: "2026-10-20", dueDate: "2026-11-02",
   clientId: "cli-1", clientTags: ["Irrigation"], lineItemNames: ["Irrigation repair"],
+  clientBillingEmails: ["a@example.com"],
 };
 const CANDIDATE = { jobberInvoiceId: "inv-1", invoiceNumber: "7207", clientName: "A",
   jobberClientId: "cli-1", email: "a@example.com", phone: "+16025550100" };
@@ -200,7 +235,7 @@ test("email path: a MAINTENANCE invoice with no pipeline card is now a candidate
     readers: { ...emailReaders,
       // Maintenance, which the service-type rule can never confirm, and no card.
       readInvoice: async () => ({ ...SOURCE, clientTags: ["Maintenance"],
-        lineItemNames: ["Monthly maintenance"] }),
+        lineItemNames: ["Monthly maintenance"], clientBillingEmails: ["a@example.com"] }),
       cardsForContact: async () => [],
       matchContacts: async () => [{ id: "c1", tags: [], dnd: false, emailDndStatus: "inactive",
         phone: "+16025550100", email: "a@example.com" }] } as any,
@@ -285,7 +320,7 @@ test("the NON-email path still requires the card and the service type", async ()
   const maintenance = await evaluateReminders({ candidates: [CANDIDATE],
     readers: { ...readers,
       readInvoice: async () => ({ ...SOURCE, clientTags: ["Maintenance"],
-        lineItemNames: ["Monthly maintenance"] }),
+        lineItemNames: ["Monthly maintenance"], clientBillingEmails: ["a@example.com"] }),
       matchContacts: async () => [{ id: "c1", tags: [], dnd: false, emailDndStatus: "inactive",
         phone: "+16025550100", email: "a@example.com" }] } as any,
     now: AT_DAY_15, verifiedExclusions: ["cli-x", "cli-y"], ignoreWindow: true,

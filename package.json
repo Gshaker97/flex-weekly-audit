@@ -10,7 +10,9 @@
     "lint": "next lint",
     "postinstall": "prisma generate",
     "reminders:evaluate": "TZ=America/Phoenix tsx scripts/reminder-evaluate-cron.ts",
-    "day15:pilot": "TZ=America/Phoenix tsx scripts/day15-pilot-cron.ts"
+    "day15:pilot": "TZ=America/Phoenix tsx scripts/day15-pilot-cron.ts",
+    "ladder:morning": "TZ=America/Phoenix tsx scripts/ladder-morning-cron.ts",
+    "reminders:audit": "TZ=America/Phoenix tsx scripts/reminder-audit.ts"
   },
   "dependencies": {
     "@prisma/client": "^5.22.0",

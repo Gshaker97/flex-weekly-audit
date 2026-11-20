@@ -16,9 +16,63 @@ export const PROPOSAL = Object.freeze({
   timingApproved: false, sendCapability: false,
 } as const);
 
-/** Stable identity deliberately excludes mutable due date, owner, channel, destination, template. */
-export function eventKey(event: Pick<Event, "accountId" | "invoiceId" | "dayPastDue" | "audience">): string {
-  return JSON.stringify(["notification-v1", event.accountId, event.invoiceId, event.dayPastDue, event.audience]);
+/**
+ * Identity of ONE MESSAGE in the ledger. Stable identity deliberately excludes
+ * mutable due date, owner, destination and template.
+ *
+ * CHANNEL IS INCLUDED, since 2026-11-18. A reminder may go out on both channels
+ * — one text AND one email — and two messages are two ledger rows, so they need
+ * two keys. Before that date the key was channel-blind, which is what made a
+ * channel switch count as the same single send.
+ *
+ * Channel is REQUIRED rather than optional on purpose: a caller that forgot it
+ * would otherwise silently mint a second, non-colliding key for the same
+ * message and could send twice. For the channel-blind identity of a planned
+ * milestone, which is NOT a ledger key, use `milestonePlanKey`.
+ */
+export function eventKey(
+  event: Pick<Event, "accountId" | "invoiceId" | "dayPastDue" | "audience" | "channel">,
+): string {
+  return JSON.stringify(["notification-v2", event.accountId, event.invoiceId,
+    event.dayPastDue, event.audience, event.channel]);
+}
+
+/**
+ * Channel-blind identity of one PLANNED milestone, for the worklist.
+ *
+ * PLANNING ONLY. This is never a ledger key and never authorizes a send. Its
+ * prefix differs from `eventKey`'s so the two can never be mistaken for one
+ * another, nor collide in the ledger's unique `eventKey` column.
+ */
+export function milestonePlanKey(
+  step: Pick<Event, "accountId" | "invoiceId" | "dayPastDue" | "audience">,
+): string {
+  return JSON.stringify(["notification-plan-v1", step.accountId, step.invoiceId,
+    step.dayPastDue, step.audience]);
+}
+
+/**
+ * The milestone a ledger event key belongs to, or null when the key cannot be
+ * read as one this version wrote.
+ *
+ * WHY. Since channel joined the key, one milestone has two possible message
+ * keys. A caller asking "was this milestone already attempted?" must match on
+ * the milestone, not the message, or a text already sent would look like no
+ * attempt at all.
+ *
+ * null is NOT "no match" and callers must not treat it as one: a key this
+ * function cannot read is a key whose milestone is UNKNOWN, so absence cannot
+ * be proven from it.
+ */
+export function planKeyOfEventKey(key: string): string | null {
+  let parts: unknown;
+  try { parts = JSON.parse(key); } catch { return null; }
+  if (!Array.isArray(parts) || parts.length !== 6 || parts[0] !== "notification-v2") return null;
+  const [, accountId, invoiceId, dayPastDue, audience] = parts as unknown[];
+  if (typeof accountId !== "string" || !accountId || typeof invoiceId !== "string" || !invoiceId ||
+      typeof dayPastDue !== "number" || !Number.isSafeInteger(dayPastDue) ||
+      (audience !== "homeowner" && audience !== "internal")) return null;
+  return milestonePlanKey({ accountId, invoiceId, dayPastDue, audience });
 }
 
 export type Event = Readonly<{
@@ -221,20 +275,36 @@ export function planNotification(request: Request, now: Date): Plan {
     priorAttemptStates: Object.freeze([...priorStates]) });
 }
 
-/** No silent priority choice. Duplicate events and distinct same-contact events all hold. */
+/**
+ * No silent priority choice. Duplicate events hold, and so does a contact
+ * carrying more work than one milestone on both channels.
+ *
+ * This mirrors the ledger's two caps exactly. A contact may appear twice in one
+ * batch ONLY as the two channels of ONE milestone — one text and one email for
+ * the same invoice, day and audience. Two different milestones for one contact
+ * still conflict, which is the per-customer daily cap: a customer with several
+ * overdue invoices gets one pair, not a pair each.
+ */
 export function planBatch(requests: readonly Request[], now: Date): readonly Plan[] {
-  const keys = new Map<string, number>(), contacts = new Map<string, Set<string>>();
+  const keys = new Map<string, number>();
+  const contacts = new Map<string, { milestones: Set<string>; channels: Map<string, number> }>();
   for (const { event } of requests) {
     const key = eventKey(event), contact = JSON.stringify([event.accountId, event.contactId]);
     keys.set(key, (keys.get(key) ?? 0) + 1);
-    const contactKeys = contacts.get(contact) ?? new Set<string>();
-    contactKeys.add(key); contacts.set(contact, contactKeys);
+    const seen = contacts.get(contact) ?? { milestones: new Set<string>(), channels: new Map<string, number>() };
+    seen.milestones.add(milestonePlanKey(event));
+    seen.channels.set(event.channel, (seen.channels.get(event.channel) ?? 0) + 1);
+    contacts.set(contact, seen);
   }
   return Object.freeze(requests.map(request => {
     const plan = planNotification(request, now), reasons = [...plan.reasons];
     if (keys.get(plan.eventKey)! > 1) reasons.push("duplicate_event_in_batch");
-    if (contacts.get(JSON.stringify([request.event.accountId, request.event.contactId]))!.size > 1)
+    const seen = contacts.get(JSON.stringify([request.event.accountId, request.event.contactId]))!;
+    // More than one milestone for one contact, or the same channel twice, is a
+    // conflict. Neither is a channel pair, and neither is resolved by guessing.
+    if (seen.milestones.size > 1 || [...seen.channels.values()].some(count => count > 1)) {
       reasons.push("simultaneous_contact_event_conflict");
+    }
     return Object.freeze({ ...plan, designStatus: reasons.length ? "hold" as const : "eligible_in_proposal" as const,
       reasons: Object.freeze(reasons) });
   }));

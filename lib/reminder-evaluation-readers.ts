@@ -13,7 +13,8 @@ const INVOICE_QUERY = `query ReminderEvaluationInvoice($id: EncodedId!) {
     id invoiceStatus issuedDate dueDate
     amounts { total invoiceBalance }
     lineItems(first: 20) { nodes { name } }
-    client { id tags { nodes { label } } }
+    client { id tags { nodes { label } } emails { address }
+      clientProperties(first: 25) { totalCount nodes { address { street1 city postalCode } } } }
   }
 }`;
 
@@ -59,6 +60,31 @@ export function createReminderEvaluationReaders(): ReminderEvaluationReaders {
         clientId: typeof invoice.client?.id === "string" ? invoice.client.id : null,
         clientTags: labelList(invoice.client?.tags?.nodes, "label"),
         lineItemNames: labelList(invoice.lineItems?.nodes, "name"),
+        // null when Jobber returned no emails collection at all, so the caller
+        // holds instead of treating "unreadable" as "no address on file".
+        clientBillingEmails: Array.isArray(invoice.client?.emails)
+          ? invoice.client.emails
+              .map((entry: unknown) => (entry && typeof entry === "object"
+                ? (entry as Record<string, unknown>).address : null))
+              .filter((address: unknown): address is string =>
+                typeof address === "string" && address.trim().length > 0)
+              .map((address: string) => address.trim().toLowerCase())
+          : null,
+        // null when the collection is absent OR when Jobber holds more
+        // properties than this page returned: a partial list could make a
+        // contact look unmatched and send to the wrong record.
+        clientPropertyAddresses: (() => {
+          const properties = invoice.client?.clientProperties;
+          const nodes = properties?.nodes;
+          if (!Array.isArray(nodes)) return null;
+          const total = properties?.totalCount;
+          if (typeof total === "number" && total > nodes.length) return null;
+          return nodes.map((node: any) => ({
+            street1: typeof node?.address?.street1 === "string" ? node.address.street1 : null,
+            city: typeof node?.address?.city === "string" ? node.address.city : null,
+            postalCode: typeof node?.address?.postalCode === "string" ? node.address.postalCode : null,
+          }));
+        })(),
       };
     },
 
@@ -77,6 +103,9 @@ export function createReminderEvaluationReaders(): ReminderEvaluationReaders {
         })(),
         phone: contact.phone ?? null,
         email: contact.email ?? null,
+        street1: contact.address1 ?? null,
+        city: contact.city ?? null,
+        postalCode: contact.postalCode ?? null,
       }));
     },
 
@@ -103,16 +132,25 @@ export function createReminderEvaluationReaders(): ReminderEvaluationReaders {
      */
     async sendHistory(
       candidate: ReminderCandidate,
-      context?: { issuedDate: string | null },
+      context?: { issuedDate: string | null; contactId?: string | null },
     ): Promise<SendHistory | null> {
       const contacts = await findExactContactMatches({ email: candidate.email, phone: candidate.phone });
-      // One exact contact or no history at all. Several already holds upstream,
-      // and merging their histories would invent an attribution.
-      if (contacts.length !== 1) {
+      // One exact contact, or the one the evaluation resolved by matching the
+      // Jobber property address when several shared an email or phone. The id
+      // is VERIFIED against the exact matches rather than trusted, so a stale
+      // or foreign id reads no history instead of the wrong person's. Merging
+      // several contacts' histories would invent an attribution, so it is never
+      // done: without a resolved id, several contacts still hold.
+      const resolved = typeof context?.contactId === "string" && context.contactId
+        ? contacts.filter(contact => contact.id === context.contactId)
+        : contacts;
+      if (resolved.length !== 1) {
         return { complete: false, incompleteReason:
-          `history needs exactly one exact contact; found ${contacts.length}`, sends: [] };
+          `history needs exactly one exact contact; found ${contacts.length}` +
+          (contacts.length > 1 && resolved.length !== 1 ? " and none was resolved by address" : ""),
+          sends: [] };
       }
-      const history = await getOutboundMessages(contacts[0].id);
+      const history = await getOutboundMessages(resolved[0].id);
       const mine = candidate.invoiceNumber?.trim() ?? "";
       const minePattern = mine ? new RegExp(`(?:^|[^0-9])${mine}(?:[^0-9]|$)`) : null;
       const anyInvoiceNumber = /#\s?\d{3,6}|invoice\s+#?\s?\d{3,6}/i;

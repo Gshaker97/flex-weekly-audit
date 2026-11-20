@@ -1,7 +1,7 @@
 /** Disabled pure planning over supplied invoice rows. No source capability, approval, IO or dispatch. */
 import { invoiceCalendarDate, invoiceReminderClock, invoiceReminderMilestones,
   type InvoiceReminderCategory } from "./invoice-reminder-clock";
-import { eventKey, PROPOSAL, type Fact } from "./notification-gate";
+import { milestonePlanKey, PROPOSAL, type Fact } from "./notification-gate";
 
 export const NOTIFICATION_WORKLIST_LIMIT = 1000;
 export type NotificationWorklistTagSnapshot = Readonly<{
@@ -123,7 +123,7 @@ export function planNotificationWorklist(invoices: readonly NotificationWorklist
         ...(step.audience === "homeowner" && invoice.homeownerContactId === null ? ["homeowner_contact_unresolved"] : []),
       ];
       const item: NotificationWorklistItem = {
-        eventKey: eventKey({ accountId: invoice.accountId, invoiceId: invoice.invoiceId, dayPastDue: step.dayPastDue, audience: step.audience }),
+        eventKey: milestonePlanKey({ accountId: invoice.accountId, invoiceId: invoice.invoiceId, dayPastDue: step.dayPastDue, audience: step.audience }),
         accountId: invoice.accountId, locationId: invoice.locationId, invoiceId: invoice.invoiceId, ownerId: invoice.ownerId,
         homeownerContactId: invoice.homeownerContactId, dayPastDue: step.dayPastDue, audience: step.audience,
         scheduledOn: step.scheduledOn, targetLocalTime: "09:00:00", timeZone: "America/Phoenix",

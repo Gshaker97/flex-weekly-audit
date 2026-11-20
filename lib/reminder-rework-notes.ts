@@ -195,6 +195,8 @@ export function classifyLinkedJobRework(result: {
   complete: boolean; reason: string | null;
   jobs: readonly { notesComplete: boolean; title: string | null; instructions: string | null;
     jobNoteMessages: readonly string[] }[];
+  lineItemNames?: readonly string[];
+  lineItemsComplete?: boolean;
 }): ReworkClassification {
   if (!result || result.complete !== true) {
     return { verdict: "hold", reason: `linked_jobs_read_incomplete: ${result?.reason ?? "unknown"}`, evidence: null };
@@ -203,8 +205,30 @@ export function classifyLinkedJobRework(result: {
   if (result.jobs.some(job => job.notesComplete !== true)) {
     return { verdict: "hold", reason: "job_notes_read_incomplete", evidence: null };
   }
+  if (result.lineItemsComplete === false) {
+    return { verdict: "hold", reason: "invoice_line_items_read_incomplete", evidence: null };
+  }
+
+  // Every readable description of this work, from the job AND from the invoice.
+  // The job's own fields are almost always empty in this account, while the
+  // line item names are always present and say what was billed. A rework or
+  // warranty word anywhere in this list still holds or excludes exactly as
+  // before; the only thing that changed is that silence on the JOB is no
+  // longer silence overall when the INVOICE describes the work.
+  const pieces: string[] = [];
+  for (const job of result.jobs) {
+    pieces.push(...(job.jobNoteMessages ?? []));
+    if (typeof job.instructions === "string") pieces.push(job.instructions);
+    if (typeof job.title === "string") pieces.push(job.title);
+  }
+  pieces.push(...(result.lineItemNames ?? []));
+  const readable = pieces.filter(piece => typeof piece === "string" && piece.trim().length > 0);
+
+  if (readable.length === 0) {
+    return { verdict: "hold", reason: "no_readable_text_on_job_or_invoice", evidence: null };
+  }
   let decision: ReworkClassification = { verdict: "clear", reason: "notes_read_no_rework_phrase", evidence: null };
-  for (const job of result.jobs) decision = worst(decision, classifyJobText(job));
+  for (const piece of readable) decision = worst(decision, classifyOneNote(piece));
   return decision;
 }
 

@@ -153,6 +153,10 @@ export function createRecurringNotificationCoordinator(options: Readonly<{
           ["createGhlReadOnlyReader"]);
         const { readNotificationHistory, inspectNotificationHistory } = notificationModuleFunctions(await import("./notification-history"),
           ["readNotificationHistory", "inspectNotificationHistory"]);
+        // Loaded the same lazy way as every other module here, so importing this
+        // file still initializes nothing.
+        const { planKeyOfEventKey } = notificationModuleFunctions(await import("./notification-gate"),
+          ["planKeyOfEventKey"]);
         const contact = createGhlReadOnlyReader({ ...r.contact, fetch: guard(r.contact.fetch), now: () => new Date(Date.now()) });
         verify(); let inventory: NotificationInventory;
         try { inventory = await readNotificationInventory({ ...scope, expiresAt: new Date(deadline).toISOString() }, inventoryIO); }
@@ -181,16 +185,39 @@ export function createRecurringNotificationCoordinator(options: Readonly<{
           let report: RecurringInvoiceReport = { invoiceOrdinal: ordinals.get(row.invoiceId)!, source: exclusion ? "excluded" : "held",
             holds: exclusion ? [...exclusion.reasons] : [], milestones: [], channels: { sms: blankChannel("sms"), email: blankChannel("email") },
             observedAt: null, freshUntil: null };
-          const milestoneReports = (records?: readonly { eventKey: string }[], absenceProven = false) => items.map(item => ({ dayPastDue: item.dayPastDue,
+          // A milestone now has TWO possible message keys, one per channel, so a
+          // prior attempt is matched on the MILESTONE. Any channel already in
+          // the ledger means this milestone was attempted. A record whose key
+          // cannot be read leaves the answer unknown rather than "no attempt":
+          // absence must never be inferred from a key we could not parse.
+          const attempted = (records?: readonly { eventKey: string }[]) => {
+            if (!records) return null;
+            const milestones = new Set<string>();
+            let unreadable = false;
+            for (const record of records) {
+              const plan = planKeyOfEventKey(record.eventKey);
+              if (plan === null) unreadable = true; else milestones.add(plan);
+            }
+            return { milestones, unreadable };
+          };
+          const milestoneReports = (records?: readonly { eventKey: string }[], absenceProven = false) => {
+            const seen = attempted(records);
+            return items.map(item => {
+              const hit = seen?.milestones.has(item.eventKey) === true;
+              const unreadable = seen?.unreadable === true;
+              return ({ dayPastDue: item.dayPastDue,
             audience: item.audience, timing: item.timing, category: item.category, planningHolds: [...item.planningHolds],
-            priorAttempt: item.audience !== "homeowner" ? null : records?.some(record => record.eventKey === item.eventKey)
-              ? true : absenceProven ? false : null,
+            priorAttempt: item.audience !== "homeowner" ? null : hit
+              ? true : absenceProven && !unreadable ? false : null,
             readHolds: [...item.planningHolds, ...(item.timing === "current_window" ? [] : [`timing_${item.timing}`]),
               ...(item.audience === "internal" ? ["internal_history_not_evaluated"] : [
-                ...(records?.some(record => record.eventKey === item.eventKey) ? ["prior_attempt_no_retry"] : []),
+                ...(hit ? ["prior_attempt_no_retry"] : []),
+                ...(!hit && unreadable ? ["prior_attempt_key_unreadable"] : []),
                 ...(!absenceProven ? ["history_absence_unproven"] : [])])],
             executionHolds: ["read_only_no_message_policy_admission", ...(item.copyStatus === "conditional_copy_unapproved" ? ["conditional_copy_and_effect_evidence_unapproved"] :
-              item.copyStatus === "digest_copy_unapproved" ? ["digest_copy_and_atomic_member_admission_unwired"] : [])], copyStatus: item.copyStatus }));
+              item.copyStatus === "digest_copy_unapproved" ? ["digest_copy_and_atomic_member_admission_unwired"] : [])], copyStatus: item.copyStatus });
+            });
+          };
           let failure = "fresh_source_or_required_read_unavailable";
           if (!exclusion) try {
             if (Date.now() >= Date.parse(initial.population.expiresAt)) { failure = "shared_population_expired_no_renewal"; throw new Error(failure); }

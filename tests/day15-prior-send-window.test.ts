@@ -57,6 +57,7 @@ const SOURCE = {
   invoiceStatus: "past_due", totalCents: 12500, balanceCents: 12500,
   issuedDate: ISSUED, dueDate: "2026-11-10",
   clientId: "cli-1", clientTags: ["Maintenance"], lineItemNames: ["Lawn service"],
+  clientBillingEmails: ["a@example.com"],
 };
 const CANDIDATE = { jobberInvoiceId: "inv-1", invoiceNumber: "7226", clientName: "A",
   jobberClientId: "cli-1", email: "a@example.com", phone: "+16025550100" };
@@ -226,11 +227,28 @@ test("an explicit Email inactive is the only thing that counts as consent", asyn
   assert.equal(plan.rows[0].decision, "eligible");
 });
 
-test("NO Email entry in GoHighLevel holds: unknown is not consent", async () => {
+/**
+ * Changed 2026-11-18 by the account owner's decision: a contact with NO Email
+ * entry at all may be emailed. Every Flexx customer is in that state, so the
+ * previous rule blocked the entire programme. An unreadable value is still not
+ * a blank one, and still holds.
+ */
+test("a blank Email entry now sends: no entry is permission, by decision", async () => {
   for (const contact of [{}, { emailDndStatus: null }, { emailDndStatus: undefined }]) {
     const plan = await runWithContact(contact);
-    assert.ok(plan.rows[0].holds.some(h => h.startsWith("destination_contact_email_consent_unknown")),
+    assert.ok(!plan.rows[0].holds.some(h => h.startsWith("destination_contact_email_consent_unknown")),
       JSON.stringify(contact) + " -> " + plan.rows[0].holds.join(" | "));
+  }
+});
+
+test("an Email entry we cannot read still holds: unreadable is not blank", async () => {
+  // "Inactive" is deliberately absent: this evaluation lowercases the status,
+  // so mixed casing reads as consent here. The sender is stricter and requires
+  // exact lowercase, so such a contact is held there instead.
+  for (const status of ["", "opted_in", "unsubscribed", "0", "yes"]) {
+    const plan = await runWithContact({ emailDndStatus: status });
+    assert.ok(plan.rows[0].holds.some(h => h.startsWith("destination_contact_email_consent_unknown")),
+      status + " -> " + plan.rows[0].holds.join(" | "));
   }
 });
 

@@ -168,18 +168,31 @@ export function parseGhlRecipient(input: Readonly<{ version: unknown; body: unkn
         reasons.push("incompatible_dnd_status_schema");
       if (settings && (Object.hasOwn(settings, "sms") || Object.hasOwn(settings, "email")))
         reasons.push("incompatible_lowercase_dnd_schema");
-      // HighLevel explicitly documents omitted global dnd as false across APIs.
-      // The reviewed pinned contact response also uses genuine SMS/settings omission
-      // for no SMS override. This observed encoding is not consent or an Email default.
-      // Present malformed values and conflicting casing never receive that default.
-      const noSmsOverride = input.expected.channel === "sms" && !incompatibleTopLevel && !incompatibleChannel &&
+      // HighLevel explicitly documents omitted global dnd as false across APIs, and
+      // encodes "no preference recorded" for a channel as a genuinely absent entry.
+      //
+      // BUSINESS DECISION, 2026-11-18, recorded by the account owner: an absent entry
+      // is to be treated as permission to send, on BOTH channels. It previously held
+      // on email, which blocked every Flexx customer, since not one of them has an
+      // Email or SMS entry at all. This widens who may be messaged, so note what it
+      // deliberately does NOT change:
+      //   - an explicit "active"/"permanent" opt-out still blocks, on both channels;
+      //   - the global dnd flag still blocks;
+      //   - an entry that is PRESENT but carries an unrecognised value still holds,
+      //     because that is an unreadable preference, not an absent one;
+      //   - a dndSettings key present but set to null/undefined still holds: that is
+      //     a malformed value, not an absence;
+      //   - malformed values and conflicting key casing never receive this default.
+      // The ONLY change from the previous rule is dropping its `channel === "sms"`
+      // restriction. Absence is recognised exactly as it was before.
+      const noChannelOverride = !incompatibleTopLevel && !incompatibleChannel &&
         (!Object.hasOwn(contact, "dndSettings") || !!settings && !Object.hasOwn(settings, channelKey));
       const globalDnd = Object.hasOwn(contact, "dnd") ? contact.dnd : false;
       blocked = globalDnd === true || status === "active" || status === "permanent";
       if (typeof globalDnd !== "boolean") reasons.push("global_dnd_unknown");
-      if (!noSmsOverride && !["active", "inactive", "permanent"].includes(status as string)) reasons.push("channel_dnd_unknown");
+      if (!noChannelOverride && !["active", "inactive", "permanent"].includes(status as string)) reasons.push("channel_dnd_unknown");
       if (blocked) reasons.push("recipient_suppressed");
-      valid = reasons.length === 0 && globalDnd === false && (status === "inactive" || noSmsOverride);
+      valid = reasons.length === 0 && globalDnd === false && (status === "inactive" || noChannelOverride);
     }
   } catch { reasons.push("malformed_contact_input"); }
   const result: GhlRecipientResult = Object.freeze({ state: valid ? "allowed" : blocked ? "blocked" : "held",

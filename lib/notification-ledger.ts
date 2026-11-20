@@ -4,7 +4,7 @@
  */
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { addInvoiceCalendarDays, invoiceCalendarDate } from "./invoice-reminder-clock";
-import type { Event } from "./notification-gate";
+import { eventKey, type Event } from "./notification-gate";
 
 export type NotificationLedgerEvent = Event;
 export type NotificationReservationInput = Readonly<{
@@ -121,7 +121,11 @@ function prepare(input: NotificationReservationInput): Prepared {
       invoiceCalendarDate(scheduledOn) !== scheduledOn || addInvoiceCalendarDays(dueOn, event.dayPastDue) !== scheduledOn)
     throw new Error("invalid_reservation_input");
   return { event, eventPayload, body, destination, scheduledOn,
-    eventKey: JSON.stringify(["notification-v1", event.accountId, event.invoiceId, event.dayPastDue, event.audience]),
+    // ONE definition of the key, imported rather than copied. This line used to
+    // inline the format, and that copy silently drifted from the real one when
+    // the channel was added on 2026-11-18: the ledger wrote a channel-blind key
+    // while every reader looked for a per-channel one.
+    eventKey: eventKey(event),
     eventHash: digest(eventPayload), bodyHash: digest(body), destinationHash: notificationDestinationHash(event) };
 }
 

@@ -61,13 +61,35 @@ const milestones: Record<InvoiceReminderCategory, readonly ReminderMilestone[]> 
     { dayPastDue: 21, audience: "internal", requiredFacts: [] },
     { dayPastDue: 25, audience: "homeowner", requiredFacts: ["recurring_late_fee_policy"] },
     { dayPastDue: 30, audience: "homeowner", requiredFacts: ["service_suspended", "collections_after_day_35_policy"] },
+    // Day 35 is INTERNAL: the policy says an unpaid invoice goes to collections
+    // at 35 days, and that is a decision a person takes. Added 2026-11-18 on the
+    // owner's instruction to task Angie with it. Nothing here refers anything to
+    // collections; the step exists so the decision is raised and recorded.
+    { dayPastDue: 35, audience: "internal", requiredFacts: ["collections_after_day_35_policy"] },
   ],
+  // Irrigation stops at 21 because the written policy's irrigation section
+  // stops at 21: it lists days 10 and 15 and the day 21 call, and no
+  // suspension, day 20/25/30 text or collections step. Not an omission.
   irrigation: [
     { dayPastDue: 10, audience: "homeowner", requiredFacts: [] },
     { dayPastDue: 15, audience: "homeowner", requiredFacts: ["three_percent_fee_applied"] },
     { dayPastDue: 21, audience: "internal", requiredFacts: [] },
   ],
 };
+
+/**
+ * One step of a category's ladder, or null if that category has no such step.
+ *
+ * This is how a caller checks that a day really belongs to this category before
+ * acting on it: irrigation stops at 21, so `ladderMilestone("irrigation", 25)`
+ * is null and a day 25 text for an irrigation invoice can be refused rather
+ * than sent because some other part of the system assumed a shared ladder.
+ */
+export function ladderMilestone(category: InvoiceReminderCategory, dayPastDue: number): ReminderMilestone | null {
+  if (!Object.hasOwn(milestones, category) || !Number.isSafeInteger(dayPastDue)) return null;
+  const step = milestones[category].find(candidate => candidate.dayPastDue === dayPastDue);
+  return step ? { ...step, requiredFacts: [...step.requiredFacts] } : null;
+}
 
 /** Pure planning only: not send eligibility, enrollment, a fee, or suspension.
  * Old steps require reconciliation, never automatic catch-up. Recipients,

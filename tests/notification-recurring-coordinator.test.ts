@@ -143,7 +143,9 @@ for (const tags of [[], ["maintenance"], null]) test(`real tags ${JSON.stringify
   const f = fixture(); f.data.contacts[0].tags = tags;
   const result = await f.run();
   assert.equal(result.invoices[0].milestones.find(m => m.dayPastDue === 10)!.planningHolds.length, 0);
-  assert.equal(result.invoices[0].milestones.length, 6);
+  // Seven since 2026-11-18: days 10, 15, 20, 21, 25, 30 and the day 35
+  // internal collections decision.
+  assert.equal(result.invoices[0].milestones.length, 7);
   assert.equal(result.invoices[0].milestones.find(m => m.dayPastDue === 20)!.category, tags === null ? null : "maintenance");
 }));
 test("history failure is held independently of allowed DND", () => clock(async () => {

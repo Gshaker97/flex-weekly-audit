@@ -287,8 +287,13 @@ model NotificationLedger {
   pendingAt         DateTime?
   outcomeAt         DateTime?
 
-  @@unique([accountId, invoiceId, dayPastDue, audience])
-  @@unique([accountId, contactId, scheduledOn])
+  /// One row per invoice per milestone PER CHANNEL: a text and an email are two
+  /// messages, so they are two rows. Approved 2026-11-18.
+  @@unique([accountId, invoiceId, dayPastDue, audience, channel])
+  /// The per-customer daily cap, now per channel. `invoiceId` is deliberately
+  /// NOT here: a customer with several overdue invoices still gets one text and
+  /// one email that day, not a pair per invoice.
+  @@unique([accountId, contactId, scheduledOn, channel])
   @@index([state, createdAt])
 }
 

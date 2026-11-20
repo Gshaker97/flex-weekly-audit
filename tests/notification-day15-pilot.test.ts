@@ -20,6 +20,7 @@ import {
   inspectDay15PilotReadiness, reviewDay15PilotConfiguration, feeEvidenceProvesThreePercent,
   renderDay15Body, day15ClaimedFacts, DAY15_FEE_FACT,
   APPROVED_DAY15_SMS_BODY, termsEvidenceSupportsWarning, smsConsentIsRecorded,
+  PROPOSED_DAY15_SMS_FEE_WARNING_BODY, day15SmsCopyWarnsWithoutClaiming, day15StaticCopyNamesNoAmount,
   type Day15PilotConfig, type Day15PilotReview,
 } from "../lib/notification-day15-pilot";
 
@@ -437,13 +438,85 @@ test("the exact approved copy is accepted: no balance placeholder, no currency p
   assert.equal(renderDay15Body(config, { balanceMinor: 13700, dueOn: "2026-10-30" }), APPROVED_DAY15_SMS_BODY);
 });
 
-test("the warning is held unless the invoice TERMS support it", () => {
+test("the warning is held unless the TERMS or a written POLICY support it", () => {
   const config = validConfig({ templatePolicy: "day15-fee-may-apply", body: APPROVED_DAY15_SMS_BODY, terms: null });
   (config as any).currencyPolicy = null;
   const raw = JSON.stringify(config);
   const result = inspectDay15PilotReadiness(raw, review(config, raw));
   assert.equal(result.state, "held");
-  assert.ok(result.missing.includes("jobber_invoice_terms_must_support_the_fee_warning"));
+  assert.ok(result.missing.includes("invoice_terms_or_written_policy_must_support_the_fee_warning"));
+});
+
+/**
+ * The fee warning may now be backed by the company's own written late-fee
+ * policy, not only by Jobber's invoice-terms field. Widened 2026-11-18 on the
+ * account owner's instruction: the fee is set by the published policy, and
+ * whether Jobber's terms field repeats it is bookkeeping, not what makes the
+ * fee true.
+ *
+ * These tests pin what did NOT move with it. The excerpt must still say a late
+ * fee exists, and a policy cannot reach back to invoices issued before it.
+ */
+const GOOD_POLICY = { source: "company-late-fee-policy" as const, policyRef: "late-fee-and-cancellation-policies",
+  effectiveFrom: "2026-01-01",
+  termsExcerpt: "A late fee of 3% may be applied to balances more than 15 days past due.",
+  statesLateFee: true as const, observedAt: "2026-11-18T16:00:00.000Z", evidenceRef: "policy-1" };
+
+test("a written company policy can back the fee warning", () => {
+  // Issued 2026-10-01, policy effective 2026-01-01: covered.
+  assert.equal(termsEvidenceSupportsWarning(GOOD_POLICY, "invoice-1", "2026-10-01"), true);
+});
+
+test("the written policy still has to SAY there is a late fee", () => {
+  assert.equal(termsEvidenceSupportsWarning({ ...GOOD_POLICY,
+    termsExcerpt: "Payment is due on receipt. Cancellations require 24 hours notice." },
+    "invoice-1", "2026-10-01"), false, "a policy that is silent on fees backs nothing");
+  assert.equal(termsEvidenceSupportsWarning({ ...GOOD_POLICY, termsExcerpt: "   " },
+    "invoice-1", "2026-10-01"), false);
+});
+
+test("a policy cannot be applied to an invoice issued before it took effect", () => {
+  // The invoice predates the policy by a day. It was never subject to it.
+  assert.equal(termsEvidenceSupportsWarning({ ...GOOD_POLICY, effectiveFrom: "2026-10-02" },
+    "invoice-1", "2026-10-01"), false);
+  // Issued ON the effective date is covered.
+  assert.equal(termsEvidenceSupportsWarning({ ...GOOD_POLICY, effectiveFrom: "2026-10-01" },
+    "invoice-1", "2026-10-01"), true);
+});
+
+test("the policy route FAILS CLOSED without a readable invoice issue date", () => {
+  // Deliberately not optional-and-skipped: plumbing the date wrong must refuse
+  // the warning, never wave it through for everyone.
+  assert.equal(termsEvidenceSupportsWarning(GOOD_POLICY, "invoice-1"), false, "no date supplied");
+  assert.equal(termsEvidenceSupportsWarning(GOOD_POLICY, "invoice-1", null), false);
+  assert.equal(termsEvidenceSupportsWarning(GOOD_POLICY, "invoice-1", "01/10/2026"), false);
+});
+
+test("the written policy needs a reference and a usable effective date", () => {
+  assert.equal(termsEvidenceSupportsWarning({ ...GOOD_POLICY, policyRef: "" }, "invoice-1", "2026-10-01"), false);
+  assert.equal(termsEvidenceSupportsWarning({ ...GOOD_POLICY, effectiveFrom: "January 2026" } as any,
+    "invoice-1", "2026-10-01"), false);
+});
+
+test("a policy is NOT tied to one invoice, unlike Jobber terms", () => {
+  // The whole point: one written policy covers every invoice issued under it,
+  // so it carries no invoiceId and is not compared against one.
+  assert.equal(termsEvidenceSupportsWarning(GOOD_POLICY, "invoice-99", "2026-10-01"), true);
+});
+
+test("an unrecognised evidence source backs nothing", () => {
+  assert.equal(termsEvidenceSupportsWarning({ ...GOOD_POLICY, source: "operator-says-so" } as any,
+    "invoice-1", "2026-10-01"), false);
+});
+
+test("a written policy satisfies the gate end to end", () => {
+  const config = validConfig({ templatePolicy: "day15-fee-may-apply",
+    body: APPROVED_DAY15_SMS_BODY, terms: GOOD_POLICY });
+  (config as any).currencyPolicy = null;
+  const raw = JSON.stringify(config);
+  const result = inspectDay15PilotReadiness(raw, review(config, raw));
+  assert.ok(!result.missing.includes("invoice_terms_or_written_policy_must_support_the_fee_warning"),
+    `fee warning still held: ${result.missing.join(", ")}`);
 });
 
 test("terms evidence must show the fee in its own text, not just assert statesLateFee", () => {
@@ -499,4 +572,110 @@ test("consent to marketing texts is not consent to billing texts", () => {
   const result = inspectDay15PilotReadiness(raw, review(config, raw));
   assert.equal(result.state, "held");
   assert.ok(result.missing.includes("recorded_homeowner_consent_to_billing_sms"));
+});
+
+/**
+ * OUR Day 15 text. The company's own written wording with one clause changed,
+ * because the written clause was measurably false: of the 27 unpaid invoices
+ * past day 15 on 2026-11-18, exactly 2 carried a Late Fee line item. The owner
+ * chose the warning wording for all of them.
+ *
+ * These tests exist so the copy cannot quietly become a claim again. The
+ * difference between "may apply" and "has been applied" is the difference
+ * between a warning and a statement about the customer's balance.
+ */
+test("our Day 15 text warns about the fee and never claims one was applied", () => {
+  assert.equal(day15SmsCopyWarnsWithoutClaiming(PROPOSED_DAY15_SMS_FEE_WARNING_BODY), true);
+});
+
+test("the copy says what the policy says, minus the claim", () => {
+  const body = PROPOSED_DAY15_SMS_FEE_WARNING_BODY;
+  assert.match(body, /your invoice is past due/);
+  assert.match(body, /late fee of 3% may apply/);
+  assert.match(body, /602-329-7865/);
+  // The exact words the policy document used, which measurement ruled out.
+  assert.ok(!/has been applied/i.test(body), "must not assert the fee was applied");
+  // No amount, so there is nothing to render and nothing to render wrong.
+  assert.ok(!/\{\{/.test(body), "our Day 15 text carries no placeholders");
+});
+
+test("the policy document's own Day 15 wording is REJECTED as a warning", () => {
+  // This is the sentence the owner's policy document actually contains. It
+  // asserts, so it must never pass the warning validator: it belongs under
+  // day15-fee-applied with Jobber's proof, which 25 of 27 invoices lack.
+  const asWritten = "This is your reminder that your invoice is past due. A late fee of 3% has been " +
+    "applied and we kindly ask this invoice be paid before incurring any additional late fees. " +
+    "If you have any questions or concerns please reach out to our office at 602-329-7865.";
+  assert.equal(day15SmsCopyWarnsWithoutClaiming(asWritten), false);
+});
+
+test("a fee claim in any ordinary phrasing is rejected", () => {
+  for (const claim of [
+    "A late fee of 3% has been applied to your invoice.",
+    "A 3% late fee was added to your balance.",
+    "We have applied a 3% late fee.",
+    "A late fee of 3% is now charged.",
+    "Your balance now includes a late fee.",
+  ]) {
+    assert.equal(day15SmsCopyWarnsWithoutClaiming(claim), false, claim);
+  }
+});
+
+test("a warning must actually mention a fee, not merely be conditional", () => {
+  // Silent about the fee belongs under day15-no-fee-claim, not here.
+  assert.equal(day15SmsCopyWarnsWithoutClaiming(
+    "Your invoice is past due. Please pay it to avoid any further action."), false);
+});
+
+test("empty, unreadable or oversized copy warns nothing", () => {
+  assert.equal(day15SmsCopyWarnsWithoutClaiming(""), false);
+  assert.equal(day15SmsCopyWarnsWithoutClaiming("   "), false);
+  assert.equal(day15SmsCopyWarnsWithoutClaiming(null), false);
+  assert.equal(day15SmsCopyWarnsWithoutClaiming(42), false);
+  assert.equal(day15SmsCopyWarnsWithoutClaiming("A late fee of 3% may apply.\0"), false);
+  assert.equal(day15SmsCopyWarnsWithoutClaiming("A late fee of 3% may apply. " + "x".repeat(4000)), false);
+});
+
+test("our copy needs no amount rendered into it, like the legacy copy", () => {
+  assert.equal(day15StaticCopyNamesNoAmount(PROPOSED_DAY15_SMS_FEE_WARNING_BODY), true);
+  assert.equal(day15StaticCopyNamesNoAmount(APPROVED_DAY15_SMS_BODY), true);
+  // Anything else must go through rendering and carry {{balance}}.
+  assert.equal(day15StaticCopyNamesNoAmount("A late fee of 3% may apply."), false);
+  assert.equal(day15StaticCopyNamesNoAmount(PROPOSED_DAY15_SMS_FEE_WARNING_BODY + " "), false);
+});
+
+test("our copy passes the gate, backed by the written policy", () => {
+  const config = validConfig({ templatePolicy: "day15-fee-may-apply",
+    body: PROPOSED_DAY15_SMS_FEE_WARNING_BODY, terms: GOOD_POLICY });
+  (config as any).currencyPolicy = null;
+  const raw = JSON.stringify(config);
+  const result = inspectDay15PilotReadiness(raw, review(config, raw));
+  for (const hold of ["invoice_terms_or_written_policy_must_support_the_fee_warning",
+    "may_apply_copy_must_not_assert_a_fee_was_applied",
+    "may_apply_copy_must_state_the_condition_explicitly",
+    "approved_day15_exact_body_rendering_policy",
+    "reviewed_exact_invoice_currency_policy"]) {
+    assert.ok(!result.missing.includes(hold), `${hold} still held: ${result.missing.join(", ")}`);
+  }
+  // It claims no fact, so the gate grants none.
+  assert.deepEqual([...result.claimedFacts], []);
+});
+
+test("rendering our copy returns it unchanged", () => {
+  const config = validConfig({ templatePolicy: "day15-fee-may-apply",
+    body: PROPOSED_DAY15_SMS_FEE_WARNING_BODY, terms: GOOD_POLICY });
+  (config as any).currencyPolicy = null;
+  assert.equal(renderDay15Body(config, { balanceMinor: 9900, dueOn: "2026-11-03" }),
+    PROPOSED_DAY15_SMS_FEE_WARNING_BODY);
+});
+
+test("the asserted policy still demands Jobber's proof, unchanged", () => {
+  // The owner allowed the WARNING without Jobber. Asserting a charge is a
+  // statement about the balance, so it keeps its arithmetic proof.
+  const config = validConfig({ templatePolicy: "day15-fee-applied", fee: null,
+    body: "Your invoice is past due. A late fee of 3% has been applied. Call 602-329-7865." });
+  const raw = JSON.stringify(config);
+  const result = inspectDay15PilotReadiness(raw, review(config, raw));
+  assert.equal(result.state, "held");
+  assert.ok(result.missing.includes("jobber_proven_three_percent_fee_for_this_invoice"));
 });

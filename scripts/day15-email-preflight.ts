@@ -33,11 +33,20 @@ import { classifyLinkedJobRework } from "../lib/reminder-rework-notes";
 import { NATIVE_SMS_ATTESTATION_2026_11_17 } from "../lib/reminder-native-sms-attestation";
 
 const DAY = 15;
-/** Email only. Day 21 keeps whatever it already does; this run never touches it. */
+/**
+ * BOTH channels on day 15, approved by the account owner 2026-11-18: a customer
+ * with a phone and an email gets one text AND one email. Day 21 keeps whatever
+ * it already does; this run never touches it.
+ */
 const MILESTONE_CHANNELS = (step: { dayPastDue: number }): readonly SendChannel[] =>
-  step.dayPastDue === DAY ? ["email"] : [];
-/** Day 15 is one ledger event regardless of channel. Mirrors `eventKey`. */
-const CHANNEL_BLIND = [DAY];
+  step.dayPastDue === DAY ? ["email", "sms"] : [];
+/**
+ * Day 15 is NO LONGER channel-blind. Each channel now has its own ledger row and
+ * its own key, so a text already sent must not cancel the email or vice versa —
+ * each is suppressed on its own evidence. Mirrors `eventKey`, which carries the
+ * channel since 2026-11-18.
+ */
+const CHANNEL_BLIND: number[] = [];
 const OPEN = ["awaiting_payment", "past_due"];
 const SETTLED = new Set(["paid", "void", "bad_debt"]);
 
@@ -84,6 +93,10 @@ const PROTECTION = [
   "uncertain_send_attempt", "send_detail_unknown", "already_sent_all_channels",
   "milestone_already_sent_on_another_channel", "owner_has_multiple_unpaid_invoices",
   "source_owner_unknown_or_changed", "exclusions_unverified",
+  // Jobber decides where the bill goes. An address it does not hold is not a
+  // billing address, and an unreadable list is not an empty one.
+  "destination_contact_has_no_email", "jobber_billing_emails_unreadable",
+  "jobber_holds_no_billing_email", "destination_email_not_a_jobber_billing_email",
 ];
 /** Holds that ask GoHighLevel to confirm something Jobber already decided. */
 const GHL_DEPENDENCY = [
@@ -196,7 +209,20 @@ async function main() {
       const ghl = real.filter(h => GHL_DEPENDENCY.some(g => h.startsWith(g)));
       const prot = real.filter(h => PROTECTION.some(p => h.startsWith(p)));
       const other = real.filter(h => !ghl.includes(h) && !prot.includes(h));
-      if (!real.length) { disposition.set(row.jobberInvoiceId, "candidate"); detail.set(row.jobberInvoiceId, label2); }
+      // Which channels this invoice would actually go out on. Day 15 now uses
+      // both, so a candidate may be a text AND an email, a text only, or an
+      // email only. Printed rather than assumed: a channel suppressed by a
+      // GoHighLevel message already sent is named with its reason.
+      const live = (row.channels ?? []).filter(entry => entry.decision === "eligible")
+        .map(entry => entry.channel).sort();
+      const dead = (row.channels ?? []).filter(entry => entry.decision !== "eligible")
+        .map(entry => `${entry.channel}=${(entry.reason ?? "suppressed").split(":")[0]}`);
+      const channelNote = `${live.length ? live.join("+") : "no channel"}` +
+        `${dead.length ? ` (held: ${dead.join(", ")})` : ""}`;
+      if (!real.length) {
+        disposition.set(row.jobberInvoiceId, "candidate");
+        detail.set(row.jobberInvoiceId, `${label2} via ${channelNote}`);
+      }
       else if (prot.length || other.length) {
         disposition.set(row.jobberInvoiceId, "held_protection");
         detail.set(row.jobberInvoiceId, `${label2}:${[...prot, ...other].map(h => h.split(":")[0]).join("+")}`);
