@@ -30,10 +30,23 @@
  * unpaid invoice. When the last one is paid the card goes to "Invoice Paid"
  * carrying a zero balance.
  *
- * It reuses the customer's existing card rather than making a second one. That
- * is what makes it safe against the constraint above, and it is how the one
- * card the per-invoice writer managed to create before it halted
- * before it halted is adopted rather than orphaned.
+ * It reuses the customer's existing OPEN card rather than making a second one.
+ * That is what makes it safe against the constraint above, and it is how the
+ * one card the per-invoice writer managed to create before it halted is
+ * adopted rather than orphaned.
+ *
+ * A finished card is not reopened
+ * -------------------------------
+ * A card marked `won` or `lost` is settled business: someone decided that
+ * chase was over. When such a customer owes again, this module starts a NEW
+ * card instead of reopening the old one, so the finished card stays an honest
+ * record of what was collected and when. GoHighLevel allows this - its one-
+ * card-per-contact rule counts only OPEN cards - and the resolver has already
+ * excluded finished cards from `openCards`, so they arrive here as
+ * `finishedCardIds` and change nothing except the reason recorded on the
+ * create. The deployed per-invoice path did the opposite and held 135 changes
+ * on "Closed or unknown status; automatic reopening disabled"; those customers
+ * now get a fresh card.
  *
  * This module is pure. It performs no I/O and decides nothing about whether a
  * write is allowed; that stays with the writer and its gate.
@@ -113,7 +126,14 @@ export type CustomerCardInput = Readonly<{
   /** Display label for the card. Never an address or a phone number. */
   label: string;
   invoices: readonly InvoiceFact[];
+  /** OPEN cards only. Finished ones go in `finishedCardIds`. */
   cards: readonly ExistingCard[];
+  /**
+   * Cards this contact already carries that are `won` or `lost`. History: they
+   * never block, never get reopened, and only add a reason to a create so the
+   * run log says plainly that a settled card was left alone.
+   */
+  finishedCardIds?: readonly string[];
   clocks: Readonly<Record<string, InvoiceClock | null>>;
   /** First issue date in scope, from `invoiceWindowStart`. */
   windowStart?: string;
@@ -265,16 +285,21 @@ export function planCustomerCard(input: CustomerCardInput): CustomerCardDecision
   const existing = usable[0];
   if (!existing) {
     if (!oldest) return Object.freeze({ state: "skip", reasons: sorted(["nothing_unpaid_and_no_card_to_close"]) });
+    // A settled card is left settled; this customer simply starts a new one.
+    const restarted = (input.finishedCardIds ?? []).filter(text).length > 0;
+    const why = restarted
+      ? "started_a_new_card_because_the_previous_one_is_finished"
+      : "no_card_for_this_contact_yet";
     // A new card always starts in Sent. Creating straight into Overdue is the
     // transition the legacy workflow sends on, so it is never done blind.
     if (wantedStage === STAGE_OVERDUE && !overdueAllowed) {
       return Object.freeze({
         state: "create",
         target: Object.freeze({ ...target, stage: STAGE_SENT }),
-        reasons: sorted(["created_in_sent_because_the_overdue_move_needs_recorded_proof"]),
+        reasons: sorted([why, "created_in_sent_because_the_overdue_move_needs_recorded_proof"]),
       });
     }
-    return Object.freeze({ state: "create", target, reasons: sorted(["no_card_for_this_contact_yet"]) });
+    return Object.freeze({ state: "create", target, reasons: sorted([why]) });
   }
 
   // Reuse. This is the branch that keeps us inside GHL's one-card-per-contact

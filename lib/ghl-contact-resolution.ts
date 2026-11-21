@@ -68,7 +68,7 @@
  * can be exercised against fixtures without touching the live board.
  */
 
-import { canonicalPhone, matchPhoneCustomer } from "./ghl-phone-match";
+import { canonicalPhone, matchPhoneCustomer, phoneMayShareOwner } from "./ghl-phone-match";
 import { strictGhlIdentityHold } from "./ghl-write-identity";
 import type { GhlContact } from "./ghl";
 
@@ -77,6 +77,35 @@ export type ResolverCustomer = Readonly<{
   jobberClientId: string;
   email?: string | null;
   phone?: string | null;
+  /** Jobber's name for the customer. Needed only to CREATE a contact. */
+  name?: string | null;
+  /** Jobber's billing address. Copied onto a created contact, nothing else. */
+  address1?: string | null;
+  city?: string | null;
+  state?: string | null;
+  postalCode?: string | null;
+}>;
+
+/**
+ * A contact this run would add to GoHighLevel, built from Jobber's own record.
+ *
+ * Only ever produced when the customer could be proved absent from the board
+ * on BOTH identifiers - see `contactCreationCheck`. The card that should follow
+ * is planned separately by the caller, against `placeholderContactId`, which is
+ * not a GoHighLevel id and must never be sent to GoHighLevel.
+ */
+export type PlannedContactCreation = Readonly<{
+  customer: ResolverCustomer;
+  name: string;
+  email: string | null;
+  phone: string | null;
+  address1: string | null;
+  city: string | null;
+  state: string | null;
+  postalCode: string | null;
+  /** How absence was proved, for the run log. */
+  via: "email_and_phone_both_absent" | "email_absent_no_phone" | "phone_absent_no_email";
+  placeholderContactId: string;
 }>;
 
 /** A card as the board reports it. `stageName` is already resolved by the caller. */
@@ -95,6 +124,13 @@ export type ResolvedPayer = Readonly<{
   customers: readonly ResolverCustomer[];
   /** Live cards only. Finished (`won`/`lost`) cards are excluded as history. */
   openCards: readonly ResolverCard[];
+  /**
+   * Cards this contact already carries that are FINISHED (`won`/`lost`). They
+   * are history: they never identify the contact and never block a new card.
+   * Carried so the card plan can say it is starting a fresh card rather than
+   * reopening a closed one - see the note on restarting below.
+   */
+  finishedCards: readonly ResolverCard[];
   /** How the contact was identified, for the run log. */
   via: "primary_email" | "secondary_email" | "phone_fallback";
 }>;
@@ -146,6 +182,93 @@ function liveCardsOf(cards: readonly ResolverCard[], contactId: string): Resolve
   return cards.filter(c => c.contactId === contactId && isLiveCard(c));
 }
 
+function finishedCardsOf(cards: readonly ResolverCard[], contactId: string): ResolverCard[] {
+  return cards.filter(c => c.contactId === contactId && !isLiveCard(c));
+}
+
+/**
+ * MAY THIS CUSTOMER'S CONTACT BE CREATED?
+ *
+ * Reached only after email matching and the phone fallback have both failed to
+ * name a contact. That is not the same as proving the customer is absent, and
+ * the difference is the whole of this function: `matchPhoneCustomer` reports
+ * "missing or ambiguous" for BOTH "no contact carries this phone" and "three
+ * contacts do", and creating on the second would plant a duplicate beside the
+ * records we have spent days merging.
+ *
+ * So absence is proved here, directly and on both identifiers, and anything
+ * short of proof holds:
+ *
+ *   - the email names no contact, primary or secondary (the caller has already
+ *     established this; a non-empty candidate list never reaches here);
+ *   - no contact's phone canonicalises to the customer's;
+ *   - no contact carries a phone that merely MIGHT be the customer's - a
+ *     malformed or partial number that `phoneMayShareOwner` cannot rule out.
+ *     An unreadable number on the board is not evidence of absence;
+ *   - the customer's own phone canonicalises. If we cannot read Jobber's own
+ *     number we cannot search for it, so we cannot claim it is absent;
+ *   - no other Jobber customer shares the phone, which would make the new
+ *     contact's identity ambiguous the moment it existed;
+ *   - the customer carries at least one identifier. With neither an email nor
+ *     a phone there is nothing to deduplicate on, now or ever;
+ *   - Jobber has a name to create the contact under;
+ *   - the customer is not part of a shared-email group. Several Jobber
+ *     customers behind one address are one payer, but they are not one
+ *     identity: there is no single name, phone or billing address to create
+ *     the contact from. That stays a hold for a person to resolve.
+ *
+ * Returns the proof when creation is safe, or the reason it is not.
+ */
+export function contactCreationCheck(
+  customer: ResolverCustomer,
+  group: readonly ResolverCustomer[],
+  allCustomers: readonly ResolverCustomer[],
+  contacts: readonly GhlContact[],
+): { ok: true; via: PlannedContactCreation["via"] } | { ok: false; reason: string } {
+  if (group.length > 1) {
+    return { ok: false, reason: "several Jobber customers share this email and none has a contact; there is no single name, phone or address to create one from. Add or merge the contact in GoHighLevel" };
+  }
+  const email = emailKey(customer.email);
+  const rawPhone = text(customer.phone) ? customer.phone : null;
+  if (!email && !rawPhone) {
+    return { ok: false, reason: "the customer has neither an email nor a phone, so a created contact could never be matched again" };
+  }
+
+  if (rawPhone) {
+    const canonical = canonicalPhone(rawPhone);
+    if (!canonical) {
+      return { ok: false, reason: "the customer's phone cannot be read, so absence from GoHighLevel cannot be proved; correct the number in Jobber" };
+    }
+    const exact = contacts.filter(c => canonicalPhone(c.phone) === canonical);
+    if (exact.length) {
+      return { ok: false, reason: `${exact.length} GoHighLevel contact(s) already carry this phone; resolve them in GoHighLevel rather than adding another` };
+    }
+    const uncertain = contacts.filter(c => !canonicalPhone(c.phone) && phoneMayShareOwner(c.phone, canonical));
+    if (uncertain.length) {
+      return { ok: false, reason: `${uncertain.length} GoHighLevel contact(s) carry an unreadable phone that may be this one; correct them in GoHighLevel rather than adding another` };
+    }
+    if (allCustomers.some(c => c.jobberClientId !== customer.jobberClientId && phoneMayShareOwner(c.phone, canonical))) {
+      return { ok: false, reason: "another Jobber customer shares this phone, so a new contact's owner would be ambiguous" };
+    }
+  }
+
+  // Last, because it is the least informative refusal: if the identifiers
+  // themselves are the problem, say so instead.
+  if (!text(customer.name)) {
+    return { ok: false, reason: "no GoHighLevel contact carries this email or phone, and Jobber has no name to create one from; add the contact in GoHighLevel" };
+  }
+
+  return {
+    ok: true,
+    via: email && rawPhone ? "email_and_phone_both_absent"
+      : email ? "email_absent_no_phone"
+      : "phone_absent_no_email",
+  };
+}
+
+const trimmed = (v?: string | null): string | null =>
+  typeof v === "string" && v.trim() ? v.trim() : null;
+
 /**
  * Resolve each wanted customer to one contact, grouping co-payers that share an
  * email. Returns the payers that can be acted on and the ones that cannot, each
@@ -154,9 +277,11 @@ function liveCardsOf(cards: readonly ResolverCard[], contactId: string): Resolve
 export function resolvePayers(input: ResolutionInput): {
   payers: readonly ResolvedPayer[];
   holds: readonly PayerHold[];
+  creations: readonly PlannedContactCreation[];
 } {
   const payers: ResolvedPayer[] = [];
   const holds: PayerHold[] = [];
+  const creations: PlannedContactCreation[] = [];
   const doneCustomers = new Set<string>();
   const doneEmails = new Set<string>();
 
@@ -197,19 +322,36 @@ export function resolvePayers(input: ResolutionInput): {
     // for a lone customer: a shared billing address tells us nothing about
     // whose phone is whose.
     if (!candidates.length) {
-      if (group.length > 1) {
-        hold(group, [], "several Jobber customers share this email and no GoHighLevel contact carries it; add the contact in GoHighLevel");
-        continue;
-      }
-      const match = matchPhoneCustomer(
-        { jobberClientId: customer.jobberClientId, email: customer.email, phone: customer.phone },
-        input.allCustomers.map(c => ({ jobberClientId: c.jobberClientId, email: c.email, phone: c.phone })),
-        input.contacts.map(c => ({ id: c.id, email: c.email, phone: c.phone })),
-      );
+      const match = group.length === 1
+        ? matchPhoneCustomer(
+            { jobberClientId: customer.jobberClientId, email: customer.email, phone: customer.phone },
+            input.allCustomers.map(c => ({ jobberClientId: c.jobberClientId, email: c.email, phone: c.phone })),
+            input.contacts.map(c => ({ id: c.id, email: c.email, phone: c.phone })),
+          )
+        : { contactId: null, candidateIds: [] as string[], reason: "shared email group" };
+
       if (!match.contactId) {
-        hold(group, match.candidateIds, email
-          ? `no GoHighLevel contact carries this email, and the phone could not identify one (${match.reason ?? "unusable"}); add or correct the contact in GoHighLevel`
-          : `the phone could not identify a contact (${match.reason ?? "unusable"}); add or correct the contact in GoHighLevel`);
+        // Neither identifier named a contact. That is the case this project
+        // decided to FIX by adding the contact from Jobber's own record -
+        // but only where absence can actually be proved, because "no match"
+        // and "too many matches" arrive here looking identical.
+        const safe = contactCreationCheck(customer, group, input.allCustomers, input.contacts);
+        if (safe.ok) {
+          creations.push(Object.freeze({
+            customer,
+            name: (customer.name as string).trim(),
+            email: emailKey(customer.email),
+            phone: trimmed(customer.phone),
+            address1: trimmed(customer.address1),
+            city: trimmed(customer.city),
+            state: trimmed(customer.state),
+            postalCode: trimmed(customer.postalCode),
+            via: safe.via,
+            placeholderContactId: `new:${customer.jobberClientId}`,
+          }));
+          continue;
+        }
+        hold(group, match.candidateIds, safe.reason);
         continue;
       }
       candidates = input.contacts.filter(c => c.id === match.contactId);
@@ -261,9 +403,14 @@ export function resolvePayers(input: ResolutionInput): {
       contactId: chosen.id,
       customers: Object.freeze(group),
       openCards: Object.freeze(liveCardsOf(input.cards, chosen.id)),
+      finishedCards: Object.freeze(finishedCardsOf(input.cards, chosen.id)),
       via,
     }));
   }
 
-  return { payers: Object.freeze(payers), holds: Object.freeze(holds) };
+  return {
+    payers: Object.freeze(payers),
+    holds: Object.freeze(holds),
+    creations: Object.freeze(creations),
+  };
 }

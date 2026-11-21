@@ -104,8 +104,10 @@ test("no contact and no usable phone is refused with an actionable reason", () =
   const c = cust(1, "absent@example.test", null);
   const { payers, holds } = run([c], [contact("C1", "someone@example.test")]);
   assert.equal(payers.length, 0);
+  // Nameless in Jobber, so there is nothing to create a contact FROM: still a
+  // hold, and the reason still names the action a person has to take.
   assert.match(holds[0].reason, /no GoHighLevel contact carries this email/);
-  assert.match(holds[0].reason, /add or correct the contact in GoHighLevel/);
+  assert.match(holds[0].reason, /add the contact in GoHighLevel/);
 });
 
 test("a shared billing email with no contact is never resolved by one member's phone", () => {
@@ -181,5 +183,7 @@ test("a customer with no email and no usable phone is refused, not skipped", () 
   const { payers, holds } = run([c], [contact("C1", "ana@example.test")]);
   assert.equal(payers.length, 0);
   assert.equal(holds.length, 1);
-  assert.match(holds[0].reason, /could not identify/);
+  // An unreadable Jobber number cannot be searched for, so absence from the
+  // board cannot be proved and no contact may be created from it.
+  assert.match(holds[0].reason, /phone cannot be read/);
 });
