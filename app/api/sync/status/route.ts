@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { publicSyncRun } from "@/lib/sync-writer-control";
 
 export const dynamic = "force-dynamic";
 
@@ -8,5 +9,5 @@ export async function GET() {
   const run = await prisma.syncRun.findFirst({
     orderBy: { startedAt: "desc" },
   });
-  return NextResponse.json({ ok: true, run });
+  return NextResponse.json({ ok: true, run: run ? publicSyncRun(run) : null });
 }

@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { prisma } from "@/lib/prisma";
+import { openReceivablesWhere, balanceReviewWhere, invoiceReviewReason } from "@/lib/invoiceMetrics";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/Card";
 import { Badge } from "@/components/ui/Badge";
 import { StatCard } from "@/components/ui/StatCard";
@@ -20,12 +21,15 @@ export default async function ReceivablesPage({
   const range = hasFilter ? resolveDateRange(searchParams) : getDateRange("allTime");
 
   const invoices = await prisma.invoiceRecord.findMany({
-    where: {
-      amountDue: { gt: 0 },
-      issuedAt: { gte: range.start, lte: range.end },
-    },
+    where: openReceivablesWhere(range),
     orderBy: { issuedAt: "desc" },
   });
+
+  const reviewInvoices = await prisma.invoiceRecord.findMany({
+    where: balanceReviewWhere(range),
+    orderBy: { issuedAt: "desc" },
+  });
+  const reviewTotal = reviewInvoices.reduce((sum, invoice) => sum + invoice.amountDue, 0);
 
   const totalDue = invoices.reduce((acc, inv) => acc + (inv.amountDue || 0), 0);
   const uniqueCustomers = new Set(
@@ -34,11 +38,10 @@ export default async function ReceivablesPage({
 
   const now = new Date();
 
-  // Dedicated worklist: past-due invoices whose customer has no email. These are
-  // skipped by the GHL Invoice Pipeline sync (it needs an email to create a
-  // contact), so they need manual follow-up. Range-independent (all overdue).
+  // Due-date worklist for open invoices whose customer has no email. This is
+  // a contact-review list, not evidence of missing reminders. Range-independent.
   const overdueForContactCheck = await prisma.invoiceRecord.findMany({
-    where: { amountDue: { gt: 0 }, dueAt: { not: null, lt: now } },
+    where: { ...openReceivablesWhere(), dueAt: { not: null, lt: now } },
     include: { customer: true },
     orderBy: { dueAt: "asc" },
   });
@@ -62,8 +65,8 @@ export default async function ReceivablesPage({
           <div>
             <h2 className="text-2xl font-semibold tracking-tight">Outstanding Receivables</h2>
             <p className="mt-1 text-sm text-muted-foreground">
-              Invoices that have been issued but still have a balance owing. Showing{" "}
-              <span className="font-medium text-foreground">{range.label}</span>.
+              Current positive balances with awaiting-payment or past-due status, issued within{" "}
+              <span className="font-medium text-foreground">{range.label}</span>. Conflicting statuses are shown separately below. This is not a historical as-of balance.
             </p>
           </div>
           <DateRangeFilter />
@@ -92,15 +95,29 @@ export default async function ReceivablesPage({
         />
       </div>
 
+      {reviewInvoices.length > 0 && (
+        <Card className="border-amber-500/40">
+          <CardHeader>
+            <CardTitle>Balances Requiring Source Review</CardTitle>
+            <CardDescription>{formatCurrencyDetailed(reviewTotal)} across {reviewInvoices.length} records has a positive balance with paid, void, draft, bad-debt or unknown status. Excluded from open receivables, not proven settled. Verify source and payment evidence before action.</CardDescription>
+          </CardHeader>
+          <CardContent><div className="overflow-x-auto"><table className="w-full text-sm">
+            <thead><tr className="text-left"><th className="p-2">Invoice</th><th className="p-2">Customer</th><th className="p-2">Status</th><th className="p-2">Balance</th><th className="p-2">Review</th></tr></thead>
+            <tbody>{reviewInvoices.map(inv => <tr key={inv.id} className="border-t border-border">
+              <td className="p-2">#{inv.invoiceNumber ?? "Unknown"}</td><td className="p-2">{inv.clientName ?? "Unknown"}</td><td className="p-2">{inv.invoiceStatus ?? "Unknown"}</td><td className="p-2">{formatCurrencyDetailed(inv.amountDue)}</td><td className="p-2">{invoiceReviewReason(inv)}</td>
+            </tr>)}</tbody>
+          </table></div></CardContent>
+        </Card>
+      )}
+
       <Card className="border-amber-500/40">
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
             <AlertTriangle size={18} className="text-amber-500" />
-            Overdue · No Email on File
+            Open Invoices Past Stored Due Date · No Email
           </CardTitle>
           <CardDescription>
-            Past-due invoices whose customer has no email — these can&apos;t auto-sync to
-            GoHighLevel and need manual follow-up.{" "}
+            Open invoices with a stored due date in the past and no customer email. Includes awaiting-payment and past-due statuses; this is not proof that a reminder was missed. Check verified phone/contact linkage and actual reminder history before follow-up.{" "}
             <span className="font-medium text-foreground">
               {formatCurrency(noContactTotal)}
             </span>{" "}
@@ -111,7 +128,7 @@ export default async function ReceivablesPage({
         <CardContent>
           {noContactInvoices.length === 0 ? (
             <p className="text-sm text-muted-foreground">
-              Every overdue invoice has an email on file. 🎉
+              No open invoices past their stored due date are missing a customer email.
             </p>
           ) : (
             <div className="overflow-hidden rounded-lg border border-border">

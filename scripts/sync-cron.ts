@@ -16,7 +16,7 @@ async function main() {
   const startedAt = Date.now();
   console.log(`[cron] sync starting at ${new Date(startedAt).toISOString()}`);
 
-  const run = await runFullSync({ triggeredBy: "cron" });
+  const run = await runFullSync({ triggeredBy: "cron", entrypoint: "standalone_cron" });
 
   console.log(
     `[cron] sync finished: status=${run.status} id=${run.id} ` +

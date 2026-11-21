@@ -41,7 +41,7 @@ export default function SyncButton() {
           const status: string | undefined = body?.run?.status;
           if (status && status !== "running") {
             if (timerRef.current) clearInterval(timerRef.current);
-            if (status === "failed") {
+            if (status === "failed" || status === "blocked") {
               setError(body?.run?.errorMessage ?? "Sync failed");
             }
             resolve();

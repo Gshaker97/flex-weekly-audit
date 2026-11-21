@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { prisma } from "@/lib/prisma";
+import { publicSyncErrorMessage } from "@/lib/sync-writer-control";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/Card";
 import { Badge } from "@/components/ui/Badge";
 import { StatCard } from "@/components/ui/StatCard";
@@ -140,7 +141,7 @@ export default async function OverdueRevenuePage({
             {lastSync.errorMessage && (
               <p className="text-danger">
                 <span className="font-medium">Sync warning:</span>{" "}
-                {lastSync.errorMessage}
+                {publicSyncErrorMessage(lastSync.errorMessage)}
               </p>
             )}
             {vanished > 0 && (

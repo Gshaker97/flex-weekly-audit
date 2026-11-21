@@ -1,0 +1,681 @@
+/**
+ * Day 15 validator + the Day 10 safeguards it reuses.
+ *
+ * Everything here runs against a DISPOSABLE IN-MEMORY DATABASE and a FAKE
+ * SENDER. No Postgres, no Railway, no production ledger row, no GoHighLevel,
+ * no Jobber, no network of any kind. The fake is a model of the constraints,
+ * not a PostgreSQL engine: it cannot prove real SQL, locking, durability or
+ * driver behaviour.
+ */
+import test from "node:test";
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import {
+  createNotificationLedger, notificationBodyDigest,
+  type NotificationLedgerDatabase, type NotificationLedgerTransaction,
+  type NotificationReservationInput,
+} from "../lib/notification-ledger";
+import { planNotification, type Event, type Request } from "../lib/notification-gate";
+import {
+  inspectDay15PilotReadiness, reviewDay15PilotConfiguration, feeEvidenceProvesThreePercent,
+  renderDay15Body, day15ClaimedFacts, DAY15_FEE_FACT,
+  APPROVED_DAY15_SMS_BODY, termsEvidenceSupportsWarning, smsConsentIsRecorded,
+  PROPOSED_DAY15_SMS_FEE_WARNING_BODY, day15SmsCopyWarnsWithoutClaiming, day15StaticCopyNamesNoAmount,
+  type Day15PilotConfig, type Day15PilotReview,
+} from "../lib/notification-day15-pilot";
+
+// ---------------------------------------------------------------------------
+// Disposable in-memory database. Models the two unique indexes that matter.
+// ---------------------------------------------------------------------------
+type Row = Record<string, unknown> & { id: string; eventKey: string; state: string };
+
+class DisposableDatabase implements NotificationLedgerDatabase {
+  rows = new Map<string, Row>();
+  byEventKey = new Map<string, string>();
+  byContactDay = new Map<string, string>();
+  statements: string[] = [];
+  /** Serialises transactions, so an "overlap" is two interleaved reserve calls. */
+  private tail: Promise<unknown> = Promise.resolve();
+
+  async transaction<T>(work: (tx: NotificationLedgerTransaction) => Promise<T>): Promise<T> {
+    const previous = this.tail;
+    let release!: () => void;
+    this.tail = new Promise<void>(resolve => { release = resolve; });
+    await previous.catch(() => undefined);
+    try { return await work({ query: ((sql: string, values?: readonly unknown[]) => this.run(sql, values ?? [])) as NotificationLedgerTransaction["query"] }); }
+    finally { release(); }
+  }
+
+  private async run(sql: string, values: readonly unknown[]): Promise<Array<Record<string, unknown>>> {
+    this.statements.push(sql);
+    if (sql.includes("notification-ledger:reserve")) {
+      const [id, token, eventKey, accountId, invoiceId, dayPastDue, audience, contactId, scheduledOn] = values as any[];
+      const contactDay = JSON.stringify([accountId, contactId, scheduledOn]);
+      // ON CONFLICT DO NOTHING on either unique index.
+      if (this.byEventKey.has(eventKey) || this.byContactDay.has(contactDay)) return [];
+      const row: Row = { id, token, eventKey, accountId, invoiceId, dayPastDue, audience, contactId,
+        scheduledOn, state: "reserved" } as Row;
+      this.rows.set(id, row);
+      this.byEventKey.set(eventKey, id);
+      this.byContactDay.set(contactDay, id);
+      return [{ id }];
+    }
+    const id = values[0] as string;
+    const row = this.rows.get(id);
+    if (!row) return [];
+    if (sql.includes("SELECT")) return row.state === "reserved" ? [{ id }] : [];
+    if (sql.includes("UPDATE") && sql.includes("pending")) {
+      if (row.state !== "reserved") return [];
+      row.state = "pending";
+      return [{ id }];
+    }
+    if (sql.includes("UPDATE")) {
+      if (row.state !== "pending") return [];
+      row.state = "closed";
+      return [{ id }];
+    }
+    return [];
+  }
+}
+
+const BODY = "Day 15 synthetic fixture. This test never sends.";
+function reservationInput(patch: Partial<Event> = {}): NotificationReservationInput {
+  const event: Event = {
+    accountId: "disposable-account", invoiceId: "disposable-invoice-A", dayPastDue: 15,
+    audience: "homeowner", sourceRevision: "src-1", ownerRevision: "own-1", ownerId: "owner-1",
+    homeownerContactId: "contact-1", issuedDate: "2026-10-01", dueDate: "2026-10-30",
+    balanceMinor: 13700, currency: "USD", category: "maintenance", recipientId: "contact-1",
+    contactId: "contact-1", channel: "sms", destination: "+16025550111", templateId: "tpl-day15",
+    templateVersion: "1", bodyDigest: notificationBodyDigest(BODY), claimedFacts: [DAY15_FEE_FACT], ...patch,
+  };
+  return { event, body: BODY, destination: event.destination, channel: event.channel,
+    contactId: event.contactId, scheduledOn: "2026-11-14" };
+}
+
+// ---------------------------------------------------------------------------
+// 1. Overlapping runs
+// ---------------------------------------------------------------------------
+test("two overlapping runs for the same invoice and milestone: exactly one reservation", async () => {
+  const database = new DisposableDatabase();
+  // Two independent ledgers = two processes. A shared in-process claim set would
+  // mask the thing under test, which is the unique index.
+  const runA = createNotificationLedger(database);
+  const runB = createNotificationLedger(database);
+
+  const [a, b] = await Promise.all([runA.reserve(reservationInput()), runB.reserve(reservationInput())]);
+  const reserved = [a, b].filter(r => r.state === "reserved");
+  const held = [a, b].filter(r => r.state === "held");
+
+  assert.equal(reserved.length, 1, "exactly one run may hold the reservation");
+  assert.equal(held.length, 1, "the other run must be held, not queued");
+  assert.equal(database.rows.size, 1, "only one durable row exists");
+});
+
+test("a different invoice for the same customer on the same day is still blocked by the per-day index", async () => {
+  const database = new DisposableDatabase();
+  const ledger = createNotificationLedger(database);
+  const first = await ledger.reserve(reservationInput({ invoiceId: "disposable-invoice-A" }));
+  const second = await ledger.reserve(reservationInput({ invoiceId: "disposable-invoice-B" }));
+  assert.equal(first.state, "reserved");
+  assert.equal(second.state, "held", "one contact cannot be texted twice on one day");
+});
+
+// ---------------------------------------------------------------------------
+// 2. Payment landing after the reservation
+// ---------------------------------------------------------------------------
+/** A complete, fresh evidence bundle. Every field the gate demands, nothing defaulted. */
+const GATE_NOW = new Date("2026-11-14T16:05:00.000Z");
+function evidenceBundle(event: Event, patch: { balanceMinor?: number; status?: "open" | "paid";
+  dnd?: "allowed" | "blocked" | "unknown" } = {}) {
+  const proof = { observedAt: "2026-11-14T16:04:00.000Z", expiresAt: "2026-11-14T16:14:00.000Z", sourceRef: "disposable-fixture" };
+  return {
+    source: { ...proof, accountId: event.accountId, invoiceId: event.invoiceId, revision: event.sourceRevision,
+      available: true, complete: true, status: patch.status ?? "open", balanceMinor: patch.balanceMinor ?? event.balanceMinor,
+      currency: event.currency, ownerId: event.ownerId, issuedDate: event.issuedDate, dueDate: event.dueDate,
+      category: event.category, categoryVerified: true },
+    owner: { ...proof, accountId: event.accountId, invoiceId: event.invoiceId, revision: event.ownerRevision,
+      ownerId: event.ownerId, homeownerContactId: event.homeownerContactId, exactSourceIdentity: true, complete: true },
+    recipient: { ...proof, accountId: event.accountId, recipientId: event.recipientId, contactId: event.contactId,
+      audience: event.audience, channel: event.channel, destination: event.destination,
+      exactSourceIdentity: true, destinationVerified: true, internalRecipientApproved: false },
+    dnd: { ...proof, accountId: event.accountId, contactId: event.contactId, channel: event.channel,
+      destination: event.destination, state: patch.dnd ?? "allowed" },
+    template: { ...proof, approved: true, accountId: event.accountId, id: event.templateId,
+      version: event.templateVersion, bodyDigest: event.bodyDigest, audience: event.audience,
+      dayPastDue: event.dayPastDue, channel: event.channel, claimedFacts: event.claimedFacts },
+    channelAuthorization: { ...proof, approved: true, eventKey: "", recipientId: event.recipientId,
+      channel: event.channel, destination: event.destination },
+    facts: event.claimedFacts.map(fact => ({ ...proof, fact, accountId: event.accountId,
+      invoiceId: event.invoiceId, sourceRevision: event.sourceRevision, value: true })),
+    attempts: { ...proof, accountId: event.accountId, historyComplete: true, records: [] },
+  } as unknown as Request["preflight"];
+}
+
+test("payment after the reservation holds at the final gate and never sends", async () => {
+  const database = new DisposableDatabase();
+  const ledger = createNotificationLedger(database);
+  const reserved = await ledger.reserve(reservationInput());
+  assert.equal(reserved.state, "reserved");
+
+  const event = reservationInput().event;
+  // Preflight saw an open balance. The final re-read sees it paid.
+  const request = {
+    event,
+    preflight: evidenceBundle(event),
+    final: evidenceBundle(event, { balanceMinor: 0, status: "paid" }),
+  } as unknown as Request;
+
+  const plan = planNotification(request, GATE_NOW);
+  assert.equal(plan.designStatus, "hold", "a paid invoice must never be eligible");
+  assert.ok(plan.reasons.some(r => r.startsWith("final:") && r.includes("not_open_positive_balance")),
+    `expected the final-phase balance hold, got ${JSON.stringify(plan.reasons)}`);
+  assert.equal(plan.sendCapability, false);
+
+  // The reservation stays exactly where it is. Nothing advances it.
+  assert.equal([...database.rows.values()][0].state, "reserved");
+});
+
+test("an opted-out recipient holds, even with everything else correct", () => {
+  const event = reservationInput().event;
+  const plan = planNotification({ event, preflight: evidenceBundle(event),
+    final: evidenceBundle(event, { dnd: "blocked" }) } as unknown as Request, GATE_NOW);
+  assert.equal(plan.designStatus, "hold");
+  assert.ok(plan.reasons.some(r => r.includes("dnd") || r.includes("suppress")),
+    `expected an opt-out hold, got ${JSON.stringify(plan.reasons)}`);
+});
+
+test("an unknown opt-out state holds too: silence is not consent", () => {
+  const event = reservationInput().event;
+  const plan = planNotification({ event, preflight: evidenceBundle(event),
+    final: evidenceBundle(event, { dnd: "unknown" }) } as unknown as Request, GATE_NOW);
+  assert.equal(plan.designStatus, "hold");
+});
+
+// ---------------------------------------------------------------------------
+// 3. A timeout must never retry
+// ---------------------------------------------------------------------------
+test("a timed-out attempt stays pending, is never retried, and cannot be re-reserved", async () => {
+  const database = new DisposableDatabase();
+  const ledger = createNotificationLedger(database);
+  const reservation = await ledger.reserve(reservationInput());
+  assert.equal(reservation.state, "reserved");
+  const handle = (reservation as { reservation: Parameters<typeof ledger.assertReserved>[0] }).reservation;
+
+  assert.equal(await ledger.assertReserved(handle), true);
+  assert.equal(await ledger.markPending(handle), true);
+
+  // The fake sender times out. One call, no response.
+  let sends = 0;
+  const fakeSender = {
+    fake: true as const, name: "fake-timeout-sender",
+    async send() { sends += 1; throw new Error("ETIMEDOUT"); },
+  };
+  let outcome: "unknown" | "accepted" = "accepted";
+  try { await fakeSender.send(); } catch { outcome = "unknown"; }
+
+  assert.equal(sends, 1, "exactly one attempt was made");
+  assert.equal(outcome, "unknown");
+
+  // Nothing retries. The row sits at pending for a person to reconcile.
+  const row = [...database.rows.values()][0];
+  assert.equal(row.state, "pending");
+
+  // And the allowance is spent: a fresh process cannot reserve it again.
+  const anotherProcess = createNotificationLedger(database);
+  const again = await anotherProcess.reserve(reservationInput());
+  assert.equal(again.state, "held", "a timed-out attempt must not free the milestone");
+  assert.equal(sends, 1, "still exactly one attempt");
+});
+
+// ---------------------------------------------------------------------------
+// 4. The test entry point cannot reach the real send transport
+// ---------------------------------------------------------------------------
+test("the day 15 module imports no transport, no runtime, no client and no network", () => {
+  const source = readFileSync(new URL("../lib/notification-day15-pilot.ts", import.meta.url), "utf8");
+  const imports = [...source.matchAll(/^import[^;]*?from\s+"([^"]+)"/gm)].map(m => m[1]);
+  assert.deepEqual(imports.sort(), ["./invoice-reminder-clock", "./notification-source", "node:crypto"].sort(),
+    `unexpected imports: ${JSON.stringify(imports)}`);
+
+  for (const forbidden of ["notification-ghl-transport", "notification-runner", "notification-dispatch",
+    "./prisma", "fetch(", "process.env", "readFile", "node:fs", "node:http"]) {
+    assert.ok(!source.includes(forbidden), `day 15 validator must not reference ${forbidden}`);
+  }
+});
+
+test("the validator exposes no send action at all", () => {
+  // Day 10 accepts "read-only" | "one-attempt". Day 15 accepts only "read-only".
+  const config = validConfig({ templatePolicy: "day15-no-fee-claim" });
+  const raw = JSON.stringify(config);
+  const asOneAttempt = { configSha256: sha256(raw), reviewRef: config.reviewRef, action: "one-attempt" } as unknown as Day15PilotReview;
+  const result = inspectDay15PilotReadiness(raw, asOneAttempt);
+  assert.equal(result.state, "held");
+  assert.ok(result.missing.includes("explicit_read_only_runtime_action"));
+  assert.equal(result.productionSendCapability, false);
+  assert.equal(result.rolloutReady, false);
+});
+
+// ---------------------------------------------------------------------------
+// 5. The 3% fee may not be claimed unless Jobber proves it
+// ---------------------------------------------------------------------------
+import { createHash } from "node:crypto";
+const sha256 = (v: string) => createHash("sha256").update(v, "utf8").digest("hex");
+
+const GOOD_CONSENT = { source: "signed-agreement", contactId: "contact-1", scope: "billing-sms",
+  recordedAt: "2026-09-01T17:00:00.000Z", evidenceRef: "consent-1" };
+const GOOD_TERMS = { source: "jobber-invoice-terms", invoiceId: "invoice-1",
+  termsExcerpt: "Payment due on receipt. A late fee of 3% may be applied to past due balances.",
+  statesLateFee: true, observedAt: "2026-11-14T16:00:00.000Z", evidenceRef: "terms-1" };
+
+function validConfig(options: { templatePolicy: Day15PilotConfig["template"]["policy"];
+  fee?: unknown; body?: string; terms?: unknown; consent?: unknown }): Day15PilotConfig {
+  const now = Date.now();
+  const iso = (ms: number) => new Date(ms).toISOString();
+  return {
+    version: 1, kind: "day15-homeowner-sms-pilot", reviewRef: "review-day15-synthetic",
+    reviewedAt: iso(now - 60_000), expiresAt: iso(now + 3_600_000),
+    source: {
+      version: 1, reviewRef: "source-day15-synthetic", expiresAt: iso(now + 7_200_000),
+      scope: { locationId: "loc-1", jobberClientId: "client-1", contactId: "contact-1", invoiceId: "invoice-1" },
+      originalInvoice: { totalMinor: 13700, issuedDate: "2026-10-01", dueDate: "2026-10-30" },
+      identityCoveragePolicy: { accountId: "account-1" },
+    },
+    destination: "+16025550111",
+    scope: { scheduledOn: "2026-11-14", dayPastDue: 15, audience: "homeowner", channel: "sms",
+      maximumAttempts: 1, history: "accessible-ghl-plus-local-ledger", timeZone: "America/Phoenix",
+      window: "[09:00:00,09:15:00)", authorizationRef: "auth-1", timingRef: "timing-1", credentialBindingRef: "cred-1" },
+    currencyPolicy: { accountId: "account-1", invoiceId: "invoice-1", currency: "USD", minorUnitExponent: 2, evidenceRef: "cur-1" },
+    sender: { number: "+16023297865", approvalRef: "sender-1", writeScopeEvidenceRef: "scope-1" },
+    template: { id: "tpl-day15", version: "1", policy: options.templatePolicy, approvalRef: "tpl-approval-1",
+      body: options.body ?? (options.templatePolicy === "day15-fee-applied"
+        ? "Your invoice is 15 days past due and a 3% late fee has been applied. Balance now {{balance}}."
+        : "Your invoice is 15 days past due. Balance {{balance}}. Please call our office at 602-329-7865.") },
+    feeEvidence: (options.fee ?? null) as Day15PilotConfig["feeEvidence"],
+    termsEvidence: ((options.terms !== undefined ? options.terms
+      : options.templatePolicy === "day15-fee-may-apply" ? GOOD_TERMS : null)) as Day15PilotConfig["termsEvidence"],
+    smsConsent: ((options.consent !== undefined ? options.consent : GOOD_CONSENT)) as Day15PilotConfig["smsConsent"],
+    nativeSms: { version: "2021-07-28", status: "pending", receiptSource: "app", semanticsRef: "sem-1",
+      footer: { mode: "exact-native-suffix", suffix: "\n\nReply STOP to opt out.", evidenceRef: "foot-1" } },
+  } as unknown as Day15PilotConfig;
+}
+const review = (c: Day15PilotConfig, raw: string): Day15PilotReview =>
+  ({ configSha256: sha256(raw), reviewRef: c.reviewRef, action: "read-only" });
+
+test("arithmetic is what proves the fee, not a line item name", () => {
+  const base = 13300;
+  const exact = Math.round((base * 300) / 10_000); // 399
+  const good = { source: "jobber-invoice-line-item" as const, invoiceId: "invoice-1",
+    lineItemName: "Late Fee", feeMinor: exact, baseMinor: base,
+    observedAt: "2026-11-14T16:00:00.000Z", evidenceRef: "jobber-line-1" };
+  assert.equal(feeEvidenceProvesThreePercent(good, "invoice-1"), true);
+
+  assert.equal(feeEvidenceProvesThreePercent({ ...good, feeMinor: exact + 1 }, "invoice-1"), false, "wrong amount");
+  assert.equal(feeEvidenceProvesThreePercent(good, "invoice-2"), false, "evidence from another invoice");
+  assert.equal(feeEvidenceProvesThreePercent({ ...good, lineItemName: "Mulch" }, "invoice-1"), false, "not named a fee");
+  assert.equal(feeEvidenceProvesThreePercent(null, "invoice-1"), false, "absent evidence is not proof");
+});
+
+test("fee-applied copy is HELD when Jobber does not prove the fee", () => {
+  const config = validConfig({ templatePolicy: "day15-fee-applied", fee: null });
+  const raw = JSON.stringify(config);
+  const result = inspectDay15PilotReadiness(raw, review(config, raw));
+  assert.equal(result.state, "held");
+  assert.ok(result.missing.includes("jobber_proven_three_percent_fee_for_this_invoice"));
+  assert.deepEqual([...result.claimedFacts], [], "an unproven fact is never claimed");
+});
+
+test("fee-applied copy is accepted when Jobber proves the fee, and only then claims the fact", () => {
+  const base = 13300;
+  const config = validConfig({ templatePolicy: "day15-fee-applied", fee: {
+    source: "jobber-invoice-line-item", invoiceId: "invoice-1", lineItemName: "Late Fee (3%)",
+    feeMinor: Math.round((base * 300) / 10_000), baseMinor: base,
+    observedAt: "2026-11-14T16:00:00.000Z", evidenceRef: "jobber-line-1" } });
+  const raw = JSON.stringify(config);
+  const result = inspectDay15PilotReadiness(raw, review(config, raw));
+  assert.equal(result.state, "reviewed_configuration", `missing: ${JSON.stringify(result.missing)}`);
+  assert.equal(result.feeClaim, "proven_by_jobber");
+  assert.deepEqual([...result.claimedFacts], [DAY15_FEE_FACT]);
+
+  const handle = reviewDay15PilotConfiguration(raw, review(config, raw)).handle;
+  assert.ok(handle);
+  assert.deepEqual([...day15ClaimedFacts(config)], [DAY15_FEE_FACT]);
+});
+
+test("no-fee-claim copy may not smuggle fee wording back in", () => {
+  const config = validConfig({ templatePolicy: "day15-no-fee-claim",
+    body: "Your invoice is 15 days past due and a late fee has been applied. Balance {{balance}}." });
+  const raw = JSON.stringify(config);
+  const result = inspectDay15PilotReadiness(raw, review(config, raw));
+  assert.equal(result.state, "held");
+  assert.ok(result.missing.includes("no_fee_claim_copy_must_not_mention_a_fee"));
+  assert.ok(result.missing.includes("asserted_fee_requires_fee_applied_policy"));
+});
+
+// --- The copy that is actually live in Fixed Automation, read 2026-11-16 ---
+const LIVE_DAY15_SMS =
+  "Hello {{balance}}, This is your reminder that your invoice is past due. " +
+  "A late fee of 3% may apply under your invoice terms, and we kindly ask this invoice " +
+  "be paid to avoid potential late fees. If you have any questions or concerns please " +
+  "reach out to our office at 602-329-7865.";
+
+test("the live approved Day 15 copy warns about the fee and does NOT assert it", () => {
+  const config = validConfig({ templatePolicy: "day15-fee-may-apply", body: LIVE_DAY15_SMS });
+  const raw = JSON.stringify(config);
+  const result = inspectDay15PilotReadiness(raw, review(config, raw));
+  assert.equal(result.state, "reviewed_configuration", `missing: ${JSON.stringify(result.missing)}`);
+  assert.equal(result.feeClaim, "not_claimed_gate_will_hold");
+  assert.deepEqual([...result.claimedFacts], [], "a warning claims nothing, so no Jobber proof is needed");
+});
+
+test("the live copy is rejected if filed as an assertion, because nothing proves the fee", () => {
+  const config = validConfig({ templatePolicy: "day15-fee-applied", body: LIVE_DAY15_SMS, fee: null });
+  const raw = JSON.stringify(config);
+  const result = inspectDay15PilotReadiness(raw, review(config, raw));
+  assert.equal(result.state, "held");
+  assert.ok(result.missing.includes("jobber_proven_three_percent_fee_for_this_invoice"));
+});
+
+test("'may apply' is not accepted as a fee-free template", () => {
+  const config = validConfig({ templatePolicy: "day15-no-fee-claim", body: LIVE_DAY15_SMS });
+  const raw = JSON.stringify(config);
+  const result = inspectDay15PilotReadiness(raw, review(config, raw));
+  assert.equal(result.state, "held");
+  assert.ok(result.missing.includes("no_fee_claim_copy_must_not_mention_a_fee"));
+});
+
+test("an assertion dressed up as a warning is still an assertion", () => {
+  const config = validConfig({ templatePolicy: "day15-fee-may-apply",
+    body: "Your invoice is past due. A 3% late fee has been applied to avoid further charges. Balance {{balance}}." });
+  const raw = JSON.stringify(config);
+  const result = inspectDay15PilotReadiness(raw, review(config, raw));
+  assert.equal(result.state, "held");
+  assert.ok(result.missing.includes("may_apply_copy_must_not_assert_a_fee_was_applied"));
+});
+
+test("no-fee-claim copy is valid, claims nothing, and the gate will hold it", () => {
+  const config = validConfig({ templatePolicy: "day15-no-fee-claim" });
+  const raw = JSON.stringify(config);
+  const result = inspectDay15PilotReadiness(raw, review(config, raw));
+  assert.equal(result.state, "reviewed_configuration", `missing: ${JSON.stringify(result.missing)}`);
+  assert.equal(result.feeClaim, "not_claimed_gate_will_hold");
+  assert.deepEqual([...result.claimedFacts], []);
+
+  // And that is exactly what the gate does: day 15 requires the fact.
+  const event = reservationInput({ claimedFacts: [] }).event;
+  const plan = planNotification({ event, preflight: evidenceBundle(event), final: evidenceBundle(event) } as unknown as Request,
+    GATE_NOW);
+  assert.equal(plan.designStatus, "hold");
+  assert.ok(plan.reasons.includes("required_template_fact_missing"),
+    `day 15 without the fee fact must hold, not send softened copy; got ${JSON.stringify(plan.reasons)}`);
+});
+
+// ---------------------------------------------------------------------------
+// 6. Rendering
+// ---------------------------------------------------------------------------
+test("rendering refuses a zero balance and an absent invoice number", () => {
+  const config = validConfig({ templatePolicy: "day15-no-fee-claim" });
+  assert.throws(() => renderDay15Body(config, { balanceMinor: 0, dueOn: "2026-10-30" }), /positive_balance/);
+
+  const withNumber = validConfig({ templatePolicy: "day15-no-fee-claim",
+    body: "Invoice {{invoiceNumber}} is 15 days past due. Balance {{balance}}." });
+  assert.throws(() => renderDay15Body(withNumber, { balanceMinor: 13700, invoiceNumber: null, dueOn: "2026-10-30" }),
+    /invoice_display_number_required/);
+  assert.equal(renderDay15Body(withNumber, { balanceMinor: 13700, invoiceNumber: "7203", dueOn: "2026-10-30" }),
+    "Invoice 7203 is 15 days past due. Balance USD 137.00.");
+});
+
+// ---------------------------------------------------------------------------
+// 7. The exact approved wording, invoice terms, and consent
+// ---------------------------------------------------------------------------
+test("the exact approved copy is accepted: no balance placeholder, no currency policy", () => {
+  const config = validConfig({ templatePolicy: "day15-fee-may-apply", body: APPROVED_DAY15_SMS_BODY });
+  (config as any).currencyPolicy = null;   // it names no amount
+  const raw = JSON.stringify(config);
+  const result = inspectDay15PilotReadiness(raw, review(config, raw));
+  assert.equal(result.state, "reviewed_configuration", `missing: ${JSON.stringify(result.missing)}`);
+  assert.equal(result.feeClaim, "not_claimed_gate_will_hold");
+  assert.deepEqual([...result.claimedFacts], []);
+  // Nothing is rendered into it, so nothing can be rendered wrong.
+  assert.equal(renderDay15Body(config, { balanceMinor: 13700, dueOn: "2026-10-30" }), APPROVED_DAY15_SMS_BODY);
+});
+
+test("the warning is held unless the TERMS or a written POLICY support it", () => {
+  const config = validConfig({ templatePolicy: "day15-fee-may-apply", body: APPROVED_DAY15_SMS_BODY, terms: null });
+  (config as any).currencyPolicy = null;
+  const raw = JSON.stringify(config);
+  const result = inspectDay15PilotReadiness(raw, review(config, raw));
+  assert.equal(result.state, "held");
+  assert.ok(result.missing.includes("invoice_terms_or_written_policy_must_support_the_fee_warning"));
+});
+
+/**
+ * The fee warning may now be backed by the company's own written late-fee
+ * policy, not only by Jobber's invoice-terms field. Widened 2026-11-18 on the
+ * account owner's instruction: the fee is set by the published policy, and
+ * whether Jobber's terms field repeats it is bookkeeping, not what makes the
+ * fee true.
+ *
+ * These tests pin what did NOT move with it. The excerpt must still say a late
+ * fee exists, and a policy cannot reach back to invoices issued before it.
+ */
+const GOOD_POLICY = { source: "company-late-fee-policy" as const, policyRef: "late-fee-and-cancellation-policies",
+  effectiveFrom: "2026-01-01",
+  termsExcerpt: "A late fee of 3% may be applied to balances more than 15 days past due.",
+  statesLateFee: true as const, observedAt: "2026-11-18T16:00:00.000Z", evidenceRef: "policy-1" };
+
+test("a written company policy can back the fee warning", () => {
+  // Issued 2026-10-01, policy effective 2026-01-01: covered.
+  assert.equal(termsEvidenceSupportsWarning(GOOD_POLICY, "invoice-1", "2026-10-01"), true);
+});
+
+test("the written policy still has to SAY there is a late fee", () => {
+  assert.equal(termsEvidenceSupportsWarning({ ...GOOD_POLICY,
+    termsExcerpt: "Payment is due on receipt. Cancellations require 24 hours notice." },
+    "invoice-1", "2026-10-01"), false, "a policy that is silent on fees backs nothing");
+  assert.equal(termsEvidenceSupportsWarning({ ...GOOD_POLICY, termsExcerpt: "   " },
+    "invoice-1", "2026-10-01"), false);
+});
+
+test("a policy cannot be applied to an invoice issued before it took effect", () => {
+  // The invoice predates the policy by a day. It was never subject to it.
+  assert.equal(termsEvidenceSupportsWarning({ ...GOOD_POLICY, effectiveFrom: "2026-10-02" },
+    "invoice-1", "2026-10-01"), false);
+  // Issued ON the effective date is covered.
+  assert.equal(termsEvidenceSupportsWarning({ ...GOOD_POLICY, effectiveFrom: "2026-10-01" },
+    "invoice-1", "2026-10-01"), true);
+});
+
+test("the policy route FAILS CLOSED without a readable invoice issue date", () => {
+  // Deliberately not optional-and-skipped: plumbing the date wrong must refuse
+  // the warning, never wave it through for everyone.
+  assert.equal(termsEvidenceSupportsWarning(GOOD_POLICY, "invoice-1"), false, "no date supplied");
+  assert.equal(termsEvidenceSupportsWarning(GOOD_POLICY, "invoice-1", null), false);
+  assert.equal(termsEvidenceSupportsWarning(GOOD_POLICY, "invoice-1", "01/10/2026"), false);
+});
+
+test("the written policy needs a reference and a usable effective date", () => {
+  assert.equal(termsEvidenceSupportsWarning({ ...GOOD_POLICY, policyRef: "" }, "invoice-1", "2026-10-01"), false);
+  assert.equal(termsEvidenceSupportsWarning({ ...GOOD_POLICY, effectiveFrom: "January 2026" } as any,
+    "invoice-1", "2026-10-01"), false);
+});
+
+test("a policy is NOT tied to one invoice, unlike Jobber terms", () => {
+  // The whole point: one written policy covers every invoice issued under it,
+  // so it carries no invoiceId and is not compared against one.
+  assert.equal(termsEvidenceSupportsWarning(GOOD_POLICY, "invoice-99", "2026-10-01"), true);
+});
+
+test("an unrecognised evidence source backs nothing", () => {
+  assert.equal(termsEvidenceSupportsWarning({ ...GOOD_POLICY, source: "operator-says-so" } as any,
+    "invoice-1", "2026-10-01"), false);
+});
+
+test("a written policy satisfies the gate end to end", () => {
+  const config = validConfig({ templatePolicy: "day15-fee-may-apply",
+    body: APPROVED_DAY15_SMS_BODY, terms: GOOD_POLICY });
+  (config as any).currencyPolicy = null;
+  const raw = JSON.stringify(config);
+  const result = inspectDay15PilotReadiness(raw, review(config, raw));
+  assert.ok(!result.missing.includes("invoice_terms_or_written_policy_must_support_the_fee_warning"),
+    `fee warning still held: ${result.missing.join(", ")}`);
+});
+
+test("terms evidence must show the fee in its own text, not just assert statesLateFee", () => {
+  const silent = { source: "jobber-invoice-terms" as const, invoiceId: "invoice-1",
+    termsExcerpt: "Payment is due on receipt. Thank you for your business.",
+    statesLateFee: true as const, observedAt: "2026-11-14T16:00:00.000Z", evidenceRef: "terms-1" };
+  assert.equal(termsEvidenceSupportsWarning(silent, "invoice-1"), false, "a flag is not proof");
+  assert.equal(termsEvidenceSupportsWarning({ ...silent,
+    termsExcerpt: "A late fee of 3% applies to past due balances." }, "invoice-1"), true);
+  assert.equal(termsEvidenceSupportsWarning({ ...silent,
+    termsExcerpt: "A late fee of 3% applies." }, "invoice-2"), false, "terms from another invoice");
+  assert.equal(termsEvidenceSupportsWarning(null, "invoice-1"), false);
+});
+
+test("terms evidence may not ride along with a policy that does not use it", () => {
+  const config = validConfig({ templatePolicy: "day15-no-fee-claim", terms: GOOD_TERMS });
+  const raw = JSON.stringify(config);
+  const result = inspectDay15PilotReadiness(raw, review(config, raw));
+  assert.equal(result.state, "held");
+  assert.ok(result.missing.includes("terms_evidence_requires_may_apply_policy"));
+});
+
+test("no recorded consent means held, under every policy", () => {
+  for (const policy of ["day15-fee-applied", "day15-fee-may-apply", "day15-no-fee-claim"] as const) {
+    const config = validConfig({ templatePolicy: policy, consent: null,
+      fee: policy === "day15-fee-applied" ? { source: "jobber-invoice-line-item", invoiceId: "invoice-1",
+        lineItemName: "Late Fee", feeMinor: 399, baseMinor: 13300,
+        observedAt: "2026-11-14T16:00:00.000Z", evidenceRef: "jobber-line-1" } : null });
+    const raw = JSON.stringify(config);
+    const result = inspectDay15PilotReadiness(raw, review(config, raw));
+    assert.equal(result.state, "held", `${policy} should hold without consent`);
+    assert.ok(result.missing.includes("recorded_homeowner_consent_to_billing_sms"), policy);
+  }
+});
+
+test("an absent SMS DND record cannot be turned into consent", () => {
+  // The shapes a DND reading could offer. None of them satisfies the check.
+  for (const shape of [
+    { source: "no_dnd_record", contactId: "contact-1", scope: "billing-sms", recordedAt: "2026-09-01T17:00:00.000Z", evidenceRef: "dnd-1" },
+    { source: "signed-agreement", contactId: "contact-1", scope: "sms", recordedAt: "2026-09-01T17:00:00.000Z", evidenceRef: "dnd-1" },
+    { source: "signed-agreement", contactId: "contact-1", scope: "marketing-sms", recordedAt: "2026-09-01T17:00:00.000Z", evidenceRef: "dnd-1" },
+    { source: "signed-agreement", contactId: "someone-else", scope: "billing-sms", recordedAt: "2026-09-01T17:00:00.000Z", evidenceRef: "dnd-1" },
+  ]) {
+    assert.equal(smsConsentIsRecorded(shape as any, "contact-1"), false, JSON.stringify(shape.source + "/" + shape.scope));
+  }
+  assert.equal(smsConsentIsRecorded(GOOD_CONSENT as any, "contact-1"), true);
+});
+
+test("consent to marketing texts is not consent to billing texts", () => {
+  const config = validConfig({ templatePolicy: "day15-no-fee-claim",
+    consent: { ...GOOD_CONSENT, scope: "marketing-sms" } });
+  const raw = JSON.stringify(config);
+  const result = inspectDay15PilotReadiness(raw, review(config, raw));
+  assert.equal(result.state, "held");
+  assert.ok(result.missing.includes("recorded_homeowner_consent_to_billing_sms"));
+});
+
+/**
+ * OUR Day 15 text. The company's own written wording with one clause changed,
+ * because the written clause was measurably false: of the 27 unpaid invoices
+ * past day 15 on 2026-11-18, exactly 2 carried a Late Fee line item. The owner
+ * chose the warning wording for all of them.
+ *
+ * These tests exist so the copy cannot quietly become a claim again. The
+ * difference between "may apply" and "has been applied" is the difference
+ * between a warning and a statement about the customer's balance.
+ */
+test("our Day 15 text warns about the fee and never claims one was applied", () => {
+  assert.equal(day15SmsCopyWarnsWithoutClaiming(PROPOSED_DAY15_SMS_FEE_WARNING_BODY), true);
+});
+
+test("the copy says what the policy says, minus the claim", () => {
+  const body = PROPOSED_DAY15_SMS_FEE_WARNING_BODY;
+  assert.match(body, /your invoice is past due/);
+  assert.match(body, /late fee of 3% may apply/);
+  assert.match(body, /602-329-7865/);
+  // The exact words the policy document used, which measurement ruled out.
+  assert.ok(!/has been applied/i.test(body), "must not assert the fee was applied");
+  // No amount, so there is nothing to render and nothing to render wrong.
+  assert.ok(!/\{\{/.test(body), "our Day 15 text carries no placeholders");
+});
+
+test("the policy document's own Day 15 wording is REJECTED as a warning", () => {
+  // This is the sentence the owner's policy document actually contains. It
+  // asserts, so it must never pass the warning validator: it belongs under
+  // day15-fee-applied with Jobber's proof, which 25 of 27 invoices lack.
+  const asWritten = "This is your reminder that your invoice is past due. A late fee of 3% has been " +
+    "applied and we kindly ask this invoice be paid before incurring any additional late fees. " +
+    "If you have any questions or concerns please reach out to our office at 602-329-7865.";
+  assert.equal(day15SmsCopyWarnsWithoutClaiming(asWritten), false);
+});
+
+test("a fee claim in any ordinary phrasing is rejected", () => {
+  for (const claim of [
+    "A late fee of 3% has been applied to your invoice.",
+    "A 3% late fee was added to your balance.",
+    "We have applied a 3% late fee.",
+    "A late fee of 3% is now charged.",
+    "Your balance now includes a late fee.",
+  ]) {
+    assert.equal(day15SmsCopyWarnsWithoutClaiming(claim), false, claim);
+  }
+});
+
+test("a warning must actually mention a fee, not merely be conditional", () => {
+  // Silent about the fee belongs under day15-no-fee-claim, not here.
+  assert.equal(day15SmsCopyWarnsWithoutClaiming(
+    "Your invoice is past due. Please pay it to avoid any further action."), false);
+});
+
+test("empty, unreadable or oversized copy warns nothing", () => {
+  assert.equal(day15SmsCopyWarnsWithoutClaiming(""), false);
+  assert.equal(day15SmsCopyWarnsWithoutClaiming("   "), false);
+  assert.equal(day15SmsCopyWarnsWithoutClaiming(null), false);
+  assert.equal(day15SmsCopyWarnsWithoutClaiming(42), false);
+  assert.equal(day15SmsCopyWarnsWithoutClaiming("A late fee of 3% may apply.\0"), false);
+  assert.equal(day15SmsCopyWarnsWithoutClaiming("A late fee of 3% may apply. " + "x".repeat(4000)), false);
+});
+
+test("our copy needs no amount rendered into it, like the legacy copy", () => {
+  assert.equal(day15StaticCopyNamesNoAmount(PROPOSED_DAY15_SMS_FEE_WARNING_BODY), true);
+  assert.equal(day15StaticCopyNamesNoAmount(APPROVED_DAY15_SMS_BODY), true);
+  // Anything else must go through rendering and carry {{balance}}.
+  assert.equal(day15StaticCopyNamesNoAmount("A late fee of 3% may apply."), false);
+  assert.equal(day15StaticCopyNamesNoAmount(PROPOSED_DAY15_SMS_FEE_WARNING_BODY + " "), false);
+});
+
+test("our copy passes the gate, backed by the written policy", () => {
+  const config = validConfig({ templatePolicy: "day15-fee-may-apply",
+    body: PROPOSED_DAY15_SMS_FEE_WARNING_BODY, terms: GOOD_POLICY });
+  (config as any).currencyPolicy = null;
+  const raw = JSON.stringify(config);
+  const result = inspectDay15PilotReadiness(raw, review(config, raw));
+  for (const hold of ["invoice_terms_or_written_policy_must_support_the_fee_warning",
+    "may_apply_copy_must_not_assert_a_fee_was_applied",
+    "may_apply_copy_must_state_the_condition_explicitly",
+    "approved_day15_exact_body_rendering_policy",
+    "reviewed_exact_invoice_currency_policy"]) {
+    assert.ok(!result.missing.includes(hold), `${hold} still held: ${result.missing.join(", ")}`);
+  }
+  // It claims no fact, so the gate grants none.
+  assert.deepEqual([...result.claimedFacts], []);
+});
+
+test("rendering our copy returns it unchanged", () => {
+  const config = validConfig({ templatePolicy: "day15-fee-may-apply",
+    body: PROPOSED_DAY15_SMS_FEE_WARNING_BODY, terms: GOOD_POLICY });
+  (config as any).currencyPolicy = null;
+  assert.equal(renderDay15Body(config, { balanceMinor: 9900, dueOn: "2026-11-03" }),
+    PROPOSED_DAY15_SMS_FEE_WARNING_BODY);
+});
+
+test("the asserted policy still demands Jobber's proof, unchanged", () => {
+  // The owner allowed the WARNING without Jobber. Asserting a charge is a
+  // statement about the balance, so it keeps its arithmetic proof.
+  const config = validConfig({ templatePolicy: "day15-fee-applied", fee: null,
+    body: "Your invoice is past due. A late fee of 3% has been applied. Call 602-329-7865." });
+  const raw = JSON.stringify(config);
+  const result = inspectDay15PilotReadiness(raw, review(config, raw));
+  assert.equal(result.state, "held");
+  assert.ok(result.missing.includes("jobber_proven_three_percent_fee_for_this_invoice"));
+});

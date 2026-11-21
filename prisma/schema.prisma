@@ -157,6 +157,14 @@ model Customer {
   companyName     String?
   email           String?
   phone           String?
+  // Jobber's BILLING address for this client, copied onto a GoHighLevel
+  // contact when one has to be created. Nullable throughout: Jobber has
+  // clients with no billing address, and "nobody has synced this yet" must
+  // stay distinguishable from "Jobber has nothing".
+  billingStreet     String?
+  billingCity       String?
+  billingState      String?
+  billingPostalCode String?
   createdAtJobber DateTime?
   isRecurring     Boolean   @default(false)
   totalRevenue    Float     @default(0)
@@ -217,6 +225,13 @@ model InvoiceRecord {
   customerId        String?
   clientName        String?
   lastSyncedAt      DateTime  @default(now())
+  // Set by the hourly open-invoice status refresh only. lastVerifiedAt advances
+  // ONLY on a confirmed read, so a failed check cannot make a row look current.
+  // lastVerifyOutcome records the latest check's result; because that check covers
+  // every open invoice on every run, it is always as of the most recent run.
+  // Both are nullable: rows written before this change have no verification record.
+  lastVerifiedAt    DateTime?
+  lastVerifyOutcome String?
 
   customer Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
 
@@ -252,4 +267,85 @@ model ServiceTypeRevenue {
 
   @@unique([year, serviceName])
   @@index([year])
+}
+
+// LOCAL CANDIDATE ONLY. npm start applies pending migrations automatically.
+// Do not deploy without separate schema review and explicit migration approval.
+// SQL also enforces immutable claim data and monotonic state transitions.
+model NotificationLedger {
+  id                String    @id
+  reservationToken  String    @unique @db.VarChar(64)
+  eventKey          String    @unique @db.Text
+  accountId         String
+  invoiceId         String
+  dayPastDue        Int
+  audience          String
+  contactId         String
+  scheduledOn       DateTime  @db.Date
+  channel           String
+  eventPayload      Json      @db.JsonB
+  body              String    @db.Text
+  destination       String    @db.Text
+  eventHash         String    @db.VarChar(64)
+  bodyHash          String    @db.VarChar(64)
+  destinationHash   String    @db.VarChar(64)
+  state             String    @default("reserved")
+  providerMessageId String?
+  createdAt         DateTime  @default(now())
+  pendingAt         DateTime?
+  outcomeAt         DateTime?
+
+  /// One row per invoice per milestone PER CHANNEL: a text and an email are two
+  /// messages, so they are two rows. Approved 2026-11-18.
+  @@unique([accountId, invoiceId, dayPastDue, audience, channel])
+  /// The per-customer daily cap, now per channel. `invoiceId` is deliberately
+  /// NOT here: a customer with several overdue invoices still gets one text and
+  /// one email that day, not a pair per invoice.
+  @@unique([accountId, contactId, scheduledOn, channel])
+  @@index([state, createdAt])
+}
+
+/// One evaluate-only reminder run. Records what would have happened. The
+/// evaluate mode never sends a message and never writes to GoHighLevel.
+model ReminderEvaluationRun {
+  id                 String    @id @default(cuid())
+  mode               String
+  phoenixDate        String
+  state              String
+  startedAt          DateTime  @default(now())
+  completedAt        DateTime?
+  candidates         Int       @default(0)
+  eligible           Int       @default(0)
+  held               Int       @default(0)
+  exclusionsVerified Boolean   @default(false)
+  sendsAttempted     Int       @default(0)
+  notes              String?
+
+  rows ReminderEvaluationRow[]
+
+  @@index([startedAt])
+  @@index([phoenixDate])
+}
+
+/// One invoice considered by a run, with every hold reason that applied.
+model ReminderEvaluationRow {
+  id              String  @id @default(cuid())
+  runId           String
+  jobberInvoiceId String
+  invoiceNumber   String?
+  clientName      String?
+  category        String?
+  categorySource  String?
+  categoryEvidence String?
+  daysPastDue     Int?
+  balanceCents    Int?
+  milestoneDay    Int?
+  audience        String?
+  decision        String
+  holds           String
+
+  run ReminderEvaluationRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@index([runId])
+  @@index([jobberInvoiceId])
 }

@@ -46,7 +46,7 @@ export default function RevenueLineChart({ data }: { data: DataPoint[] }) {
                 currency: "USD",
                 maximumFractionDigits: 0,
               }).format(value),
-              "Revenue",
+              "Issued Invoice Value",
             ]}
           />
           <Line

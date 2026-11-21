@@ -1,4 +1,19 @@
+import { cancelPaidOwnedInvoiceCycle } from "./ghl-paid-cycle-cancellation";
+import { syncExistingOverdueBootstrap } from "./ghl-bootstrap-operation";
+import { readPrePaidDateWitness, readPaidDateReadback } from "./ghl-paid-date-witness";
+import { readConfiguredStandingIdentityPolicy, readStandingIdentityInventory } from "./ghl-standing-identity";
+import { inspectReviewedIdentityInventory, reviewedIdentityOwnerEvidence } from "./ghl-identity-coverage";
 import { prisma } from "./prisma";
+import { latestCycleOwner, admitSyncRun, SyncEntrypoint, SyncRunWriter, SyncWriterBlockedError } from "./sync-writer-control";
+import { buildGhlWriteIntent, approvedGhlCards } from "./ghl-write-intent";
+import { verifyFreshGhlIdentity, readFreshJobberIdentities, strictGhlIdentityHold, validGhlContactIdentity } from "./ghl-write-identity";
+import { refreshOpenInvoiceStatuses } from "./open-invoice-status-refresh";
+import { runConfiguredPaidCycle } from "./ghl-paid-cycle";
+import { resetJournalOwnedInvoiceCycle } from "./ghl-cycle-reset";
+import { syncRecurringDueDateBeforeStage } from "./ghl-recurring-due-date";
+import { runConfiguredDateRepair } from "./ghl-date-repair-operation";
+import { runConfiguredRecurringDay10, recurringDay10SyncIssue } from "./notification-recurring-cron";
+import { runConfiguredRecurringDay15Email, recurringDay15EmailSyncIssue } from "./notification-recurring-day15-cron";
 import {
   fetchAllClients,
   fetchAllJobs,
@@ -14,19 +29,25 @@ import {
   concatJobNotes,
   jobberGraphQL,
 } from "./jobber";
+import { jobberBillingAddress } from "./jobber-billing-address";
 import {
   getInvoicePipelineRefs,
-  findContactByEmail,
-  createContact,
-  searchOpportunities,
+  listContactsForPhoneMatching,
   listPipelineOpportunities,
   moveOpportunityToStage,
-  createOpportunity,
-  deleteOpportunity,
+  readOpportunity,
+  GhlContact,
   GhlOpportunity,
-  InvoicePipelineRefs,
 } from "./ghl";
+import { phoneSourcePlan, readPhoneInvoiceEvidence } from "./ghl-phone-state";
+import { canonicalPhone, matchPhoneCustomer, phoneMayShareOwner } from "./ghl-phone-match";
 import { log, logError } from "./log";
+import { planCardCreation, describeCardCreation, CARD_CREATION_STAGE } from "./ghl-card-creation-plan";
+import { DEFAULT_LOOKBACK_MONTHS, invoiceNumbersInCardName, invoiceWindowStart, planInvoiceCards,
+  PROTECTED_STAGES, type InvoiceCardPlan, type LegacySendingEvidence } from "./ghl-invoice-card-plan";
+import { applyInvoiceCardPlan, claimedInvoiceIdsFromHistory, invoiceCardWriteGate,
+  legacySendingFromEnv, type InvoiceCardWriteReport } from "./ghl-invoice-card-writer";
+import { invoiceReminderClock } from "./invoice-reminder-clock";
 
 // Backfill scope: when set to a Date, invoices are pulled in full but limited to
 // those issued on/after it (instead of the incremental updatedAt filter). null =
@@ -51,13 +72,15 @@ function hasNoInvoiceNote(notesText: string): boolean {
 // anything beyond the pool, so a larger batch costs nothing when the pool is
 // small and saves real time when it isn't.
 const DB_BATCH_SIZE = 25;
-async function inBatches<T>(
+export async function inBatches<T>(
   items: T[],
   fn: (item: T) => Promise<void>,
   size = DB_BATCH_SIZE
 ): Promise<void> {
   for (let i = 0; i < items.length; i += size) {
-    await Promise.all(items.slice(i, i + size).map(fn));
+    const settled = await Promise.allSettled(items.slice(i, i + size).map(item => Promise.resolve().then(() => fn(item))));
+    const failed = settled.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (failed) throw failed.reason;
   }
 }
 
@@ -117,41 +140,16 @@ function isRecurringJob(j: JobberJobNode): boolean {
 }
 
 export async function runFullSync(
-  opts: { triggeredBy?: "manual" | "cron"; full?: boolean } = {}
+  opts: { triggeredBy?: "manual" | "cron"; full?: boolean; entrypoint?: SyncEntrypoint } = {}
 ) {
-  // Decide full vs incremental. Incremental pulls only records modified since
-  // the last successful sync (with a 24h overlap for safety). We force a full
-  // sync when there's no prior sync, when the last full sync is over 7 days
-  // old (a weekly reconcile to catch anything incremental missed), or when
-  // explicitly requested.
-  const lastComplete = await prisma.syncRun.findFirst({
-    where: { status: "complete" },
-    orderBy: { completedAt: "desc" },
-  });
-  const lastFull = await prisma.syncRun.findFirst({
-    where: { status: "complete", mode: "full" },
-    orderBy: { completedAt: "desc" },
-  });
-  const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
-  const fullStale =
-    !lastFull ||
-    !lastFull.completedAt ||
-    Date.now() - new Date(lastFull.completedAt).getTime() > WEEK_MS;
-  const doFull = Boolean(opts.full) || !lastComplete || fullStale;
-  const since =
-    doFull || !lastComplete
-      ? null
-      : new Date(new Date(lastComplete.startedAt).getTime() - 24 * 60 * 60 * 1000);
-  const mode = doFull ? "full" : "incremental";
-  log(`[sync] mode=${mode}${since ? ` since=${since.toISOString()}` : ""}`);
-
-  const run = await prisma.syncRun.create({
-    data: {
-      status: "running",
-      triggeredBy: opts.triggeredBy ?? "manual",
-      mode,
-    },
-  });
+  const { run, since } = await admitSyncRun({ ...opts, entrypoint: opts.entrypoint ?? "http" });
+  const writer = new SyncRunWriter(run.id);
+  let heavyFeeds: Promise<{ ok: true } | { ok: false; err: unknown }> | undefined;
+  let recurringDay10Issue: string | null = null;
+  let recurringDay15EmailIssue: string | null = null;
+  // Both notification phases contribute to one SyncRun note.
+  const notificationIssues = () => [recurringDay10Issue, recurringDay15EmailIssue].filter(Boolean).join(" · ") || null;
+  log(`[sync] mode=${run.mode}${since ? ` since=${since.toISOString()}` : ""}`);
 
   try {
     const clientNodes = await fetchAllClients(since);
@@ -160,6 +158,23 @@ export async function runFullSync(
       where: { id: run.id },
       data: { customersFetched: clientNodes.length },
     });
+
+    // Optional, default-disabled notification phase. Only an admitted standalone
+    // cron may load its private standing policy. The first ordinary Jobber call
+    // above owns the existing token lifecycle; no notification-driven refresh.
+    // Await all notification settlement before heavy feeds; unknown event outcomes
+    // retain their ledger fence without stopping unrelated dashboard cache refresh.
+    const recurringDay10 = await runConfiguredRecurringDay10({ entrypoint: opts.entrypoint ?? "http" });
+    recurringDay10Issue = recurringDay10SyncIssue(recurringDay10);
+
+    // Day 15 customer email. Independent milestone, independent ledger events, same
+    // admitted standalone-cron entrypoint and the same default-disabled contract. A
+    // held or unknown Day 10 phase does not start or skip this one; each milestone is
+    // fenced by its own ledger key, so neither can mask the other.
+    const recurringDay15Email = await runConfiguredRecurringDay15Email({ entrypoint: opts.entrypoint ?? "http" });
+    recurringDay15EmailIssue = recurringDay15EmailSyncIssue(recurringDay15Email);
+    const notificationIssue = notificationIssues();
+    if (notificationIssue) await prisma.syncRun.update({ where: { id: run.id }, data: { errorMessage: notificationIssue } });
 
     // Jobs and visits are the two heavy feeds — neither accepts an updatedAt
     // filter, so both pull in full every sync and together they are the large
@@ -171,7 +186,7 @@ export async function runFullSync(
     // Settled into a value rather than left as a rejectable promise: nothing
     // awaits this until after the invoice and timesheet steps, and an
     // unhandled rejection in that window takes the whole process down.
-    const heavyFeeds = Promise.all([
+    heavyFeeds = Promise.allSettled([
       (async () => {
         const jobNodes = await step("jobs", () => fetchAllJobs(since));
         await step("jobs:write", () => upsertJobs(jobNodes));
@@ -193,7 +208,7 @@ export async function runFullSync(
               visitsFetched: visits.length,
               // A truncated pull is not an error, but it silently leaves the
               // newest records stale — so it has to be recorded, not just logged.
-              ...(warnings.length ? { errorMessage: warnings.join(" · ") } : {}),
+              ...(warnings.length ? { errorMessage: [notificationIssues(), ...warnings].filter(Boolean).join(" · ") } : {}),
             },
           });
         } catch (err: any) {
@@ -203,15 +218,15 @@ export async function runFullSync(
           await prisma.syncRun
             .update({
               where: { id: run.id },
-              data: { errorMessage: `Visit sync failed: ${err?.message ?? err}` },
+              data: { errorMessage: [notificationIssues(), `Visit sync failed: ${err?.message ?? err}`].filter(Boolean).join(" · ") },
             })
             .catch(() => {});
         }
       })(),
-    ]).then(
-      () => ({ ok: true as const }),
-      (err: any) => ({ ok: false as const, err })
-    );
+    ]).then(results => {
+      const failed = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+      return failed ? { ok: false as const, err: failed.reason } : { ok: true as const };
+    });
 
     // Backfill: full invoice pull scoped to invoices issued on/after 2026-01-01,
     // replacing the incremental updatedAt filter for invoices. (Temporary — revert
@@ -237,8 +252,14 @@ export async function runFullSync(
     }
 
     // Everything after this point reads jobs and visits together.
-    const heavy = await step("jobs+visits", () => heavyFeeds);
+    const heavy = await step("jobs+visits", () => heavyFeeds!);
     if (!heavy.ok) throw heavy.err;
+
+    // Some source statuses change as time passes without appearing in the
+    // incremental updatedAt feed. The gated refresh reads all cached open IDs.
+    // Read/write failure propagates, so this run cannot continue into GHL with
+    // a partially applied status correction. Activation requires release review.
+    await step("refreshOpenInvoiceStatuses", () => refreshOpenInvoiceStatuses());
 
     // Stamp the "No Invoice" note flag onto visits so the Uninvoiced Revenue
     // metric excludes intentionally-uninvoiced jobs and all their visits.
@@ -256,9 +277,8 @@ export async function runFullSync(
     log("[sync] step: recomputeServiceTypeRevenue");
     await step("recomputeServiceTypeRevenue", () => recomputeServiceTypeRevenue());
 
-    // Void invoices that were deleted in Jobber before mirroring to GHL, so a
-    // stale past_due record can't keep dunning a customer who no longer owes.
-    // Best-effort: a Jobber hiccup here must not fail the whole sync.
+    // Flag missing source objects without inventing void/payment. Fresh full
+    // source evidence below independently holds all ambiguous GHL changes.
     try {
       log("[sync] step: reconcileDeletedInvoices");
       await reconcileDeletedInvoices();
@@ -266,36 +286,40 @@ export async function runFullSync(
       logError("Deleted-invoice reconciliation failed (continuing):", err?.message ?? err);
     }
 
-    // Mirror invoices into the GHL "Invoice Pipeline" (Sent / Overdue / Paid /
-    // Canceled by status). Best-effort: a GHL outage or missing config (no API
-    // key, pipeline renamed) must not fail the whole Jobber sync.
+    // Reconcile existing ordinary GHL cards. Defaults to verified email Paid
+    // exits only; other changes require explicit mode/gates. Best-effort: a GHL
+    // outage must not prevent refreshing the Jobber dashboard cache.
     try {
-      const ghlSynced = await syncGhlInvoicePipeline();
+      const ghlSynced = await syncGhlInvoicePipeline({ writer });
       await prisma.syncRun.update({
         where: { id: run.id },
         data: { ghlOpportunitiesSynced: ghlSynced },
       });
       log(`[sync] ghlInvoicePipeline: ${ghlSynced} invoices synced to GHL`);
     } catch (err: any) {
+      if (err instanceof SyncWriterBlockedError) throw err;
       logError("GHL invoice sync failed (continuing):", err?.message ?? err);
     }
 
-    return await prisma.syncRun.update({
-      where: { id: run.id },
-      data: {
-        status: "complete",
-        completedAt: new Date(),
-      },
-    });
+    // No-op unless an exact, short-lived request is separately approved and
+    // enabled. Only the admitted standalone cron can reach a field-only write;
+    // review mode and phone-write hold remain required. Unknown outcomes retain
+    // the durable barrier and must not be swallowed as a best-effort failure.
+    const dateRepair = await runConfiguredDateRepair({ writer, entrypoint: opts.entrypoint ?? "http" });
+    if (dateRepair.state !== "disabled") log(`[sync] exactOpportunityDateRepair: ${dateRepair.state}`);
+    if (dateRepair.state === "applied") await prisma.syncRun.update({ where: { id: run.id },
+      data: { ghlOpportunitiesSynced: { increment: 1 } } });
+    const paidCycle = await runConfiguredPaidCycle({ writer, entrypoint: opts.entrypoint ?? "http" });
+    if (paidCycle.state !== "disabled") log(`[sync] exactPaidCycle: ${paidCycle.state}`);
+    if (paidCycle.state === "applied") await prisma.syncRun.update({ where: { id: run.id },
+      data: { ghlOpportunitiesSynced: { increment: 1 } } });
+
+    return await writer.finish("complete");
   } catch (err: any) {
-    await prisma.syncRun.update({
-      where: { id: run.id },
-      data: {
-        status: "failed",
-        completedAt: new Date(),
-        errorMessage: err?.message ?? "Unknown error",
-      },
-    });
+    // Never release admission while a rejected feed still has sibling work.
+    // A killed process leaves running/blocked state for explicit operator review.
+    await heavyFeeds;
+    await writer.finish("failed", [notificationIssues(), err?.message ?? "Unknown error"].filter(Boolean).join(" · "));
     throw err;
   }
 }
@@ -304,6 +328,11 @@ async function upsertClients(nodes: JobberClientNode[]) {
   await inBatches(nodes, async (c) => {
     const email = c.emails?.find((e) => e.primary)?.address ?? c.emails?.[0]?.address ?? null;
     const phone = c.phones?.find((p) => p.primary)?.number ?? c.phones?.[0]?.number ?? null;
+    // Jobber's billing address, for the contact writer to create a GoHighLevel
+    // contact with. Blank fields arrive as null, so a client with nothing on
+    // file stays indistinguishable from one not yet synced - which is correct:
+    // in both cases there is no address to write.
+    const billing = jobberBillingAddress(c.billingAddress);
 
     await prisma.customer.upsert({
       where: { jobberClientId: c.id },
@@ -313,6 +342,7 @@ async function upsertClients(nodes: JobberClientNode[]) {
         companyName: c.companyName ?? null,
         email,
         phone,
+        ...billing,
         createdAtJobber: c.createdAt ? new Date(c.createdAt) : null,
       },
       update: {
@@ -320,6 +350,7 @@ async function upsertClients(nodes: JobberClientNode[]) {
         companyName: c.companyName ?? null,
         email,
         phone,
+        ...billing,
         createdAtJobber: c.createdAt ? new Date(c.createdAt) : null,
         lastSyncedAt: new Date(),
       },
@@ -545,63 +576,12 @@ async function upsertInvoices(nodes: JobberInvoiceNode[]) {
   });
 }
 
-// Build the opportunity name we use when creating an overdue-invoice card.
-// Also used as a fallback match target (see matchesInvoice).
-function opportunityName(inv: {
-  invoiceNumber: string | null;
-  clientName: string | null;
-}): string {
-  const num = inv.invoiceNumber ? `#${inv.invoiceNumber}` : "";
-  const who = inv.clientName ? ` — ${inv.clientName}` : "";
-  return `Invoice ${num}${who}`.trim();
-}
-
-// Match an existing GHL opportunity to an invoice on invoice number or title.
-// The number must appear as a bounded "#<num>" token — NOT a bare substring —
-// so #12 doesn't match "#123" or an aggregated card like "… — 12 overdue
-// invoices", and #1 doesn't match every "… — 1 overdue invoice" card.
-function matchesInvoice(
-  opp: GhlOpportunity,
-  inv: { invoiceNumber: string | null; clientName: string | null }
-): boolean {
-  const name = (opp.name ?? "").toLowerCase();
-  if (!name) return false;
-  const num = (inv.invoiceNumber ?? "").trim().toLowerCase();
-  // #<num> anchored on the left by "#" and on the right by a non-digit boundary.
-  if (num && new RegExp(`#${num.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?!\\d)`).test(name)) {
-    return true;
-  }
-  return name === opportunityName(inv).toLowerCase();
-}
-
-// For every overdue, unpaid invoice, ensure a GHL opportunity exists in the
-// "Invoice Overdue" stage of the "Invoice Pipeline" — moving an existing card
-// or creating a new one. Returns the number of invoices processed.
-// GHL Invoice Pipeline stage names (matched case-insensitively against the
-// pipeline's stages resolved at runtime).
+// Supported ordinary stages. Every other stage is a manual-review hold.
 const GHL_STAGE_SENT = "Invoice Sent";
 const GHL_STAGE_OVERDUE = "Invoice Overdue";
 const GHL_STAGE_PAID = "Invoice Paid";
 
-// Map a Jobber invoice to the GHL stage it belongs in (null = skip).
-// Only OPEN invoices (awaiting_payment → Sent, past_due → Overdue) are synced.
-// paid / void / bad_debt / draft are intentionally skipped so settled and
-// non-actionable invoices don't flood the GHL pipeline.
-function ghlStageForInvoice(
-  inv: { invoiceStatus: string | null; dueAt: Date | null },
-  now: Date
-): string | null {
-  const status = (inv.invoiceStatus ?? "").toLowerCase();
-  if (status === "past_due") return GHL_STAGE_OVERDUE;
-  if (status === "awaiting_payment") {
-    return inv.dueAt && inv.dueAt < now ? GHL_STAGE_OVERDUE : GHL_STAGE_SENT;
-  }
-  // paid, void, bad_debt, draft, and any other status → skip.
-  return null;
-}
-
-// Invoices issued before this cutoff, or with no amount owed, are not synced to
-// GHL going forward (and are removed by the CLEANUP_INVALID_OPPS pass).
+// Existing entry cutoff. Old positive debt still blocks a Paid exit.
 const GHL_SYNC_SINCE = new Date("2026-01-01T00:00:00Z");
 
 // True when an invoice shouldn't have a GHL opportunity: it's too old (issued —
@@ -618,11 +598,7 @@ function isOldOrZeroInvoice(inv: {
   return !(inv.total ?? 0);
 }
 
-// Whether to skip an invoice when syncing to GHL going forward. On top of the
-// old/zero-total rule, we also skip invoices with nothing owed (amountDue <= 0)
-// — e.g. a past_due invoice already paid but not re-flagged in Jobber — so they
-// don't create $0 cards. The cleanup pass intentionally stays keyed on total
-// only (see isOldOrZeroInvoice), so this extra rule is sync-only.
+// Group-order eligibility only; the fresh source plan authorizes any write.
 function skipForSync(inv: {
   issuedAt: Date | null;
   createdAtJobber: Date | null;
@@ -632,14 +608,9 @@ function skipForSync(inv: {
   return isOldOrZeroInvoice(inv) || (inv.amountDue ?? 0) <= 0;
 }
 
-// Reconcile invoices that were DELETED in Jobber. The incremental sync only ever
-// adds/updates invoices Jobber returns; a deleted invoice simply stops appearing,
-// so its last-known status is frozen forever. A past_due one stays past_due and
-// keeps driving the GHL Overdue pipeline — dunning a customer who no longer owes.
-// Here we re-check every still-open invoice (issued since the cutoff) against
-// Jobber by id; any that Jobber no longer returns is voided so it drops out of
-// past_due everywhere (dashboard + GHL). Returns how many were voided.
-async function reconcileDeletedInvoices(): Promise<number> {
+// Missing source objects are unknown, not evidence of payment or cancellation.
+// Keep last-known cache balances visible for review; never invent void/zero.
+export async function reconcileDeletedInvoices(): Promise<number> {
   const open = await prisma.invoiceRecord.findMany({
     where: {
       invoiceStatus: { in: ["past_due", "awaiting_payment"] },
@@ -657,7 +628,7 @@ async function reconcileDeletedInvoices(): Promise<number> {
   for (let i = 0; i < open.length; i += BATCH) {
     const slice = open.slice(i, i + BATCH);
     // One aliased query per batch: i0: invoice(id:$id0){id} i1: … — a null field
-    // means Jobber no longer has that invoice (deleted).
+    // means the source object is unavailable, not proof it was paid or voided.
     const varDefs = slice.map((_, j) => `$id${j}: EncodedId!`).join(", ");
     const fields = slice
       .map((_, j) => `i${j}: invoice(id: $id${j}) { id }`)
@@ -683,318 +654,552 @@ async function reconcileDeletedInvoices(): Promise<number> {
   }
 
   if (missingIds.length > 0) {
-    await prisma.invoiceRecord.updateMany({
-      where: { id: { in: missingIds } },
-      data: { invoiceStatus: "void", amountDue: 0, lastSyncedAt: new Date() },
-    });
+    logError(`[sync] ${missingIds.length} invoices missing at source; retained last-known balances for review, not marked void or paid`);
   }
-  log(
-    `[sync] reconcile deleted invoices — checked=${open.length} voided=${missingIds.length}`
-  );
-  return missingIds.length;
+  return 0;
 }
 
-// Full GHL "Invoice Pipeline" sync: route every invoice to the stage matching
-// its status (Sent / Overdue / Paid / Canceled), creating the GHL contact and
-// opportunity when missing. Returns the number of invoices processed.
-export async function syncGhlInvoicePipeline(): Promise<number> {
-  log('[ghl] starting invoice pipeline sync');
+// Explicit modes separate cache/dashboard refresh from reminder enrollment.
+// paid_only preserves verified settled exits, but does NOT cancel queued GHL
+// reminders by itself. Both the exit workflow and any enrollment need review.
+export type GhlInvoiceWriteMode = "review" | "paid_only" | "sync";
+export interface GhlInvoiceReview {
+  customerId?: string;
+  jobberClientId?: string;
+  candidateContactIds?: string[];
+  storedInvoiceIds?: string[];
+  contactId?: string;
+  opportunityId?: string;
+  action: "hold" | "unchanged" | "planned" | "applied" | "failed";
+  reason: string;
+  from?: { stageId?: string | null; status?: string | null; monetaryValue?: number | null; name?: string | null };
+  to?: { stageId: string; monetaryValue: number; name?: string };
+}
 
-  // Resolving the pipeline + its stages is the most likely thing to fail
-  // (network + config). Isolate it so a failure logs and skips cleanly.
-  let refs: InvoicePipelineRefs;
-  try {
-    refs = await getInvoicePipelineRefs();
-  } catch (err: any) {
-    logError('[ghl] failed to resolve pipeline refs (skipping):', err?.message ?? err);
-    return 0;
-  }
-  log('[ghl] pipeline resolved', refs.pipelineId, '| stages:', Object.keys(refs.stageIdByName).join(', '));
+/**
+ * One customer's per-invoice card plan. Reporting only, and only produced when
+ * a caller asks for it.
+ */
+export interface InvoiceCardPlanReport {
+  customerId: string;
+  jobberClientId: string;
+  contactId: string;
+  plan: InvoiceCardPlan;
+}
 
-  const overdueStageId = refs.stageIdByName[GHL_STAGE_OVERDUE.toLowerCase()];
-  if (!overdueStageId) {
-    logError(`[ghl] stage "${GHL_STAGE_OVERDUE}" not found in pipeline — aborting`);
-    return 0;
-  }
-
+// Existing cards only. Never delete duplicates/old cards, infer payment from
+// absence, use a duplicate-create error as identity, or reopen won/lost cards.
+export async function syncGhlInvoicePipeline(opts: {
+  mode?: GhlInvoiceWriteMode;
+  report?: (entry: GhlInvoiceReview) => void;
+  writer?: Pick<SyncRunWriter, "prepare" | "assertPending" | "confirm" | "block"> & Partial<Pick<SyncRunWriter, "readCycleHistory">>;
+  /**
+   * Ask for the ONE CARD PER INVOICE plan, chosen by the owner 2026-11-20.
+   *
+   * Opt-in on purpose. Without this callback the block is skipped entirely - no
+   * extra reads, no extra log lines - so a deployed sync behaves exactly as it
+   * did before the per-invoice work existed. Nothing here writes: the plan is
+   * computed and handed back, and the per-customer path below is untouched.
+   */
+  perInvoiceReport?: (entry: InvoiceCardPlanReport) => void;
+  /** Proof the legacy workflow's sending is off; without it no Overdue move is planned. */
+  legacySending?: LegacySendingEvidence | null;
+  /**
+   * Per-card outcomes from the per-invoice WRITER. Supplying this does not
+   * enable writing - `invoiceCardWriteGate` does - and withholding it does not
+   * disable it; it only decides whether the caller hears about each card.
+   */
+  perInvoiceWriteReport?: (entry: InvoiceCardWriteReport) => void;
+  /**
+   * Force the per-invoice writer off even when the environment gate is open.
+   * For dry runs that want the plan against production without any risk that a
+   * variable set on the host turns a read into a write.
+   */
+  perInvoiceWritesDisabled?: boolean;
+} = {}): Promise<number> {
+  const mode = opts.mode ?? process.env.GHL_INVOICE_WRITE_MODE ?? "paid_only";
+  if (!["review", "paid_only", "sync"].includes(mode)) throw new Error("Invalid GHL_INVOICE_WRITE_MODE");
+  const phoneWrites = process.env.GHL_PHONE_WRITES_ENABLED === "true";
+  const approvedCards = approvedGhlCards();
+  const report = (entry: GhlInvoiceReview) => {
+    log(`[ghl-plan] ${JSON.stringify(entry)}`);
+    opts.report?.(entry);
+  };
+  const refs = await getInvoicePipelineRefs();
+  const sentId = refs.stageIdByName[GHL_STAGE_SENT.toLowerCase()];
+  const overdueId = refs.stageIdByName[GHL_STAGE_OVERDUE.toLowerCase()];
+  const paidId = refs.stageIdByName[GHL_STAGE_PAID.toLowerCase()];
+  if (!sentId || !overdueId || !paidId) throw new Error("Required invoice stages missing");
+  // refs only keeps lowercased stage names, so recover the canonical spelling
+  // for the stages we reason about and pass anything else through as-is.
+  const canonicalStages = [GHL_STAGE_SENT, GHL_STAGE_OVERDUE, GHL_STAGE_PAID, ...PROTECTED_STAGES];
+  const stageNameById = new Map<string, string>(
+    Object.entries(refs.stageIdByName).map(([lower, id]) =>
+      [id, canonicalStages.find(name => name.toLowerCase() === lower) ?? lower]));
   const now = new Date();
-  let created = 0;
-  let moved = 0;
-  let skipped = 0;
-  let skippedOldOrZero = 0;
-  let contactsCreated = 0;
-  let customersProcessed = 0;
-  let invoicesProcessed = 0;
-  let cleared = 0;
-  const overdueContactIds = new Set<string>(); // contacts that belong in Overdue
-  const awaitingContactIds = new Set<string>(); // contacts moved to Sent in Phase B
-  const keptOppByContact = new Map<string, string>(); // the one card kept per overdue contact
-
-  // Resolve a contact by email, creating it if there's no exact match.
-  const resolveContact = async (
-    email: string,
-    name: string | null,
-    phone: string | null
-  ): Promise<string> => {
-    const found = await findContactByEmail(email);
-    if (found && (found.email ?? "").toLowerCase() === email.toLowerCase()) {
-      return found.id;
+  const customers = await prisma.customer.findMany();
+  const invoices = await prisma.invoiceRecord.findMany({ include: { customer: true } });
+  // Complete, status=all snapshots are required BEFORE the first write.
+  let contacts: GhlContact[];
+  let cards: GhlOpportunity[];
+  try {
+    contacts = await listContactsForPhoneMatching();
+    if (contacts.some(contact => !validGhlContactIdentity(contact))) throw new Error("GHL identity field shape is unverified");
+    cards = await listPipelineOpportunities(refs.pipelineId);
+  } catch (err: any) {
+    report({ action: "hold", reason: `Incomplete GHL preflight; no writes: ${err?.message ?? err}` });
+    return 0;
+  }
+  const phoneCustomers = customers.filter(c => !c.email?.trim() && c.phone?.trim() &&
+    invoices.some(inv => inv.customerId === c.id && !isOldOrZeroInvoice(inv)));
+  const phoneIdentities = new Map(phoneCustomers.map(customer =>
+    [customer.id, matchPhoneCustomer(customer, customers, contacts)]));
+  const protectedPhoneContacts = new Set([...phoneIdentities.values()].flatMap(identity => identity.candidateIds));
+  const protectedPhones = phoneCustomers.filter(c => phoneIdentities.get(c.id)?.candidateIds.length)
+    .map(c => canonicalPhone(c.phone)).filter((phone): phone is string => !!phone);
+  const reviewedCards = new Set<string>();
+  const processedCustomers = new Set<string>();
+  let source: ReturnType<typeof readPhoneInvoiceEvidence> | undefined;
+  let freshIdentities: ReturnType<typeof readFreshJobberIdentities> | undefined;
+  let standingInventory: ReturnType<typeof readStandingIdentityInventory> | undefined;
+  let standingInventoryPolicy: string | undefined;
+  let sourceObservedAt: string | undefined;
+  let applied = 0;
+  let writesHalted = false;
+  // --- ONE CARD PER INVOICE: run-level state -------------------------------
+  // The gate is read once, here, so every customer in a run is judged by the
+  // same configuration even if the environment changes underneath us.
+  const cardGate = opts.perInvoiceWritesDisabled ? { open: false, reason: "per_invoice_writes_disabled_by_caller" } as const : invoiceCardWriteGate();
+  const perInvoiceActive = !!opts.perInvoiceReport || !!opts.perInvoiceWriteReport || cardGate.open;
+  const cardWritesEligible = cardGate.open && !!opts.writer && !!opts.writer.readCycleHistory;
+  if (cardGate.open && !cardWritesEligible) {
+    report({ action: "hold", reason: "Per-invoice card writes are enabled but no durable writer with cycle history was admitted" });
+  }
+  // How far back the board looks. Rolling, computed once per run so every
+  // customer is judged against the same boundary. A malformed setting falls
+  // back to the default rather than widening the window.
+  const lookbackRaw = process.env.GHL_INVOICE_LOOKBACK_MONTHS?.trim();
+  const lookbackMonths = lookbackRaw && /^\d{1,3}$/.test(lookbackRaw) ? Number(lookbackRaw) : DEFAULT_LOOKBACK_MONTHS;
+  const windowStart = invoiceWindowStart(now, lookbackMonths);
+  if (perInvoiceActive) log(`[ghl-card] lookback ${lookbackMonths} months; invoices issued on or after ${windowStart} are in scope`);
+  const cardSpend = { remaining: cardGate.open ? cardGate.budget : 0 };
+  let cardClaims: Set<string> | undefined;
+  let cardWritesHalted = false;
+  const cardInfo = (card: GhlOpportunity) => ({ opportunityId: card.id, contactId: card.contactId ?? undefined,
+    from: { stageId: card.pipelineStageId, status: card.status, monetaryValue: card.monetaryValue, name: card.name } });
+  const holdCards = (reason: string, candidateIds: string[], customer?: typeof customers[number]) => {
+    const affected = cards.filter(card => !!card.contactId && candidateIds.includes(card.contactId));
+    const owner = customer ? { customerId: customer.id, jobberClientId: customer.jobberClientId, candidateContactIds: candidateIds } : {};
+    if (!affected.length) report({ ...owner, action: "hold", reason });
+    for (const card of affected) {
+      reviewedCards.add(card.id);
+      report({ ...owner, ...cardInfo(card), action: "hold", reason });
     }
-    const c = await createContact({ email, name, phone });
-    contactsCreated += 1;
-    return c.id;
+  };
+  // Unsupported relevant phone formats leave ownership unresolved across paths.
+  if (phoneCustomers.some(c => !canonicalPhone(c.phone))) {
+    for (const card of cards) report({ ...cardInfo(card), action: "hold", reason: "Unresolved phone ownership; no pipeline writes" });
+    return 0;
+  }
+
+  const reconcile = async (customer: typeof customers[number]) => {
+    if (processedCustomers.has(customer.id)) return;
+    // Mark before any request: a failed/uncertain write is never retried by an
+    // exit/cleanup pass during the same run.
+    processedCustomers.add(customer.id);
+    const ownInvoices = invoices.filter(inv => inv.customerId === customer.id);
+    const email = customer.email?.trim().toLowerCase();
+    let candidateIds: string[];
+    if (email) {
+      candidateIds = contacts.filter(c => c.email?.trim().toLowerCase() === email).map(c => c.id);
+      if (customers.filter(c => c.email?.trim().toLowerCase() === email).length !== 1) {
+        holdCards("Email belongs to multiple Jobber customers", candidateIds, customer); return;
+      }
+      if (candidateIds.some(id => protectedPhoneContacts.has(id)) || protectedPhones.some(phone => phoneMayShareOwner(customer.phone, phone))) {
+        holdCards("Contact has a phone-only ownership hold", candidateIds, customer); return;
+      }
+    } else {
+      const identity = phoneIdentities.get(customer.id);
+      if (!identity) return;
+      candidateIds = identity.candidateIds;
+      if (!identity.contactId) { holdCards(`Phone identity: ${identity.reason}`, candidateIds, customer); return; }
+      candidateIds = [identity.contactId];
+    }
+    if (candidateIds.length !== 1) {
+      holdCards(candidateIds.length ? "Multiple exact GHL contacts" : "No existing exact GHL contact", candidateIds, customer); return;
+    }
+    const contactId = candidateIds[0];
+    const identityHold = strictGhlIdentityHold(customer, customers, contacts, contactId);
+    if (identityHold) { holdCards(identityHold, candidateIds, customer); return; }
+    const matchingCards = cards.filter(card => card.contactId === contactId);
+
+    // ONE CARD PER INVOICE.
+    if (perInvoiceActive) {
+      try {
+        source ??= readPhoneInvoiceEvidence();
+        const evidence = await source;
+        sourceObservedAt ??= new Date().toISOString();
+        const mine = evidence.filter(inv => inv.client?.id === customer.jobberClientId);
+        const clocks: Record<string, { daysPastDue: number; isOverdue: boolean; sentOn: string } | null> = {};
+        for (const inv of mine) {
+          const clock = invoiceReminderClock(inv.issuedDate, inv.dueDate, now);
+          clocks[inv.id] = clock
+            ? { daysPastDue: clock.daysPastDue, isOverdue: clock.isOverdue, sentOn: clock.sentOn }
+            : null;
+        }
+        const existingCards = matchingCards.map(card => ({
+          id: card.id, name: card.name ?? null, status: card.status ?? null,
+          stageName: stageNameById.get(card.pipelineStageId ?? "") ?? null,
+          monetaryValue: card.monetaryValue ?? null,
+        }));
+        const plan = planInvoiceCards({
+            contactId, now, clocks, windowStart, legacySending: opts.legacySending ?? legacySendingFromEnv(),
+            legacyWorkflowId: process.env.GHL_LEGACY_INVOICE_WORKFLOW_ID ?? "",
+            label: ownInvoices[0]?.clientName ?? customer.companyName ?? customer.name ?? customer.jobberClientId,
+            invoices: mine.map(inv => ({
+              invoiceId: inv.id, invoiceNumber: inv.invoiceNumber, status: inv.invoiceStatus,
+              totalDollars: inv.amounts?.total ?? null, balanceDollars: inv.amounts?.invoiceBalance ?? null,
+              issuedDate: inv.issuedDate, dueDate: inv.dueDate,
+            })),
+            cards: existingCards,
+        });
+        opts.perInvoiceReport?.({ customerId: customer.id, jobberClientId: customer.jobberClientId, contactId, plan });
+
+        // The writer. Nothing below can move a card into "Invoice Overdue":
+        // `decideInvoiceCardWrite` refuses that target outright, independently
+        // of the plan's own legacy-sending gate.
+        if (cardWritesEligible && cardGate.open && !writesHalted && !cardWritesHalted
+            && plan.actions.some(a => a.state === "adopt" || a.state === "create")) {
+          cardClaims ??= claimedInvoiceIdsFromHistory(await opts.writer!.readCycleHistory!(),
+            { locationId: process.env.GHL_LOCATION_ID ?? "", pipelineId: refs.pipelineId });
+          const result = await applyInvoiceCardPlan({
+            plan, contactId, jobberClientId: customer.jobberClientId, pipelineId: refs.pipelineId,
+            locationId: process.env.GHL_LOCATION_ID ?? "",
+            stageIds: { sent: sentId, overdue: overdueId, paid: paidId },
+            gate: cardGate, source: evidence, observedAt: sourceObservedAt,
+            preflight: new Map(existingCards.map(card => [card.id, card])),
+            spend: cardSpend, claimedInvoiceIds: cardClaims,
+            writer: { prepare: opts.writer!.prepare.bind(opts.writer), assertPending: opts.writer!.assertPending.bind(opts.writer),
+              confirm: opts.writer!.confirm.bind(opts.writer), block: opts.writer!.block.bind(opts.writer),
+              readCycleHistory: opts.writer!.readCycleHistory!.bind(opts.writer) },
+            report: entry => {
+              log(`[ghl-card] ${JSON.stringify(entry)}`);
+              opts.perInvoiceWriteReport?.(entry);
+            },
+          });
+          applied += result.applied;
+          if (result.halted) {
+            // One shared writer: a halt here stops the per-customer path too.
+            cardWritesHalted = true;
+            writesHalted = true;
+          }
+        }
+      } catch (err: any) {
+        // `applyInvoiceCardPlan` handles its own failures and halts itself, so
+        // anything thrown here happened before or around it - a bad journal
+        // read, unusable source. Stop attempting card writes for the rest of
+        // the run rather than retrying on a foundation we could not read, and
+        // leave the per-customer path's own guards to speak for themselves.
+        cardWritesHalted = true;
+        report({ customerId: customer.id, jobberClientId: customer.jobberClientId, contactId,
+          action: "hold", reason: `Per-invoice card plan or write unavailable; card writes stopped for this run: ${err?.message ?? err}` });
+      }
+    }
+
+    // THE OWNERSHIP BOUNDARY. A card that names an invoice belongs to the
+    // per-invoice writer, so once that writer is on the per-customer aggregate
+    // must keep its hands off: measured 2026-11-20, 28 of the 40 per-invoice
+    // cards the aggregate path reaches would be renamed, restaged and 26 of
+    // them revalued to $0 the moment it was allowed to write. Two writers with
+    // different ideas of what a card means is worse than either alone.
+    if (cardGate.open) {
+      const ownedPerInvoice = matchingCards.filter(card => invoiceNumbersInCardName(card.name).length > 0);
+      for (const card of ownedPerInvoice) {
+        reviewedCards.add(card.id);
+        report({ customerId: customer.id, jobberClientId: customer.jobberClientId, ...cardInfo(card), contactId,
+          action: "hold", reason: "Card names an invoice and belongs to the per-invoice writer; the per-customer aggregate leaves it alone" });
+      }
+      if (ownedPerInvoice.length) return;
+    }
+
+    if (matchingCards.length > 1) {
+      holdCards("Multiple existing cards, including closed statuses", candidateIds, customer); return;
+    }
+    if (!matchingCards.length) {
+      // A customer with unpaid invoices and no card is INVISIBLE on a board
+      // whose whole purpose is showing who owes money, and the reminder
+      // evaluator will not text anyone whose card is not in the Overdue stage.
+      // So instead of reporting "creation disabled" and moving on, work out
+      // what the card would be and report it.
+      //
+      // Still a read: this branch plans and never creates. The target stage is
+      // always "Invoice Sent" and never "Invoice Overdue", because the legacy
+      // Fixed Automation workflow is triggered by an opportunity event - a card
+      // appearing straight in Overdue can enrol the customer and fire reminders
+      // at them, while the Sent transition provably cannot. See
+      // lib/ghl-card-creation-plan.ts for the full argument.
+      // ...unless the per-invoice writer is on, in which case creating cards is
+      // its job and a second, per-customer proposal for the same customer is
+      // just noise in the log someone has to read every morning.
+      if (cardGate.open) {
+        report({ customerId: customer.id, jobberClientId: customer.jobberClientId, contactId,
+          candidateContactIds: candidateIds, storedInvoiceIds: ownInvoices.map(inv => inv.jobberInvoiceId),
+          action: "hold", reason: "No existing card; card creation belongs to the per-invoice writer" });
+        return;
+      }
+      source ??= readPhoneInvoiceEvidence();
+      const evidence = await source;
+      sourceObservedAt ??= new Date().toISOString();
+      const plan = phoneSourcePlan(customer.jobberClientId, ownInvoices.map(inv => inv.jobberInvoiceId), evidence, now);
+      const label = ownInvoices[0]?.clientName ?? customer.companyName ?? customer.name ?? customer.jobberClientId;
+      const creation = planCardCreation({ contactId, existingCardCount: 0, label,
+        verified: plan ? { stage: plan.stage, total: plan.total, count: plan.count } : null });
+      const owner = { customerId: customer.id, jobberClientId: customer.jobberClientId, contactId,
+        candidateContactIds: candidateIds, storedInvoiceIds: ownInvoices.map(inv => inv.jobberInvoiceId) };
+      // Reported as a hold, not as "planned": "planned" already means a write
+      // this run is about to make, and no creation write exists yet.
+      report(creation.state === "create"
+        ? { ...owner, action: "hold", to: { stageId: refs.stageIdByName[CARD_CREATION_STAGE.toLowerCase()],
+              monetaryValue: creation.monetaryValue, name: creation.name },
+            reason: `No existing card; creation writes not enabled: ${describeCardCreation(creation)}` }
+        : { ...owner, action: "hold", reason: `No existing card; ${describeCardCreation(creation)}` });
+      return;
+    }
+    const card = matchingCards[0];
+    reviewedCards.add(card.id);
+    const context = { customerId: customer.id, jobberClientId: customer.jobberClientId,
+      storedInvoiceIds: ownInvoices.map(inv => inv.jobberInvoiceId), ...cardInfo(card) };
+    if (card.status !== "open") {
+      report({ ...context, action: "hold", reason: "Closed or unknown status; automatic reopening disabled" }); return;
+    }
+    if (![sentId, overdueId, paidId].includes(card.pipelineStageId ?? "")) {
+      report({ ...context, action: "hold", reason: "Special stage protected, including Late Fee and Closed Out" }); return;
+    }
+    let mutationStarted = false;
+    try {
+      source ??= readPhoneInvoiceEvidence();
+      const evidence = await source;
+      sourceObservedAt ??= new Date().toISOString();
+      const plan = phoneSourcePlan(customer.jobberClientId, ownInvoices.map(inv => inv.jobberInvoiceId), evidence, now);
+      if (!plan) {
+        report({ ...context, action: "hold", reason: "Incomplete, missing, unknown, void, old outstanding, or inconsistent Jobber evidence, including invalid monetary amounts" }); return;
+      }
+      const stageId = refs.stageIdByName[plan.stage.toLowerCase()];
+      const paid = plan.stage === GHL_STAGE_PAID;
+      const label = ownInvoices[0]?.clientName ?? customer.companyName ?? customer.name ?? customer.jobberClientId;
+      const to = { stageId, monetaryValue: plan.total,
+        ...(paid ? {} : { name: `${label} — ${plan.count} ${plan.stage === GHL_STAGE_OVERDUE ? "overdue" : "unpaid"} invoice${plan.count === 1 ? "" : "s"}` }) };
+      const cancellationCandidate = !paid && card.pipelineStageId!==paidId && process.env.GHL_DIRECT_WORKFLOW_REMOVAL_ENABLED==="true"
+        && process.env.GHL_CYCLE_OWNERSHIP_ENABLED==="true" && process.env.GHL_RECURRING_DUE_DATE_ENABLED==="true";
+      const bootstrapOverdue = !paid && card.pipelineStageId === overdueId && process.env.GHL_EXISTING_OVERDUE_BOOTSTRAP_ENABLED === "true";
+      if (!paid && card.pipelineStageId === overdueId && !cancellationCandidate && !bootstrapOverdue) {
+        report({ ...context, to, action: "hold", reason: "Existing Overdue cycle requires execution review; no re-enrollment or clock restart" }); return;
+      }
+      if (!cancellationCandidate && !bootstrapOverdue && card.pipelineStageId === stageId && (paid || (card.monetaryValue === to.monetaryValue && card.name === to.name))) {
+        report({ ...context, to, action: "unchanged", reason: "Already matches verified source" }); return;
+      }
+      const blocked = writesHalted ? "Earlier GHL write outcome unconfirmed; remaining writes halted" :
+        mode === "review" ? "Review mode; no writes" :
+        !email && !phoneWrites ? "Phone writes not enabled" :
+        mode === "paid_only" && !paid ? "Enrollment and non-Paid changes require explicit sync mode" :
+        !opts.writer ? "No admitted durable writer; no writes" :
+        !approvedCards.has(card.id) ? "Card is outside the explicitly approved write cohort; Paid exits are also held" : null;
+      report({ ...context, to, action: blocked ? "hold" : "planned", reason: blocked ?? "Fresh complete Jobber source verified" });
+      if (blocked) return;
+      const standingPolicy = readConfiguredStandingIdentityPolicy();
+      let identityReason: string | null;
+      let standingHandle: Awaited<ReturnType<typeof readStandingIdentityInventory>> | undefined;
+      let standingEvidence: ReturnType<typeof reviewedIdentityOwnerEvidence> | undefined;
+      if (standingPolicy) {
+        const policyKey = JSON.stringify(standingPolicy);
+        if (standingInventoryPolicy !== policyKey) { standingInventory = undefined; standingInventoryPolicy = policyKey; }
+        standingInventory ??= readStandingIdentityInventory(standingPolicy, customers);
+        standingHandle = await standingInventory;
+        const inventory = inspectReviewedIdentityInventory(standingHandle);
+        standingEvidence = reviewedIdentityOwnerEvidence(standingHandle, customer.jobberClientId);
+        identityReason = verifyFreshGhlIdentity(customer, customers, contacts, contactId, inventory.identities, standingEvidence);
+      } else {
+        freshIdentities ??= readFreshJobberIdentities();
+        identityReason = verifyFreshGhlIdentity(customer, customers, contacts, contactId, await freshIdentities);
+      }
+      if (identityReason) { report({ ...context, to, action: "hold", reason: identityReason }); return; }
+      const standingHold = (): string | null => {
+        if (!standingPolicy) return null;
+        try {
+          if (JSON.stringify(readConfiguredStandingIdentityPolicy()) !== JSON.stringify(standingPolicy))
+            return "Standing identity authorization changed before write";
+          if (!standingHandle || !standingEvidence) return "Standing identity evidence unavailable";
+          const inventory = inspectReviewedIdentityInventory(standingHandle);
+          // Reuse the SAME bounded handle and owner proof: never refresh either
+          // its observation time or authorization just to get past a slow read.
+          return verifyFreshGhlIdentity(customer, customers, contacts, contactId, inventory.identities, standingEvidence);
+        } catch { return "Standing identity evidence expired or changed before write"; }
+      };
+      const current = await readOpportunity(card.id);
+      const currentObservedAt = new Date().toISOString();
+      if (current.pipelineId !== refs.pipelineId || current.contactId !== contactId || current.status !== "open") {
+        report({ ...context, to, action: "hold", reason: "Card ownership/status changed before write" }); return;
+      }
+      if (!cancellationCandidate && !bootstrapOverdue && current.pipelineStageId === stageId && (paid || (current.monetaryValue === to.monetaryValue && current.name === to.name))) {
+        report({ ...context, to, action: "unchanged", reason: "Fresh GHL read already matches target; no repeated PUT" }); return;
+      }
+      if (current.pipelineStageId !== card.pipelineStageId || current.name !== card.name || current.monetaryValue !== card.monetaryValue) {
+        report({ ...context, to, action: "hold", reason: "Card changed since preflight; replan on a fresh run" }); return;
+      }
+      const postReadStandingHold = standingHold();
+      if (postReadStandingHold) { report({ ...context, to, action: "hold", reason: postReadStandingHold }); return; }
+      if(cancellationCandidate){
+        if(!opts.writer!.readCycleHistory){report({...context,to,action:"hold",reason:"Cancellation requires durable cycle history"});return;}
+        mutationStarted=true;
+        const cancelled=await cancelPaidOwnedInvoiceCycle({
+          scope:{locationId:process.env.GHL_LOCATION_ID??"",opportunityId:card.id,contactId,jobberClientId:customer.jobberClientId},
+          expectedCard:current,mode,phoneOwner:!email,writer:{
+            prepare:opts.writer!.prepare.bind(opts.writer),assertPending:opts.writer!.assertPending.bind(opts.writer),
+            confirm:opts.writer!.confirm.bind(opts.writer),block:opts.writer!.block.bind(opts.writer),
+            readCycleHistory:opts.writer!.readCycleHistory.bind(opts.writer)},
+        });
+        if(cancelled.state==="cancelled"){
+          if(!cancelled.reused)applied+=1;
+          report({...context,to,action:cancelled.reused?"hold":"applied",
+            reason:"Owned paid invoice workflow removal acknowledged; aggregate card unchanged and successor entry held"});
+          return;
+        }
+        if(cancelled.state==="held"){report({...context,to,action:"hold",reason:cancelled.reason});return;}
+        if(current.pipelineStageId===overdueId && !bootstrapOverdue){
+          report({...context,to,action:"hold",reason:"Existing Overdue cycle requires execution review; no re-enrollment or clock restart"});return;
+        }
+      }
+      if (bootstrapOverdue) {
+        const unpaid = evidence.filter(i => i.client?.id === customer.jobberClientId &&
+          (i.invoiceStatus?.toLowerCase() !== "paid" || i.amounts?.invoiceBalance !== 0));
+        if (unpaid.length !== 1 || !opts.writer!.readCycleHistory) {
+          report({ ...context, to, action:"hold", reason:"Bootstrap requires unique unpaid source and durable complete history" }); return;
+        }
+        mutationStarted=true;
+        const result=await syncExistingOverdueBootstrap({
+          scope:{locationId:process.env.GHL_LOCATION_ID??"",opportunityId:card.id,contactId,
+            jobberClientId:customer.jobberClientId,invoiceId:unpaid[0].id},
+          expectedCard:current,target:to,mode,phoneOwner:!email,writer:{
+            prepare:opts.writer!.prepare.bind(opts.writer),assertPending:opts.writer!.assertPending.bind(opts.writer),
+            confirm:opts.writer!.confirm.bind(opts.writer),block:opts.writer!.block.bind(opts.writer),
+            readCycleHistory:opts.writer!.readCycleHistory.bind(opts.writer)},
+        });
+        if(result.state==="applied")applied+=1;
+        report({...context,to,action:result.state==="applied"?"applied":"hold",
+          reason:result.state==="applied"?"Reviewed existing-overdue cycle entered with source date and past milestones skipped":result.reason});
+        return;
+      }
+      if (!paid && process.env.GHL_CYCLE_OWNERSHIP_ENABLED === "true" && current.pipelineStageId === paidId) {
+        const unpaid = evidence.filter(i => i.client?.id === customer.jobberClientId &&
+          (i.invoiceStatus?.toLowerCase() !== "paid" || i.amounts?.invoiceBalance !== 0));
+        if (unpaid.length !== 1 || !opts.writer!.readCycleHistory) {
+          report({ ...context, to, action: "hold", reason: "Cycle reset requires unique unpaid source and durable cycle history" }); return;
+        }
+        mutationStarted = true;
+        const result = await resetJournalOwnedInvoiceCycle({ scope: { locationId: process.env.GHL_LOCATION_ID ?? "", opportunityId: card.id,
+          contactId, jobberClientId: customer.jobberClientId, invoiceId: unpaid[0].id }, expectedCard: current, name: to.name,
+          writer: { prepare: opts.writer!.prepare.bind(opts.writer), assertPending: opts.writer!.assertPending.bind(opts.writer),
+            confirm: opts.writer!.confirm.bind(opts.writer), block: opts.writer!.block.bind(opts.writer), readCycleHistory: opts.writer!.readCycleHistory.bind(opts.writer) },
+          mode, phoneOwner: !email });
+        if (result.state === "applied") applied += 1;
+        report({ ...context, action: result.state === "applied" ? "applied" : "hold",
+          reason: result.state === "applied" ? "Journal-owned next invoice reset to Sent after reviewed cleanup evidence; no enrollment claimed" : result.reason });
+        return;
+      }
+      // Every possible Overdue enrollment goes through date-before-stage. When
+      // disabled or effects are unverified, HOLD rather than fall back to the
+      // legacy stage PUT. Existing Paid exit gates are unchanged.
+      if (!paid && (stageId === overdueId || process.env.GHL_RECURRING_DUE_DATE_ENABLED === "true")) {
+        const unpaid = evidence.filter(i => i.client?.id === customer.jobberClientId &&
+          (i.invoiceStatus?.toLowerCase() !== "paid" || i.amounts?.invoiceBalance !== 0));
+        if (unpaid.length !== 1) {
+          report({ ...context, to, action: "hold", reason: "Recurring date binding requires exactly one unpaid owner invoice" }); return;
+        }
+        // The helper owns durable claims and blocks on any uncertain outcome.
+        // Mark locally too, so an exception halts subsequent cards this run.
+        mutationStarted = true;
+        const result = await syncRecurringDueDateBeforeStage({
+          scope: { locationId: process.env.GHL_LOCATION_ID ?? "", opportunityId: card.id,
+            contactId, jobberClientId: customer.jobberClientId, invoiceId: unpaid[0].id },
+          expectedCard: current, target: to, mode, phoneOwner: !email, writer: opts.writer!,
+        });
+        if (result.state === "applied") applied += 1;
+        report({ ...context, to, action: result.state === "applied" ? "applied" : "hold",
+          reason: result.state === "applied" ? "Due date read back before fresh verified stage transition; delivery not asserted" : result.reason });
+        return;
+      }
+      const intent = buildGhlWriteIntent({ current, to, jobberClientId: customer.jobberClientId,
+        source: evidence, storedInvoiceIds: ownInvoices.map(inv => inv.jobberInvoiceId), observedAt: sourceObservedAt });
+      if (!intent) { report({ ...context, to, action: "hold", reason: "Immutable card/source evidence is unavailable" }); return; }
+      if (paid && process.env.GHL_CYCLE_OWNERSHIP_ENABLED === "true" && opts.writer!.readCycleHistory) {
+        const history = await opts.writer!.readCycleHistory();
+        const owned = latestCycleOwner(history, { ...intent, locationId: process.env.GHL_LOCATION_ID ?? "" });
+        // Keep the original owned card date as history; the actual paid source
+        // may have edited its due date. Never misattribute a reset successor to
+        // an older enrollment or repeat an already recorded Paid claim.
+        const alreadyPaid = owned?.intent.cycle && history.some(w => w.intent.cycle?.phase === "paid"
+          && w.intent.cycle.locationId === owned.intent.cycle!.locationId && w.intent.cycle.workflowId === owned.intent.cycle!.workflowId
+          && w.intent.cycle.invoiceId === owned.intent.cycle!.invoiceId && w.intent.jobberClientId === intent.jobberClientId);
+        if (owned?.intent.cycle && !alreadyPaid) {
+          intent.cycle = { ...owned.intent.cycle, phase: "paid" };
+          const witness = await readPrePaidDateWitness({ current, owner: owned, observedAt: currentObservedAt });
+          if (witness) intent.cycle.paidDateWitness = witness;
+        }
+      }
+      const preAdmissionStandingHold = standingHold();
+      if (preAdmissionStandingHold) {
+        report({ ...context, to, action: "hold", reason: preAdmissionStandingHold }); return;
+      }
+      // A failure anywhere after attempting the durable claim halts this writer.
+      mutationStarted = true;
+      const intentId = await opts.writer!.prepare(intent);
+      await opts.writer!.assertPending(intentId);
+      const preMutationStandingHold = standingHold();
+      if (preMutationStandingHold) throw new Error(preMutationStandingHold);
+      await moveOpportunityToStage(card.id, stageId, plan.total, to.name);
+      const accepted = await readOpportunity(card.id);
+      if (accepted.pipelineId !== current.pipelineId || accepted.contactId !== current.contactId || accepted.status !== "open"
+          || accepted.pipelineStageId !== stageId || accepted.monetaryValue !== plan.total
+          || accepted.name !== (to.name ?? current.name)) throw new Error("Post-write card state not confirmed");
+      await opts.writer!.confirm(intentId, await readPaidDateReadback(intent, accepted));
+      applied += 1;
+      report({ ...context, to, action: "applied", reason: "GHL accepted update; downstream workflow effects not verified" });
+    } catch (err: any) {
+      // A timeout may have applied. No retry or compensating move, and no
+      // remaining writes this run. This in-memory halt is NOT cross-run fencing.
+      if (mutationStarted) { writesHalted = true; await opts.writer!.block(); }
+      report({ ...context, action: "failed", reason: `${mutationStarted ? "GHL write outcome unconfirmed; remaining writes halted. " : "Source/read validation failed; held. "}${err?.message ?? err}` });
+    }
   };
 
-  // --- Phase A: past_due — ONE opportunity per CUSTOMER (aggregated) ---------
-  // GHL keeps a single open opp per contact, so a customer with many overdue
-  // invoices collapses to one card. Aggregate their total overdue onto it.
-  const pastDue = await prisma.invoiceRecord.findMany({
-    where: { invoiceStatus: "past_due" },
-    include: { customer: true },
-  });
-
-  interface OverdueGroup {
-    email: string;
-    name: string | null;
-    clientName: string | null;
-    phone: string | null;
-    total: number;
-    count: number;
+  // Preserve overdue group precedence. In particular this guard existed in
+  // production; a future awaiting invoice must never demote its overdue group.
+  const groups = new Map<string, typeof customers[number]>();
+  for (const inv of invoices.filter(inv => inv.invoiceStatus === "past_due" && !skipForSync(inv))) {
+    const customer = customers.find(c => c.id === inv.customerId);
+    const email = customer?.email?.trim().toLowerCase();
+    if (customer && email) groups.set(email, customer);
   }
-  const groups = new Map<string, OverdueGroup>();
-  for (const inv of pastDue) {
-    // Skip invoices that are too old or carry no balance (nothing owed) — don't
-    // let them create a card or inflate a customer's aggregated total.
-    if (skipForSync(inv)) {
-      skippedOldOrZero += 1;
-      continue;
-    }
-    const email = inv.customer?.email?.trim().toLowerCase();
-    if (!email) {
-      skipped += 1; // no email → can't map or create a GHL contact
-      continue;
-    }
-    let g = groups.get(email);
-    if (!g) {
-      g = {
-        email,
-        name: inv.customer?.name ?? inv.customer?.companyName ?? inv.clientName ?? null,
-        // clientName is the dashboard/Jobber label (property/company name). We
-        // use it for the GHL card title so the board reads the same as the
-        // Collections list (e.g. "Opperman Residence", not "John Bradford").
-        clientName: inv.clientName ?? inv.customer?.companyName ?? inv.customer?.name ?? null,
-        phone: inv.customer?.phone ?? null,
-        total: 0,
-        count: 0,
-      };
-      groups.set(email, g);
-    }
-    g.total += inv.amountDue || 0;
-    g.count += 1;
+  for (const customer of groups.values()) await reconcile(customer);
+  for (const inv of invoices.filter(inv => inv.invoiceStatus === "awaiting_payment" && !skipForSync(inv))) {
+    const customer = customers.find(c => c.id === inv.customerId);
+    const email = customer?.email?.trim().toLowerCase();
+    if (email && groups.has(email)) continue;
+    if (customer) await reconcile(customer);
   }
-  log(`[ghl] past_due: ${pastDue.length} invoices across ${groups.size} customers`);
-
-  for (const g of Array.from(groups.values())) {
-    try {
-      const contactId = await resolveContact(g.email, g.name, g.phone);
-      overdueContactIds.add(contactId);
-      // Card title matches the dashboard/Jobber clientName so the board reads
-      // the same as the Collections list.
-      const cardName = `${g.clientName ?? g.name ?? g.email} — ${g.count} overdue invoice${g.count === 1 ? "" : "s"}`;
-      const opps = await searchOpportunities(contactId, refs.pipelineId);
-      if (opps.length > 0) {
-        // Update the customer's existing card: move to Overdue, set the total,
-        // rename to the dashboard label, and force it back to "open" (also
-        // un-hides won/lost cards).
-        await moveOpportunityToStage(opps[0].id, overdueStageId, g.total, cardName);
-        keptOppByContact.set(contactId, opps[0].id);
-        moved += 1;
-      } else {
-        const opp = await createOpportunity({
-          pipelineId: refs.pipelineId,
-          pipelineStageId: overdueStageId,
-          contactId,
-          name: cardName,
-          monetaryValue: g.total,
-        });
-        keptOppByContact.set(contactId, opp.id);
-        created += 1;
-      }
-      customersProcessed += 1;
-      invoicesProcessed += g.count;
-    } catch (err: any) {
-      skipped += g.count;
-      logError(
-        `[sync] ghlInvoicePipeline: customer ${g.email} failed (continuing):`,
-        err?.message ?? err
-      );
-    }
+  // Remaining owners include paid/unknown cache rows. Only explicit fresh
+  // evidence can authorize their exit; lack of an overdue group proves nothing.
+  for (const customer of customers) {
+    if (invoices.some(inv => inv.customerId === customer.id)) await reconcile(customer);
   }
-
-  // --- Phase B: awaiting_payment — per invoice (these aren't collapsed) ------
-  const awaiting = await prisma.invoiceRecord.findMany({
-    where: { invoiceStatus: "awaiting_payment" },
-    include: { customer: true },
-  });
-  for (const inv of awaiting) {
-    const invId = inv.invoiceNumber ?? inv.jobberInvoiceId ?? inv.id;
-    // Skip invoices that are too old or carry no balance (nothing owed) before
-    // any create/move.
-    if (skipForSync(inv)) {
-      skippedOldOrZero += 1;
-      continue;
-    }
-    const email = inv.customer?.email?.trim().toLowerCase();
-    if (!email) {
-      skipped += 1;
-      log(`[ghl] no email for invoice ${invId} — skipping`);
-      continue;
-    }
-    // A customer already handled as overdue in Phase A owns their single card;
-    // don't let a per-invoice awaiting card move it out of "Invoice Overdue".
-    if (groups.has(email)) continue;
-
-    const stageName = ghlStageForInvoice(inv, now);
-    if (!stageName) {
-      skipped += 1;
-      continue;
-    }
-    const stageId = refs.stageIdByName[stageName.toLowerCase()];
-    if (!stageId) {
-      skipped += 1;
-      log(`[ghl] stage "${stageName}" not found in pipeline — skipping invoice ${invId}`);
-      continue;
-    }
-    try {
-      const contactId = await resolveContact(
-        email,
-        inv.customer?.name ?? inv.customer?.companyName ?? inv.clientName ?? null,
-        inv.customer?.phone ?? null
-      );
-      awaitingContactIds.add(contactId);
-      const opps = await searchOpportunities(contactId, refs.pipelineId);
-      const match = opps.find((o) => matchesInvoice(o, inv));
-      if (match) {
-        if (match.pipelineStageId !== stageId) {
-          await moveOpportunityToStage(match.id, stageId);
-          moved += 1;
-        }
-      } else {
-        await createOpportunity({
-          pipelineId: refs.pipelineId,
-          pipelineStageId: stageId,
-          contactId,
-          name: opportunityName(inv),
-          monetaryValue: inv.amountDue || inv.total || 0,
-        });
-        created += 1;
-      }
-      invoicesProcessed += 1;
-    } catch (err: any) {
-      skipped += 1;
-      logError(
-        `[sync] ghlInvoicePipeline: invoice ${inv.invoiceNumber ?? inv.id} failed (continuing):`,
-        err?.message ?? err
-      );
-    }
+  for (const card of cards) {
+    if (!reviewedCards.has(card.id)) report({ ...cardInfo(card), action: "hold", reason: "No unambiguous Jobber owner with stored invoice coverage" });
   }
-
-  // --- Phase C: clean up the Overdue stage ----------------------------------
-  // Demote any card in "Invoice Overdue" that no longer belongs: a contact who
-  // isn't currently overdue (paid off, or only awaiting), or a duplicate card
-  // for an overdue contact (we keep the single aggregate card per contact).
-  const paidStageId = refs.stageIdByName[GHL_STAGE_PAID.toLowerCase()];
-  const sentStageId = refs.stageIdByName[GHL_STAGE_SENT.toLowerCase()];
-  try {
-    const pipelineOpps = await listPipelineOpportunities(refs.pipelineId);
-    for (const o of pipelineOpps) {
-      if (o.pipelineStageId !== overdueStageId) continue;
-      const cid = o.contactId ?? "";
-      // Keep the single aggregate card for a currently-overdue contact.
-      if (cid && overdueContactIds.has(cid) && keptOppByContact.get(cid) === o.id) {
-        continue;
-      }
-      // Stale or duplicate → move it out: awaiting-only → Sent, otherwise Paid.
-      const target =
-        cid && !overdueContactIds.has(cid) && awaitingContactIds.has(cid)
-          ? sentStageId
-          : paidStageId;
-      if (!target) continue;
-      await moveOpportunityToStage(o.id, target);
-      cleared += 1;
-    }
-  } catch (err: any) {
-    logError("[ghl] overdue cleanup failed (continuing):", err?.message ?? err);
-  }
-
-  log(
-    `[ghl] invoice pipeline sync summary — processed=${customersProcessed} customers ` +
-      `(${invoicesProcessed} invoices) created=${created} moved=${moved} skipped=${skipped} ` +
-      `skippedOldOrZero=${skippedOldOrZero} cleared=${cleared}`
-  );
-
-  // --- One-time cleanup: delete opportunities for invalid invoices -----------
-  // Gated behind CLEANUP_INVALID_OPPS=true. Deletes any Invoice-Pipeline
-  // opportunity that matches an invoice which is too old (pre-cutoff) or carries
-  // no balance. Deletes the opportunity only — never the contact.
   if (process.env.CLEANUP_INVALID_OPPS === "true") {
-    await cleanupInvalidOpportunities(refs.pipelineId);
+    log("[ghl] Invalid-card deletion disabled; old, zero, duplicate, closed and special-stage cards require individual review");
   }
-
-  return customersProcessed;
-}
-
-// Delete GHL opportunities that were created for invalid invoices (issued before
-// the cutoff, or $0/null total). Matches with the same invoice-number/title
-// logic used elsewhere and removes only the opportunity, not the contact.
-// One-time maintenance pass, gated by the CLEANUP_INVALID_OPPS env flag.
-async function cleanupInvalidOpportunities(pipelineId: string): Promise<void> {
-  let checked = 0;
-  let deleted = 0;
-  let notFound = 0;
-  let errors = 0;
-  try {
-    // Superset query, then filter with the exact same predicate as the sync.
-    const candidates = (
-      await prisma.invoiceRecord.findMany({
-        where: {
-          OR: [
-            { issuedAt: { lt: GHL_SYNC_SINCE } },
-            { issuedAt: null },
-            { total: { lte: 0 } },
-          ],
-        },
-      })
-    ).filter((inv) => isOldOrZeroInvoice(inv));
-
-    // One pass over the pipeline; match invalid invoices against it in memory.
-    const pipelineOpps = await listPipelineOpportunities(pipelineId);
-    for (const inv of candidates) {
-      checked += 1;
-      const matches = pipelineOpps.filter((o) => matchesInvoice(o, inv));
-      if (matches.length === 0) {
-        notFound += 1;
-        continue;
-      }
-      for (const o of matches) {
-        try {
-          await deleteOpportunity(o.id);
-          deleted += 1;
-        } catch (err: any) {
-          errors += 1;
-          logError(
-            `[ghl] cleanup: failed to delete opportunity ${o.id} for invoice ${inv.invoiceNumber ?? inv.id}:`,
-            err?.message ?? err
-          );
-        }
-      }
-    }
-  } catch (err: any) {
-    logError("[ghl] cleanup pass failed (continuing):", err?.message ?? err);
-  }
-  log(
-    `[ghl] cleanup summary — checked=${checked} deleted=${deleted} notFound=${notFound} errors=${errors}`
-  );
+  log(`[ghl] invoice sync mode=${mode} applied=${applied}; existing queued reminders are not canceled by holds`);
+  return applied;
 }
 
 async function upsertTimeEntries(entries: FlatTimeEntry[]) {
