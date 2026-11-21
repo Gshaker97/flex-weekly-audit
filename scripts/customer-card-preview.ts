@@ -53,9 +53,11 @@ async function main() {
     email: c.email,
     phone: c.phone,
     name: c.name ?? c.companyName ?? null,
-    // The sync does not store Jobber's billing address, so the preview cannot
-    // show it. Reported below; the writer will have to read it from Jobber.
-    address1: null, city: null, state: null, postalCode: null,
+    // Jobber's billing address, as the client sync stored it.
+    address1: c.billingStreet,
+    city: c.billingCity,
+    state: c.billingState,
+    postalCode: c.billingPostalCode,
   });
 
   const allCustomers = customers.map(asResolver);
@@ -186,9 +188,13 @@ async function main() {
   const byVia = new Map<string, number>();
   for (const c of creations) bump(byVia, c.via);
   for (const [k, v] of byVia) console.log(`   ${v}  ${k}`);
-  console.log(`   examples: ${creations.slice(0, 5).map(c => c.name).join("; ") || "(none)"}`);
-  const withoutAddress = creations.filter(c => !c.address1).length;
-  if (withoutAddress) console.log(`   NOTE: ${withoutAddress} would be created with no billing address - the sync does not store it`);
+  for (const c of creations.slice(0, 5)) {
+    const where = [c.address1, c.city, c.state, c.postalCode].filter(Boolean).join(", ");
+    console.log(`   - ${c.name} | address: ${where || "(none on file in Jobber)"}`);
+  }
+  const withoutAddress = creations.filter(
+    c => !c.address1 && !c.city && !c.state && !c.postalCode).length;
+  console.log(`   ${creations.length - withoutAddress} would carry a billing address, ${withoutAddress} would not`);
 
   console.log(`\nWOULD CREATE ${createdCards.length + newContactCards.length} card(s)`);
   console.log(`   ${createdCards.length} on contacts that already exist`);

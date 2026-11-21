@@ -29,6 +29,7 @@ import {
   concatJobNotes,
   jobberGraphQL,
 } from "./jobber";
+import { jobberBillingAddress } from "./jobber-billing-address";
 import {
   getInvoicePipelineRefs,
   listContactsForPhoneMatching,
@@ -327,6 +328,11 @@ async function upsertClients(nodes: JobberClientNode[]) {
   await inBatches(nodes, async (c) => {
     const email = c.emails?.find((e) => e.primary)?.address ?? c.emails?.[0]?.address ?? null;
     const phone = c.phones?.find((p) => p.primary)?.number ?? c.phones?.[0]?.number ?? null;
+    // Jobber's billing address, for the contact writer to create a GoHighLevel
+    // contact with. Blank fields arrive as null, so a client with nothing on
+    // file stays indistinguishable from one not yet synced - which is correct:
+    // in both cases there is no address to write.
+    const billing = jobberBillingAddress(c.billingAddress);
 
     await prisma.customer.upsert({
       where: { jobberClientId: c.id },
@@ -336,6 +342,7 @@ async function upsertClients(nodes: JobberClientNode[]) {
         companyName: c.companyName ?? null,
         email,
         phone,
+        ...billing,
         createdAtJobber: c.createdAt ? new Date(c.createdAt) : null,
       },
       update: {
@@ -343,6 +350,7 @@ async function upsertClients(nodes: JobberClientNode[]) {
         companyName: c.companyName ?? null,
         email,
         phone,
+        ...billing,
         createdAtJobber: c.createdAt ? new Date(c.createdAt) : null,
         lastSyncedAt: new Date(),
       },

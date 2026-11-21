@@ -157,6 +157,14 @@ model Customer {
   companyName     String?
   email           String?
   phone           String?
+  // Jobber's BILLING address for this client, copied onto a GoHighLevel
+  // contact when one has to be created. Nullable throughout: Jobber has
+  // clients with no billing address, and "nobody has synced this yet" must
+  // stay distinguishable from "Jobber has nothing".
+  billingStreet     String?
+  billingCity       String?
+  billingState      String?
+  billingPostalCode String?
   createdAtJobber DateTime?
   isRecurring     Boolean   @default(false)
   totalRevenue    Float     @default(0)

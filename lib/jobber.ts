@@ -365,6 +365,7 @@ const CLIENTS_QUERY = `
         createdAt
         emails { address primary }
         phones { number primary }
+        billingAddress { street1 street2 city province postalCode }
       }
     }
   }
@@ -504,6 +505,14 @@ export interface JobberClientNode {
   createdAt: string | null;
   emails?: Array<{ address: string; primary: boolean }>;
   phones?: Array<{ number: string; primary: boolean }>;
+  /** Jobber's billing address. Absent for clients that have none on file. */
+  billingAddress?: {
+    street1?: string | null;
+    street2?: string | null;
+    city?: string | null;
+    province?: string | null;
+    postalCode?: string | null;
+  } | null;
 }
 
 export interface JobberInvoiceNode {
