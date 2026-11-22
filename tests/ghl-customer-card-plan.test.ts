@@ -15,10 +15,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  planCustomerCard, customerCardName,
+  planCustomerCard, customerCardName, CARD_NAME_MAX_LENGTH,
   STAGE_OVERDUE, STAGE_PAID, STAGE_SENT,
   type CustomerCardInput, type InvoiceClock,
 } from "../lib/ghl-customer-card-plan";
+import { invoiceNumbersInCardName } from "../lib/ghl-invoice-card-plan";
 import type { ExistingCard, InvoiceFact } from "../lib/ghl-invoice-card-plan";
 
 const NOW = new Date("2026-11-20T12:00:00Z");
@@ -126,10 +127,19 @@ test("four invoices for one customer produce ONE card, and GHL never sees a seco
   assert.equal(ghl.creates, 1, "create was attempted exactly once, so GHL never had the chance to refuse");
   const card = [...ghl.cards.values()][0];
   assert.equal(card.value, 720, "value is the total unpaid, not one invoice");
-  for (const n of ["9101", "9102", "9103", "9105"]) {
-    assert.ok(card.name.includes(`#${n}`), `name lists invoice ${n}`);
-  }
-  assert.ok(card.name.includes("due 2026-10-01"), "name carries each due date");
+  // This used to assert all four numbers appeared. GoHighLevel refuses a name
+  // over 150 characters outright (HTTP 422, measured 2026-11-22), and four
+  // invoices spelled out in full come to 167, so that assertion was asking for
+  // a card that cannot be written. What must hold instead: the count and the
+  // total are exact, the oldest invoices are the ones named, and whatever did
+  // not fit is declared rather than dropped in silence.
+  assert.ok(card.name.length <= CARD_NAME_MAX_LENGTH, `${card.name.length} characters`);
+  assert.ok(card.name.includes("4 unpaid invoices, $720.00"));
+  assert.ok(card.name.includes("#9101"), "the oldest invoice is the one that must survive");
+  assert.ok(card.name.includes("due 2026-10-01"), "the name still carries a due date");
+  const listed = invoiceNumbersInCardName(card.name);
+  const omitted = Number(/\+(\d+) more$/.exec(card.name)?.[1] ?? 0);
+  assert.equal(listed.length + omitted, 4, "every invoice is either listed or counted");
 });
 
 test("the fake really does enforce GHL's rule, so the test above is meaningful", () => {
@@ -320,6 +330,123 @@ test("the name keeps the per-customer wording the old aggregate guard looks for"
   ]);
   assert.match(name, /\d+\s+unpaid\s+invoice/i);
   assert.ok(name.startsWith("Customer With Old Invoice — 1 unpaid invoice, $99.00"));
+});
+
+// --- GoHighLevel's 150-character limit on a card name -----------------------
+// Not a style rule. On 2026-11-22 a 166-character name was refused outright
+// with HTTP 422, so the card was never written at all. Everything below is
+// about that write succeeding, however many invoices a customer runs up.
+
+const many = (n: number) => Array.from({ length: n }, (_, i) => ({
+  invoiceId: `inv-${i}`, invoiceNumber: String(7000 + i), balanceDollars: 180,
+  dueDate: `2026-0${(i % 9) + 1}-1${i % 9}`, sentOn: "2026-07-01", daysPastDue: 40, isOverdue: true,
+}));
+
+test("a card name never exceeds GoHighLevel's 150-character limit, however many invoices", () => {
+  for (const n of [1, 2, 3, 4, 5, 8, 13, 40, 200]) {
+    const name = customerCardName("Customer With Many", many(n));
+    assert.ok(name.length <= CARD_NAME_MAX_LENGTH,
+      `${n} invoices produced ${name.length} characters: ${name}`);
+  }
+});
+
+test("the four-invoice customer that GoHighLevel actually rejected now fits", () => {
+  // The shape of the real refusal: four invoices, same amount, four due dates.
+  const name = customerCardName("Customer With Four Unpaid", many(4));
+  assert.ok(name.length <= CARD_NAME_MAX_LENGTH, `${name.length} characters`);
+  assert.ok(name.startsWith("Customer With Four Unpaid — 4 unpaid invoices, $720.00"));
+});
+
+test("what survives the squeeze: the count, the money and the first invoice", () => {
+  const name = customerCardName("Customer With Many", many(40));
+  assert.ok(name.length <= CARD_NAME_MAX_LENGTH);
+  // 1. the phrase the other writer's guard matches on
+  assert.match(name, /\d+\s+unpaid\s+invoice/i);
+  assert.ok(name.includes("40 unpaid invoices, $7,200.00"));
+  // 2. at least one invoice number, so the ownership boundary still sees it
+  assert.ok(invoiceNumbersInCardName(name).length >= 1);
+  // 3. the customer is still named
+  assert.ok(name.startsWith("Customer With Many"));
+  // 4. and the board does not pretend the list is complete
+  assert.match(name, / · \+\d+ more$/);
+});
+
+test("the dropped invoices are counted, not silently lost", () => {
+  const name = customerCardName("Customer With Many", many(40));
+  const shown = invoiceNumbersInCardName(name).length;
+  const hidden = Number(/\+(\d+) more$/.exec(name)?.[1]);
+  assert.equal(shown + hidden, 40);
+});
+
+test("an over-long customer name is shortened before any invoice is dropped", () => {
+  const long = "A".repeat(300);
+  const name = customerCardName(long, many(1));
+  assert.ok(name.length <= CARD_NAME_MAX_LENGTH, `${name.length} characters`);
+  assert.match(name, /\d+\s+unpaid\s+invoice/i);
+  assert.ok(name.includes("#7000"), "the only invoice must survive a long customer name");
+  assert.ok(name.startsWith("AAAA"), "what is left of the customer's name stays at the front");
+  assert.ok(name.includes("\u2026"), "the shortening is visible, not silent");
+});
+
+test("a customer with nothing unpaid still fits, even with an absurd name", () => {
+  const name = customerCardName("B".repeat(300), []);
+  assert.ok(name.length <= CARD_NAME_MAX_LENGTH);
+});
+
+test("the planner's own target name obeys the cap", () => {
+  const invoices = many(30).map(l => invoice({
+    invoiceId: l.invoiceId, invoiceNumber: l.invoiceNumber, balanceDollars: l.balanceDollars,
+    issuedDate: "2026-09-01", dueDate: l.dueDate,
+  }));
+  const clocks: Record<string, InvoiceClock> = {};
+  for (const i of invoices) clocks[i.invoiceId] = clock("2026-09-01", 40);
+  const decision = plan({ label: "Customer With Thirty", invoices, clocks, windowStart: "2026-01-01" });
+  assert.ok(decision.state === "create" || decision.state === "update");
+  if (decision.state !== "create" && decision.state !== "update") return;
+  assert.ok(decision.target.name.length <= CARD_NAME_MAX_LENGTH,
+    `planner produced ${decision.target.name.length} characters`);
+});
+
+test("a card already named in the OLD long format is adopted and renamed, never re-created", () => {
+  // Exactly what is on the board today: the pre-cap name, over the limit.
+  const invoices = many(4).map(l => invoice({
+    invoiceId: l.invoiceId, invoiceNumber: l.invoiceNumber, balanceDollars: l.balanceDollars,
+    issuedDate: "2026-07-01", dueDate: l.dueDate,
+  }));
+  const clocks: Record<string, InvoiceClock> = {};
+  for (const i of invoices) clocks[i.invoiceId] = clock("2026-07-01", 40);
+  const oldFormat = "Customer With Four — 4 unpaid invoices, $720.00"
+    + invoices.map(i => ` · #${i.invoiceNumber} $180.00 due ${i.dueDate}`).join("");
+  assert.ok(oldFormat.length > CARD_NAME_MAX_LENGTH, "the fixture must be a genuinely over-long old name");
+
+  const existing: ExistingCard = {
+    id: "card-old-format", name: oldFormat, stageName: STAGE_SENT, status: "open", monetaryValue: 720,
+  };
+  const decision = plan({ label: "Customer With Four", invoices, clocks,
+    windowStart: "2026-01-01", cards: [existing] });
+
+  assert.equal(decision.state, "update");
+  if (decision.state !== "update") return;
+  assert.equal(decision.cardId, "card-old-format", "it must reuse the card, not start a new one");
+  assert.ok(decision.changes.includes("name"));
+  assert.ok(decision.target.name.length <= CARD_NAME_MAX_LENGTH);
+});
+
+test("a card already carrying the NEW short name is left alone", () => {
+  const invoices = many(4).map(l => invoice({
+    invoiceId: l.invoiceId, invoiceNumber: l.invoiceNumber, balanceDollars: l.balanceDollars,
+    issuedDate: "2026-07-01", dueDate: l.dueDate,
+  }));
+  const clocks: Record<string, InvoiceClock> = {};
+  for (const i of invoices) clocks[i.invoiceId] = clock("2026-07-01", 40);
+  const first = plan({ label: "Customer With Four", invoices, clocks, windowStart: "2026-01-01" });
+  assert.equal(first.state, "create");
+  if (first.state !== "create") return;
+
+  const settled = plan({ label: "Customer With Four", invoices, clocks, windowStart: "2026-01-01",
+    cards: [{ id: "card-new-format", name: first.target.name, stageName: first.target.stage,
+      status: "open", monetaryValue: first.target.monetaryValue }] });
+  assert.equal(settled.state, "nothing", "a second run must not keep renaming the same card");
 });
 
 // --- Cases the 2026-11-20 production dry run exposed ------------------------
