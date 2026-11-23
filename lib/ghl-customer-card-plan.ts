@@ -144,22 +144,72 @@ export type CustomerCardInput = Readonly<{
 }>;
 
 /**
- * The card's name. Lists every unpaid invoice so the board itself answers
- * "what does this customer owe, and since when" without opening Jobber.
+ * GoHighLevel's hard limit on an opportunity name. Measured, not guessed: on
+ * 2026-11-22 a PUT carrying a 166-character name was refused with HTTP 422 and
+ * "Name must be shorter than or equal to 150 characters.", which left one real
+ * customer's card unconverted. Any name this function returns fits.
+ */
+export const CARD_NAME_MAX_LENGTH = 150;
+
+const ELLIPSIS = "\u2026";
+
+/** Last-resort trim, so nothing can leave this module over the cap. */
+const clampToCap = (s: string): string =>
+  s.length <= CARD_NAME_MAX_LENGTH ? s : s.slice(0, CARD_NAME_MAX_LENGTH - 1).trimEnd() + ELLIPSIS;
+
+/**
+ * The card's name. Lists the unpaid invoices so the board itself answers
+ * "what does this customer owe, and since when" without opening Jobber - but
+ * never at the cost of exceeding GoHighLevel's 150-character limit, because a
+ * name one character too long is not a truncated card, it is NO card: the
+ * whole write is refused.
  *
- * Deliberately keeps the `N unpaid invoices` phrasing of the per-customer cards
- * that already exist, so the old aggregate writer's `PER_CUSTOMER` guard still
- * recognises these as per-customer cards and leaves them alone.
+ * WHAT IS PROTECTED, IN ORDER, when there is not room for everything:
+ *   1. `N unpaid invoices, $total` - the count and the money, always present
+ *      and always in the same words. The old aggregate writer's `PER_CUSTOMER`
+ *      guard matches on this phrase, so keeping it is what stops a second
+ *      writer from treating these as somebody else's cards.
+ *   2. The first invoice's number. A per-customer card has always named at
+ *      least one invoice, and `invoiceNumbersInCardName` is what the ownership
+ *      boundary in the sync uses to tell whose card this is. A name that
+ *      listed no invoice at all would quietly move a card across that line.
+ *   3. The customer's name, shortened with an ellipsis before any invoice is
+ *      dropped, because a half-written customer name still identifies them
+ *      while a missing balance does not.
+ *   4. The remaining invoices, as many as fit, with `+N more` standing in for
+ *      the rest so the board never implies the list is complete.
  */
 export function customerCardName(label: string, lines: readonly CustomerCardLine[]): string {
   const who = label.trim();
-  if (!lines.length) return `${who} — all invoices paid`;
+  if (!lines.length) return clampToCap(`${who} — all invoices paid`);
+
   const total = lines.reduce((s, l) => s + l.balanceDollars, 0);
-  const head = `${who} — ${lines.length} unpaid invoice${lines.length === 1 ? "" : "s"}, ${money(total)}`;
-  const detail = lines
-    .map(l => `#${l.invoiceNumber} ${money(l.balanceDollars)}${l.dueDate ? ` due ${l.dueDate}` : ""}`)
-    .join(" · ");
-  return `${head} · ${detail}`;
+  const counted = `${lines.length} unpaid invoice${lines.length === 1 ? "" : "s"}, ${money(total)}`;
+  const parts = lines.map(
+    l => `#${l.invoiceNumber} ${money(l.balanceDollars)}${l.dueDate ? ` due ${l.dueDate}` : ""}`);
+
+  const build = (name: string, shown: number) => {
+    const hidden = parts.length - shown;
+    return `${name} — ${counted}`
+      + parts.slice(0, shown).map(p => ` · ${p}`).join("")
+      + (hidden > 0 ? ` · +${hidden} more` : "");
+  };
+
+  // Shorten the customer's name first, but only as far as keeping the count
+  // and the first invoice needs - never for the sake of a longer invoice list.
+  let shortened = who;
+  const over = build(who, 1).length - CARD_NAME_MAX_LENGTH;
+  if (over > 0) {
+    shortened = who.length - over > 1 ? who.slice(0, who.length - over - 1).trimEnd() + ELLIPSIS : ELLIPSIS;
+  }
+
+  // Then as much of the invoice list as fits. Every candidate is measured, so
+  // this does not rely on each entry being a predictable width.
+  for (let shown = parts.length; shown >= 1; shown--) {
+    const candidate = build(shortened, shown);
+    if (candidate.length <= CARD_NAME_MAX_LENGTH) return candidate;
+  }
+  return clampToCap(build(shortened, 1));
 }
 
 /**
