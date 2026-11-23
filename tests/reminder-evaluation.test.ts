@@ -105,7 +105,9 @@ test("an absent GoHighLevel tag is silence, not an assertion of maintenance", ()
   });
   assert.equal(resolution.category, "irrigation", "Jobber decides");
   assert.equal(resolution.source, "jobber_only");
-  assert.equal(serviceTypeIsConfirmed(resolution), false, "uncorroborated, so it still holds");
+  // Since 2026-11-23 Jobber decides on its own. Silence from GoHighLevel is
+  // still silence - it just no longer blocks a type Jobber has named.
+  assert.equal(serviceTypeIsConfirmed(resolution), true, "Jobber alone is enough");
 });
 
 test("no Jobber signal resolves to unknown even when GoHighLevel claims irrigation", () => {
@@ -171,10 +173,11 @@ test("two exactly matching contacts hold the invoice and nothing is merged", asy
   assert.equal(row.decision, "held");
   assert.ok(row.holds.some(hold => hold.includes("ambiguous_destination_contacts: 2 exact matches, not merged")), row.holds.join("; "));
   // With no single contact there is no tag to corroborate with, so the type is
-  // Jobber-only and therefore unconfirmed: still held, and no ladder chosen.
+  // Jobber-only - which since 2026-11-23 is confirmation, so the ladder IS now
+  // consulted. The ambiguous destination is what holds the row, and that is the
+  // point: there is no single place to send.
   assert.equal(row.categorySource, "jobber_only");
-  assert.equal(row.milestoneDay, null, "no ladder was consulted");
-  assert.ok(row.holds.some(hold => hold.startsWith("service_type_jobber_only")), row.holds.join("; "));
+  assert.ok(!row.holds.some(hold => hold.startsWith("service_type_")), row.holds.join("; "));
 });
 
 for (const [name, cards] of Object.entries({
@@ -197,15 +200,19 @@ test("an opted-out destination holds the invoice", async () => {
   assert.equal(plan.rows[0].decision, "held");
 });
 
-test("several unpaid invoices for one owner hold every one of them", async () => {
+test("several unpaid invoices for one owner no longer hold any of them", async () => {
+  // Reversed by the account owner's decision of 2026-11-23: this used to hold
+  // every invoice, which silenced exactly the customers who owe the most. The
+  // count is still reported, and `planDailyReminders` caps what one day can
+  // actually deliver to one text and one email per customer.
   const plan = await run({ candidates: [
     candidate({ jobberInvoiceId: "synthetic-a", invoiceNumber: "9001" }),
     candidate({ jobberInvoiceId: "synthetic-b", invoiceNumber: "9002" }),
   ], readers: readers({ readInvoice: async (id) => sourceInvoice({ clientId: "synthetic-client" }) }) });
   assert.equal(plan.rows.length, 2);
   for (const row of plan.rows) {
-    assert.equal(row.decision, "held");
-    assert.ok(row.holds.some(hold => hold.startsWith("owner_has_multiple_unpaid_invoices: 2")), row.holds.join("; "));
+    assert.ok(!row.holds.some(hold => hold.startsWith("owner_has_multiple_unpaid_invoices")), row.holds.join("; "));
+    assert.equal(row.unpaidInvoicesForOwner, 2);
   }
 });
 

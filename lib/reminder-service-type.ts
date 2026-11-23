@@ -88,7 +88,25 @@ export function resolveServiceType(input: {
     detail: `Only Jobber asserts ${jobber}; needs operator confirmation before a ladder is chosen` });
 }
 
-/** A ladder may be chosen only when both sources agree. Everything else holds. */
+/**
+ * A ladder may be chosen when JOBBER names the service type. GoHighLevel
+ * corroboration is still recorded and still welcome, but it is no longer
+ * required.
+ *
+ * Why this changed, decided by the account owner 2026-11-23: requiring
+ * agreement could never be satisfied for maintenance. A GoHighLevel tag can
+ * only ever positively assert irrigation (see `resolveServiceType`), so nothing
+ * in GoHighLevel is able to corroborate maintenance, and every maintenance
+ * invoice stayed held forever — 29 of the 32 invoices held on service type in
+ * the 2026-11-23 evaluation. Jobber is the system the customer is billed from,
+ * so Jobber alone is now enough.
+ *
+ * What still holds: "conflict" (Jobber contradicts itself, or GoHighLevel
+ * asserts irrigation against a Jobber maintenance reading) and "unknown"
+ * (Jobber says nothing at all). Neither names a category, so neither can pick
+ * a ladder.
+ */
 export function serviceTypeIsConfirmed(resolution: ServiceTypeResolution): boolean {
-  return resolution.source === "agreed" && resolution.category !== null;
+  return (resolution.source === "agreed" || resolution.source === "jobber_only")
+    && resolution.category !== null;
 }

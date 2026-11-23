@@ -191,6 +191,16 @@ export interface ReminderEvaluationRow {
   reworkReason: string | null;
   milestoneDay: number | null;
   audience: string | null;
+  /**
+   * How many unpaid invoices this owner has. Reporting only: it no longer holds
+   * the row, because the daily plan caps delivery per customer.
+   */
+  unpaidInvoicesForOwner: number | null;
+  /**
+   * True when no ladder milestone falls today and the row was admitted anyway
+   * because the invoice is simply past due. See `pastDueCatchUp`.
+   */
+  pastDueCatchUp: boolean;
   /** Per-channel outcome for today's milestone. Empty when no milestone is due. */
   channels: { channel: SendChannel; decision: "eligible" | "suppressed"; reason: string | null }[];
 }
@@ -229,6 +239,13 @@ export function withinArizonaWindow(now: Date): boolean {
  * runner never sends it, so one milestone can never be sent by two schedules.
  */
 export const DAY10_OWNED_BY_HOURLY_SENDER = 10;
+/**
+ * The milestone day stamped on a past-due catch-up. Deliberately not 10, 15 or
+ * 21: it must never be mistaken for a ladder step in the send ledger, and it
+ * gives the catch-up its own suppression key so one catch-up text and one
+ * catch-up email per invoice is all that can ever go out.
+ */
+export const PAST_DUE_CATCH_UP_DAY = 0;
 
 /** True once 09:15 Phoenix has passed on the current Phoenix day. */
 export function arizonaWindowPassed(now: Date): boolean {
@@ -246,6 +263,23 @@ export async function evaluateReminders(input: {
   verifiedExclusions?: readonly string[] | null;
   /** Only a manual review may ignore the window. The scheduled runner never does. */
   ignoreWindow?: boolean;
+  /**
+   * Chase EVERY invoice that is owed and past due, not only the invoices whose
+   * ladder milestone happens to land today. Decided by the account owner
+   * 2026-11-23: most overdue invoices sit between milestones, or have passed
+   * their last one, and were therefore never chased at all.
+   *
+   * Opt-in, so every existing caller and every existing test behaves exactly as
+   * before. What it does NOT change:
+   *  - it never promotes a row that is held for any other reason;
+   *  - it never invents a milestone in the past or the future. The synthesized
+   *    step is stamped `PAST_DUE_CATCH_UP_DAY` and dated today, so the
+   *    prior-send ledger key is (this invoice, catch-up, channel). One text and
+   *    one email per invoice, ever — a catch-up does not repeat daily;
+   *  - the 09:00 Phoenix window, the opt-out checks, the destination checks and
+   *    the one-text-one-email-per-customer-per-day cap all still apply.
+   */
+  pastDueCatchUp?: boolean;
   /**
    * Which channels a milestone would use. Supplied by the caller on purpose:
    * this module does not decide channel policy. Absent, null or empty holds.
@@ -377,9 +411,22 @@ export async function evaluateReminders(input: {
       category: null, categorySource: null, categoryEvidence: null,
       daysPastDue: null, balanceCents: null, totalCents: null, sourceIssuedDate: null,
       reworkVerdict: null, reworkReason: null, milestoneDay: null, audience: null,
+      unpaidInvoicesForOwner: null, pastDueCatchUp: false,
       channels: [],
     };
     rows.push(row);
+
+    // The two reviewed exclusions are now ENFORCED here, not merely counted.
+    // Until 2026-11-23 `verifiedExclusions` was only checked for its length:
+    // having exactly two reviewed client IDs configured turned live sends on,
+    // but nothing anywhere actually skipped those two clients' invoices. With
+    // sending about to be switched on that gap would have messaged the very
+    // customers the review set aside, so the check is made real. It runs before
+    // anything else, so an excluded client is never even read.
+    if (candidate.jobberClientId && uniqueExclusions.has(candidate.jobberClientId)) {
+      holds.push("client_excluded_by_review");
+      continue;
+    }
 
     const source = await readers.readInvoice(candidate.jobberInvoiceId);
     if (!source) { holds.push("source_invoice_unreadable"); continue; }
@@ -414,9 +461,13 @@ export async function evaluateReminders(input: {
     if (!clock) { holds.push("source_dates_unusable"); continue; }
     row.daysPastDue = clock.daysPastDue;
 
-    if ((perOwner.get(candidate.jobberClientId) ?? 0) > 1) {
-      holds.push(`owner_has_multiple_unpaid_invoices: ${perOwner.get(candidate.jobberClientId)}`);
-    }
+    // An owner with several unpaid invoices is NOT a hold any more, by the
+    // account owner's decision of 2026-11-23. It used to hold because nothing
+    // chose which of the owner's invoices to chase; `planDailyReminders` now
+    // makes that choice downstream and caps delivery at one text and one email
+    // per customer per day, so holding here only suppressed the chase for the
+    // customers who owe the most. The count stays on the row for review.
+    row.unpaidInvoicesForOwner = perOwner.get(candidate.jobberClientId) ?? 0;
 
     const contacts = await readers.matchContacts(candidate);
     let contactTags: readonly string[] | null = null;
@@ -538,7 +589,29 @@ export async function evaluateReminders(input: {
              "past_reconcile" | "today" | "future" }]
       : invoiceReminderMilestones(service.category!, source.issuedDate, source.dueDate, now);
     if (!milestones) { holds.push("milestones_unavailable"); continue; }
-    const today = milestones.find(step => step.timing === "today");
+    let today = milestones.find(step => step.timing === "today");
+    // No milestone today, but the money is late. Chase it anyway when the
+    // caller asked for that. The step is synthesized from the ladder's own
+    // audience and required facts so nothing downstream has to special-case it,
+    // and it is stamped with the catch-up day so the send ledger can tell a
+    // catch-up apart from a real day 10/15/21.
+    if (!today && input.pastDueCatchUp === true && clock.daysPastDue >= 1 && milestones.length > 0) {
+      today = {
+        dayPastDue: PAST_DUE_CATCH_UP_DAY,
+        // Always the customer, never an internal step. The furthest milestone a
+        // long-overdue invoice has passed is often an internal one (day 21, day
+        // 35), and inheriting that would address a chase to nobody.
+        audience: "homeowner",
+        // Deliberately empty. A catch-up states that money is owed and overdue,
+        // which Jobber proves. It must not inherit day 15's
+        // "three_percent_fee_applied" or day 25's late-fee wording, because the
+        // fee is in fact applied to only a small minority of these invoices.
+        requiredFacts: [],
+        scheduledOn: clock.today,
+        timing: "today",
+      };
+      row.pastDueCatchUp = true;
+    }
     if (!today) {
       // Explicitly not a hold and explicitly not a catch-up. A milestone that
       // already passed is reconciled by a person; it is never replayed here.

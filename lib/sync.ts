@@ -35,6 +35,7 @@ import {
   listContactsForPhoneMatching,
   listPipelineOpportunities,
   moveOpportunityToStage,
+  type GhlOpportunityStatusWrite,
   readOpportunity,
   GhlContact,
   GhlOpportunity,
@@ -969,7 +970,16 @@ export async function syncGhlInvoicePipeline(opts: {
     reviewedCards.add(card.id);
     const context = { customerId: customer.id, jobberClientId: customer.jobberClientId,
       storedInvoiceIds: ownInvoices.map(inv => inv.jobberInvoiceId), ...cardInfo(card) };
-    if (card.status !== "open") {
+    // A closed card is no longer the end of the road. Decided by the account
+    // owner 2026-11-23: a card someone marked won or lost while Jobber still
+    // shows a balance has to be chased, so it is reopened. Two limits keep the
+    // old protection intact: only the two statuses a person sets deliberately
+    // qualify (anything else still holds, including an unreadable status), and
+    // the decision is deferred until `plan` below has read FRESH Jobber
+    // evidence — never a cached snapshot.
+    const closedButReopenable = process.env.GHL_CARD_STATUS_WRITES_ENABLED === "true"
+      && (card.status === "won" || card.status === "lost");
+    if (card.status !== "open" && !closedButReopenable) {
       report({ ...context, action: "hold", reason: "Closed or unknown status; automatic reopening disabled" }); return;
     }
     if (![sentId, overdueId, paidId].includes(card.pipelineStageId ?? "")) {
@@ -986,6 +996,22 @@ export async function syncGhlInvoicePipeline(opts: {
       }
       const stageId = refs.stageIdByName[plan.stage.toLowerCase()];
       const paid = plan.stage === GHL_STAGE_PAID;
+      // The two status writes this sync may make, both from fresh Jobber
+      // evidence and nothing else:
+      //   paid      -> close the card as won. "Goes to Paid AND is closed" was
+      //                half-built before: the stage moved and the card stayed
+      //                open forever.
+      //   reopening -> a won/lost card that still owes money goes back to open
+      //                so it can be chased.
+      // Everything else leaves status exactly as it was.
+      // Gated, like every other write in this file. Off, the sync behaves
+      // exactly as it did: stage only, status untouched. The account owner
+      // turns it on once this PR is reviewed.
+      const statusWritesOn = process.env.GHL_CARD_STATUS_WRITES_ENABLED === "true";
+      const reopening = statusWritesOn && closedButReopenable && !paid;
+      const statusWrite: GhlOpportunityStatusWrite | undefined = !statusWritesOn ? undefined
+        : paid ? "won" : reopening ? "open" : undefined;
+      const expectedStatus = statusWrite ?? card.status;
       const label = ownInvoices[0]?.clientName ?? customer.companyName ?? customer.name ?? customer.jobberClientId;
       const to = { stageId, monetaryValue: plan.total,
         ...(paid ? {} : { name: `${label} — ${plan.count} ${plan.stage === GHL_STAGE_OVERDUE ? "overdue" : "unpaid"} invoice${plan.count === 1 ? "" : "s"}` }) };
@@ -995,7 +1021,11 @@ export async function syncGhlInvoicePipeline(opts: {
       if (!paid && card.pipelineStageId === overdueId && !cancellationCandidate && !bootstrapOverdue) {
         report({ ...context, to, action: "hold", reason: "Existing Overdue cycle requires execution review; no re-enrollment or clock restart" }); return;
       }
-      if (!cancellationCandidate && !bootstrapOverdue && card.pipelineStageId === stageId && (paid || (card.monetaryValue === to.monetaryValue && card.name === to.name))) {
+      // `reopening` blocks the shortcut: a won/lost card can already sit in the
+      // right stage with the right value and still need its status put back.
+      if (!cancellationCandidate && !bootstrapOverdue && !reopening
+          && card.pipelineStageId === stageId
+          && (paid ? card.status === "won" : (card.monetaryValue === to.monetaryValue && card.name === to.name))) {
         report({ ...context, to, action: "unchanged", reason: "Already matches verified source" }); return;
       }
       const blocked = writesHalted ? "Earlier GHL write outcome unconfirmed; remaining writes halted" :
@@ -1037,10 +1067,11 @@ export async function syncGhlInvoicePipeline(opts: {
       };
       const current = await readOpportunity(card.id);
       const currentObservedAt = new Date().toISOString();
-      if (current.pipelineId !== refs.pipelineId || current.contactId !== contactId || current.status !== "open") {
+      if (current.pipelineId !== refs.pipelineId || current.contactId !== contactId
+          || current.status !== (closedButReopenable ? card.status : "open")) {
         report({ ...context, to, action: "hold", reason: "Card ownership/status changed before write" }); return;
       }
-      if (!cancellationCandidate && !bootstrapOverdue && current.pipelineStageId === stageId && (paid || (current.monetaryValue === to.monetaryValue && current.name === to.name))) {
+      if (!cancellationCandidate && !bootstrapOverdue && !reopening && current.pipelineStageId === stageId && (paid || (current.monetaryValue === to.monetaryValue && current.name === to.name))) {
         report({ ...context, to, action: "unchanged", reason: "Fresh GHL read already matches target; no repeated PUT" }); return;
       }
       if (current.pipelineStageId !== card.pipelineStageId || current.name !== card.name || current.monetaryValue !== card.monetaryValue) {
@@ -1156,9 +1187,10 @@ export async function syncGhlInvoicePipeline(opts: {
       await opts.writer!.assertPending(intentId);
       const preMutationStandingHold = standingHold();
       if (preMutationStandingHold) throw new Error(preMutationStandingHold);
-      await moveOpportunityToStage(card.id, stageId, plan.total, to.name);
+      await moveOpportunityToStage(card.id, stageId, plan.total, to.name, statusWrite);
       const accepted = await readOpportunity(card.id);
-      if (accepted.pipelineId !== current.pipelineId || accepted.contactId !== current.contactId || accepted.status !== "open"
+      if (accepted.pipelineId !== current.pipelineId || accepted.contactId !== current.contactId
+          || accepted.status !== expectedStatus
           || accepted.pipelineStageId !== stageId || accepted.monetaryValue !== plan.total
           || accepted.name !== (to.name ?? current.name)) throw new Error("Post-write card state not confirmed");
       await opts.writer!.confirm(intentId, await readPaidDateReadback(intent, accepted));

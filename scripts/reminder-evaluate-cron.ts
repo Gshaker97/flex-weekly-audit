@@ -9,7 +9,7 @@
 // "evaluate". Pass --ignore-window for a manual review outside 09:00.
 import { prisma } from "../lib/prisma";
 import { evaluateReminders, summarizeReminderEvaluation, withinArizonaWindow, phoenixParts,
-  type SendChannel } from "../lib/reminder-evaluation";
+  PAST_DUE_CATCH_UP_DAY, type SendChannel } from "../lib/reminder-evaluation";
 import { createReminderEvaluationReaders } from "../lib/reminder-evaluation-readers";
 import { planDailyReminders } from "../lib/reminder-daily-plan";
 import { recordReminderEvaluation } from "../lib/reminder-evaluation-store";
@@ -39,7 +39,11 @@ import { COLLECTIONS_SINCE } from "../lib/lateInvoices";
  * that acts must ask the policy, not infer intent from these channels.
  */
 const MILESTONE_CHANNELS = (step: { dayPastDue: number; audience: string }): readonly SendChannel[] =>
-  step.dayPastDue === 21 ? ["email", "sms"] : ["sms"];
+  // A past-due catch-up goes out on BOTH channels together — the same message as
+  // a text and as an email — by the account owner's decision of 2026-11-23.
+  step.dayPastDue === PAST_DUE_CATCH_UP_DAY ? ["email", "sms"]
+    : step.dayPastDue === 21 ? ["email", "sms"]
+    : ["sms"];
 
 /** Exactly two reviewed Jobber client IDs, comma separated. Anything else is unverified. */
 function configuredExclusions(): string[] | null {
@@ -92,6 +96,9 @@ async function main() {
     verifiedExclusions: configuredExclusions(),
     ignoreWindow,
     milestoneChannels: MILESTONE_CHANNELS,
+    // Chase every invoice that is owed and past due, not only the ones whose
+    // ladder milestone lands today. Decided by the account owner 2026-11-23.
+    pastDueCatchUp: true,
   });
 
   const runId = await recordReminderEvaluation(plan, startedAt);
