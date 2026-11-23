@@ -11,6 +11,7 @@ import { prisma } from "../lib/prisma";
 import { evaluateReminders, summarizeReminderEvaluation, withinArizonaWindow, phoenixParts,
   type SendChannel } from "../lib/reminder-evaluation";
 import { createReminderEvaluationReaders } from "../lib/reminder-evaluation-readers";
+import { planDailyReminders } from "../lib/reminder-daily-plan";
 import { recordReminderEvaluation } from "../lib/reminder-evaluation-store";
 import { COLLECTIONS_SINCE } from "../lib/lateInvoices";
 
@@ -97,6 +98,21 @@ async function main() {
   const summary = summarizeReminderEvaluation(plan);
   console.log(`[reminder-evaluate] run=${runId} ${JSON.stringify(summary)}`);
   for (const note of plan.notes) console.log(`[reminder-evaluate] note: ${note}`);
+
+  // What one day could actually deliver: at most one text and one email per
+  // customer. Reporting only - this collapses the per-invoice plan, it never
+  // promotes anything the evaluation held.
+  const daily = planDailyReminders({ rows: plan.rows, candidates, phoenixDate: plan.phoenixDate });
+  console.log(`[reminder-evaluate] today: ${daily.customersWithASend} customer(s) would be messaged` +
+    ` — ${daily.smsPicked} text(s), ${daily.emailPicked} email(s)` +
+    `, ${daily.droppedToCap} further message(s) dropped by the one-per-customer-per-channel cap`);
+  for (const customer of daily.customers) {
+    if (!customer.picks.length && !customer.drops.length) continue;
+    const picks = customer.picks.map(pick =>
+      `${pick.channel} #${pick.invoiceNumber ?? "?"} day${pick.milestoneDay ?? "?"}`).join(" + ") || "nothing";
+    const dropped = customer.drops.length ? ` (also owed ${customer.drops.map(drop => `${drop.channel} #${drop.invoiceNumber ?? "?"}`).join(", ")}, capped)` : "";
+    console.log(`[reminder-evaluate] would send: ${customer.clientName ?? customer.customerKey} → ${picks}${dropped}`);
+  }
 
   // Decision lines carry invoice number and hold reasons only: no phone, no
   // email, no message text.

@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { ORIGINAL_DAY10_SMS_BODY } from "../lib/notification-copy-policy";
-import { evaluateAutomaticReminders, PAULA_DAY10_ALLOWLIST, phoenixClock, singleSenderConfirmed, type ReminderSourceInvoice } from "../lib/invoice-reminder-automatic";
+import { customerSendWindowOpensAt, customerSendWindowState, evaluateAutomaticReminders, PAULA_DAY10_ALLOWLIST,
+  phoenixClock, singleSenderConfirmed, type ReminderSourceInvoice } from "../lib/invoice-reminder-automatic";
 import { inspectAutomaticReminderConfig } from "../lib/invoice-reminder-automatic-config";
 import { readJobberInvoicesById, runAutomaticReminderPass, type AutomaticReminderDependencies } from "../lib/invoice-reminder-automatic-cron";
 import { bootstrapDay10PilotRuntime } from "../lib/notification-day10-runtime";
@@ -56,24 +57,76 @@ test("lateness follows due date for net-7 and net-15, not the issue date", () =>
   assert.equal(next.sends.length, 0);
 });
 
-test("Paula Day 10 can be eligible only inside 09:05 through 09:14 Phoenix on 2026-11-13", () => {
-  for (const iso of ["2026-11-13T16:05:00.000Z", "2026-11-13T16:14:59.000Z"]) {
+test("the window is 09:00:00 through 09:14:59 Phoenix, and 09:15:00 is missed, not replayed", () => {
+  // 09:00 itself is now inside the window; it used to be five minutes early.
+  for (const iso of ["2026-11-13T16:00:00.000Z", "2026-11-13T16:05:00.000Z", "2026-11-13T16:14:59.000Z"]) {
     const result = at(iso, [paula()]);
     assert.equal(result.paula?.action, "eligible_send", iso);
     assert.equal(result.sends.length, 1);
     assert.equal(result.sends[0].invoiceNumber, "7171");
   }
-  const early = at("2026-11-13T16:04:59.000Z", [paula()]);
-  assert.equal(early.paula?.action, "wait_for_paula_window");
-  assert.equal(early.sends.length, 0);
-  assert.equal(early.paula?.waitUntil, "2026-11-13T16:05:00.000Z");
   const missed = at("2026-11-13T16:15:00.000Z", [paula()]);
   assert.equal(missed.paula?.action, "reconcile");
   assert.ok(missed.paula?.reasons.includes("missed_window_no_catch_up"));
   assert.equal(missed.sends.length, 0);
   const beforeNine = at("2026-11-13T15:59:59.000Z", [paula()]);
-  assert.notEqual(beforeNine.paula?.action, "eligible_send");
+  assert.equal(beforeNine.paula?.action, "reconcile");
+  assert.ok(beforeNine.paula?.reasons.includes("waiting_for_window"));
   assert.equal(beforeNine.sends.length, 0);
+  assert.equal(customerSendWindowState(9 * 3600 - 1), "before");
+  assert.equal(customerSendWindowState(9 * 3600), "open");
+  assert.equal(customerSendWindowState(9 * 3600 + 15 * 60 - 1), "open");
+  assert.equal(customerSendWindowState(9 * 3600 + 15 * 60), "after");
+  assert.equal(customerSendWindowOpensAt("2026-11-13"), "2026-11-13T16:00:00.000Z");
+  assert.equal(customerSendWindowOpensAt("not-a-date"), null);
+});
+
+test("the daily schedule is 16:00 UTC all year, because Arizona never moves its clocks", () => {
+  // The Railway cron for the 09:00 reminder run is "0 16 * * *". That is only
+  // correct because Phoenix is UTC-7 in January and in July alike. If anyone
+  // ever "fixes" this for daylight saving, this test fails first.
+  for (const date of ["2027-01-15", "2027-03-15", "2027-07-15", "2027-11-15"]) {
+    assert.equal(customerSendWindowOpensAt(date), `${date}T16:00:00.000Z`, date);
+    const phoenix = new Intl.DateTimeFormat("en-GB", {
+      timeZone: "America/Phoenix", hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+    }).format(new Date(`${date}T16:00:00.000Z`));
+    assert.equal(phoenix, "09:00", date);
+  }
+});
+
+test("the window is DAILY: the same invoice qualifies on its own day 10, whatever the date", () => {
+  // The old gate was pinned to 2026-11-13 and could never open again. Each of
+  // these is a different invoice with a different due date, and each is
+  // eligible on its own day 10 - months apart, including across a year end.
+  for (const [issued, dueDate, dayTen] of [
+    ["2026-10-27", "2026-11-03", "2026-11-13"],
+    ["2026-12-13", "2026-12-20", "2026-12-30"],
+    ["2026-12-21", "2026-12-28", "2027-01-07"],
+    ["2027-05-25", "2027-06-01", "2027-06-11"]] as const) {
+    const invoice = paula({ issuedDate: issued, dueDate });
+    const result = evaluateAutomaticReminders({
+      now: new Date(`${dayTen}T16:05:00.000Z`), invoices: [invoice], ...ready,
+      // The token must itself be refreshed after 09:00 on the day in question,
+      // so it moves with the date exactly as the real one would.
+      token: { updatedAt: `${dayTen}T16:01:00.000Z`, expiresAt: `${dayTen}T17:01:00.000Z` },
+      config: { ...ready.config, scheduledOn: dayTen },
+    });
+    assert.equal(result.paula?.daysPastDue, 10, dayTen);
+    assert.equal(result.paula?.action, "eligible_send", dayTen);
+    assert.equal(result.sends.length, 1, dayTen);
+  }
+  // And the frozen date is gone: the allowlist carries identity only.
+  assert.equal("scheduledOn" in PAULA_DAY10_ALLOWLIST, false);
+  assert.equal("waitUntil" in PAULA_DAY10_ALLOWLIST, false);
+});
+
+test("a config reviewed for another day cannot send today", () => {
+  const stale = at("2026-11-13T16:05:00.000Z", [paula()], {
+    config: { ...ready.config, scheduledOn: "2026-11-12" },
+  });
+  assert.equal(stale.sends.length, 0);
+  assert.equal(stale.paula?.action, "hold");
+  assert.ok(stale.paula?.reasons.includes("allowlist_schedule_mismatch"));
 });
 
 test("no send outside the 09:00-09:15 Phoenix window, and later Paula milestones stay gated off", () => {
@@ -124,7 +177,7 @@ test("an empty history and attempt mode do not confirm that GoHighLevel workflow
   assert.equal(unconfirmed.paula?.action, "hold");
   assert.ok(unconfirmed.paula?.reasons.includes("duplicate_sender_unconfirmed"));
   const early = at("2026-11-13T16:04:00.000Z", [paula()], { singleSenderConfirmed: false });
-  assert.notEqual(early.paula?.action, "wait_for_paula_window");
+  assert.equal(early.paula?.action, "hold");
   assert.equal(early.sends.length, 0);
   assert.equal(singleSenderConfirmed(undefined, undefined), false);
   assert.equal(singleSenderConfirmed("true", "synthetic-review"), false);
@@ -178,45 +231,47 @@ test("the cron pass sends only the single fresh Paula decision and never replays
   assert.equal(sent.sends, 1);
   assert.deepEqual(sends, ["paula"]);
   assert.equal(deps.loadConfigCalls, 1);
-  now = Date.parse("2026-11-13T16:04:00.000Z");
-  const waited: number[] = [];
-  let reads = 0;
-  const waiting = await runAutomaticReminderPass(fakeDeps({
-    now: () => new Date(now),
+  // The pass used to sleep until 09:05 and re-read. With a daily 09:00 window
+  // the run is scheduled for the window itself, so a pass before it simply
+  // reports and ends - it never sleeps, and never sends on a later tick.
+  const beforeDeps = fakeDeps({
+    now: () => new Date("2026-11-13T15:59:00.000Z"),
     mode: () => "paula-day10-attempt",
     singleSender: true,
     invoices,
-    sleep: async ms => { waited.push(ms); now += ms; },
-    send: async () => { sends.push("after-wait"); return { state: "accepted", attempted: true }; },
-    onRead: () => { reads += 1; },
-  }), { entrypoint: "standalone_cron" });
-  assert.equal(waiting.state, "sent");
-  assert.equal(waited.length, 1);
-  assert.ok(waited[0] <= 5 * 60 * 1000);
-  assert.ok(reads >= 2);
-  let paidNow = Date.parse("2026-11-13T16:04:00.000Z");
-  const paidAfterWait = await runAutomaticReminderPass(fakeDeps({
-    now: () => new Date(paidNow),
+    sleep: async () => { throw new Error("the pass must not sleep"); },
+    send: async () => { sends.push("before-window"); return { state: "accepted", attempted: true }; },
+  });
+  const before = await runAutomaticReminderPass(beforeDeps, { entrypoint: "standalone_cron" });
+  assert.equal(before.state, "evaluated");
+  assert.equal(before.sends, 0);
+  assert.equal(beforeDeps.loadConfigCalls, 0, "the reviewed config is not even read outside the window");
+
+  const afterDeps = fakeDeps({
+    now: () => new Date("2026-11-13T16:15:00.000Z"),
     mode: () => "paula-day10-attempt",
     singleSender: true,
     invoices,
-    sleep: async () => { paidNow = Date.parse("2026-11-13T16:05:00.000Z"); },
-    afterSleepInvoices: [paula({ invoiceStatus: "paid", balanceMinor: 0 })],
+    sleep: async () => { throw new Error("the pass must not sleep"); },
+    send: async () => { sends.push("after-window"); return { state: "accepted", attempted: true }; },
+  });
+  const after = await runAutomaticReminderPass(afterDeps, { entrypoint: "standalone_cron" });
+  assert.equal(after.sends, 0);
+  assert.ok(after.code === "missed_window_no_catch_up" || after.state === "evaluated");
+
+  // A paid invoice inside the window is suppressed, not sent.
+  const paidDeps = fakeDeps({
+    now: () => new Date("2026-11-13T16:05:00.000Z"),
+    mode: () => "paula-day10-attempt",
+    singleSender: true,
+    invoices: [paula({ invoiceStatus: "paid", balanceMinor: 0 })],
     send: async () => { sends.push("paid"); return { state: "accepted", attempted: true }; },
-  }), { entrypoint: "standalone_cron" });
-  assert.notEqual(paidAfterWait.state, "sent");
-  assert.equal(paidAfterWait.sends, 0);
-  let lateNow = Date.parse("2026-11-13T16:04:00.000Z");
-  const late = await runAutomaticReminderPass(fakeDeps({
-    now: () => new Date(lateNow),
-    mode: () => "paula-day10-attempt",
-    singleSender: true,
-    invoices,
-    sleep: async () => { lateNow = Date.parse("2026-11-13T16:15:00.000Z"); },
-    send: async () => { sends.push("late"); return { state: "accepted", attempted: true }; },
-  }), { entrypoint: "standalone_cron" });
-  assert.equal(late.sends, 0);
-  assert.ok(!sends.includes("paid") && !sends.includes("late"));
+  });
+  const paid = await runAutomaticReminderPass(paidDeps, { entrypoint: "standalone_cron" });
+  assert.notEqual(paid.state, "sent");
+  assert.equal(paid.sends, 0);
+
+  assert.deepEqual(sends, ["paula"], "exactly one send across every pass above");
 });
 
 test("evaluate mode, a non-cron entrypoint, and an unknown transport do not send or retry", async () => {
@@ -259,10 +314,10 @@ test("evaluate mode, a non-cron entrypoint, and an unknown transport do not send
 test("config inspection names missing operational values and does not return them", () => {
   const phone = "+12025550123";
   const sender = "+12025550999";
-  const inspected = inspectAutomaticReminderConfig(undefined, undefined, undefined);
+  const inspected = inspectAutomaticReminderConfig(undefined, undefined, undefined, "2026-11-13");
   assert.deepEqual(inspected.blockers, ["required_config_missing"]);
   const partial = JSON.stringify({ source: { scope: { contactId: "someone-else" } }, destination: phone, sender: { number: sender } });
-  const gaps = inspectAutomaticReminderConfig(partial, createHash("sha256").update(partial).digest("hex"), "review");
+  const gaps = inspectAutomaticReminderConfig(partial, createHash("sha256").update(partial).digest("hex"), "review", "2026-11-13");
   for (const name of ["sender_number_unconfigured", "native_footer_unconfigured", "jobber_account_id_unconfigured", "quarantine_identities_unconfigured", "allowlist_contact_mismatch", "unapproved_day10_body"]) {
     assert.equal(gaps.blockers.includes(name) || gaps.blockers.includes("required_config_missing"), true, name);
   }
@@ -270,7 +325,7 @@ test("config inspection names missing operational values and does not return the
   assert.equal(JSON.stringify(gaps).includes(sender), false);
   const complete = paulaConfig(phone, sender);
   const raw = JSON.stringify(complete);
-  const readyConfig = inspectAutomaticReminderConfig(raw, createHash("sha256").update(raw).digest("hex"), "synthetic-operator-review");
+  const readyConfig = inspectAutomaticReminderConfig(raw, createHash("sha256").update(raw).digest("hex"), "synthetic-operator-review", "2026-11-13");
   assert.equal(readyConfig.blockers.includes("unapproved_day10_body"), false);
   assert.equal(readyConfig.blockers.includes("allowlist_contact_mismatch"), false);
   assert.equal(readyConfig.binding.contactId, CONTACT);
@@ -278,7 +333,7 @@ test("config inspection names missing operational values and does not return the
   assert.equal(JSON.stringify(readyConfig).includes(sender), false);
   assert.equal(JSON.stringify(readyConfig).includes(FORBIDDEN), false);
   const poisoned = raw.replace("synthetic-operator-review", FORBIDDEN);
-  const blocked = inspectAutomaticReminderConfig(poisoned, createHash("sha256").update(poisoned).digest("hex"), "synthetic-operator-review");
+  const blocked = inspectAutomaticReminderConfig(poisoned, createHash("sha256").update(poisoned).digest("hex"), "synthetic-operator-review", "2026-11-13");
   assert.ok(blocked.blockers.includes("forbidden_opportunity_present"));
 });
 
