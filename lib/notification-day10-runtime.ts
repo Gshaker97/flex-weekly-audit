@@ -22,11 +22,15 @@ export async function bootstrapDay10PilotRuntime(scope: Readonly<{
   /** Which deployed service is bootstrapping. Omitted means the original web pilot
    *  service, so every existing caller keeps the exact behaviour it had. */
   service?: "pilot" | "recurring-cron";
+  /** The cron service is accepted only for the one named Paula Day 10 rollout. */
+  rollout?: "paula-day10-2026-11-13";
 }>): Promise<Day10PilotRuntime> {
-  if (!["read-only", "one-attempt"].includes(scope.action) || !scope.accountId || !scope.locationId)
-    throw new Error("explicit_exact_runtime_scope_required");
   const service = scope.service ?? "pilot";
-  if (!["pilot", "recurring-cron"].includes(service)) throw new Error("explicit_exact_runtime_scope_required");
+  if (!["read-only", "one-attempt"].includes(scope.action) || !scope.accountId || !scope.locationId ||
+      (service !== "pilot" && service !== "recurring-cron"))
+    throw new Error("explicit_exact_runtime_scope_required");
+  if (service === "recurring-cron" && scope.rollout !== "paula-day10-2026-11-13")
+    throw new Error("cron_runtime_requires_paula_day10_allowlist");
   verifyDay10DeploymentHolds(process.env, scope.locationId, service);
   const original = Object.fromEntries(["RAILWAY_SERVICE_ID", "RAILWAY_ENVIRONMENT_ID", "RAILWAY_PROJECT_ID",
     "RAILWAY_DEPLOYMENT_ID", "DATABASE_URL", "GHL_LOCATION_ID", "GHL_API_KEY"].map(key => [key, process.env[key]]));
