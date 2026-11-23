@@ -19,7 +19,8 @@ function text(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= 256 && value.trim() === value;
 }
 
-export function inspectAutomaticReminderConfig(raw: string | undefined, sha256: string | undefined, reviewRef: string | undefined): AutomaticReminderConfigInspection {
+export function inspectAutomaticReminderConfig(raw: string | undefined, sha256: string | undefined, reviewRef: string | undefined,
+  today: string): AutomaticReminderConfigInspection {
   const blockers: string[] = [];
   if (typeof raw !== "string" || !raw || Buffer.byteLength(raw, "utf8") > 32_768 || typeof sha256 !== "string" ||
       !/^[a-f0-9]{64}$/.test(sha256) || typeof reviewRef !== "string" || !reviewRef.trim()) {
@@ -44,7 +45,8 @@ export function inspectAutomaticReminderConfig(raw: string | undefined, sha256: 
   if (!text(parsed.destination)) blockers.push("destination_unconfigured");
   if (parsed.template?.body !== ORIGINAL_DAY10_SMS_BODY) blockers.push("unapproved_day10_body");
   if (contactId !== PAULA_DAY10_ALLOWLIST.contactId) blockers.push("allowlist_contact_mismatch");
-  if (scheduledOn !== PAULA_DAY10_ALLOWLIST.scheduledOn || parsed.scope?.dayPastDue !== 10 ||
+  // Today, not a frozen date: a config reviewed for one day cannot fire later.
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(today) || scheduledOn !== today || parsed.scope?.dayPastDue !== 10 ||
       parsed.scope?.audience !== "homeowner" || parsed.scope?.channel !== "sms") blockers.push("scope_not_day10_sms");
   const readiness = inspectDay10PilotReadiness(raw, { configSha256: sha256, reviewRef, action: "one-attempt" });
   if (readiness.state !== "reviewed_configuration") blockers.push("required_config_missing");

@@ -1,10 +1,27 @@
 /** Automatic reminder decisions. Pure: no env, network, database, or send.
  * Already-due invoices are reconciled on the official clock. Elapsed milestones
  * are skipped. Nothing here texts a customer who is not the explicit allowlist.
- * The only allowlisted candidate is Paula Rose invoice 7171, Day 10, on
- * 2026-11-13 between 09:05 and 09:14 America/Phoenix, and even that stays held
- * until a separate single-sender confirmation says GoHighLevel workflows will
- * not also text. An empty message history is not that confirmation.
+ * The only allowlisted candidate is invoice 7171, Day 10, homeowner, and even
+ * that stays held until a separate single-sender confirmation says GoHighLevel
+ * workflows will not also text. An empty message history is not that
+ * confirmation.
+ *
+ * THE WINDOW IS DAILY, NOT A DATE. Until 2026-11-23 the send window was pinned
+ * to the single calendar date 2026-11-13, 09:05-09:14 Phoenix. That date has
+ * passed, so the path could never open again and the module quietly became
+ * dead code. The window is now CUSTOMER_SEND_WINDOW - 09:00:00 inclusive to
+ * 09:15:00 exclusive America/Phoenix, every day - which is the same window the
+ * ladder evaluator uses, so the repo has one definition of "the 9 AM window"
+ * rather than two that can drift.
+ *
+ * Removing the date did NOT remove a guard. What now decides a send is:
+ *   - the invoice's OWN day-10 milestone falls today, on the official clock;
+ *   - today's clock is inside the 09:00-09:15 Phoenix window;
+ *   - the mode is "paula-day10-attempt" AND the single-sender confirmation is
+ *     present (two separate environment switches, both unset in production);
+ *   - a reviewed config whose contact, invoice and client match the allowlist
+ *     AND whose scheduledOn is TODAY, so a config reviewed for one day cannot
+ *     fire on another. Going live therefore still takes a same-day human act.
  */
 import { addInvoiceCalendarDays, invoiceCalendarDate, invoiceReminderClock, invoiceReminderMilestones,
   type InvoiceReminderCategory } from "./invoice-reminder-clock";
@@ -25,12 +42,25 @@ export const PAULA_DAY10_ALLOWLIST = Object.freeze({
   category: "irrigation" as const,
   dayPastDue: 10 as const,
   audience: "homeowner" as const,
-  scheduledOn: "2026-11-13",
-  /** 09:05:00 inclusive through 09:14:59; 09:15:00 is missed and is not replayed. */
-  windowStartSeconds: 9 * 3600 + 5 * 60,
-  windowEndExclusiveSeconds: 9 * 3600 + 15 * 60,
-  waitUntil: "2026-11-13T16:05:00.000Z",
 });
+
+/** Where today's clock sits against the one daily customer window. */
+export type SendWindowState = "before" | "open" | "after";
+
+export function customerSendWindowState(seconds: number): SendWindowState {
+  if (!Number.isFinite(seconds)) return "after";
+  if (seconds < CUSTOMER_SEND_WINDOW.startSeconds) return "before";
+  return seconds < CUSTOMER_SEND_WINDOW.endExclusiveSeconds ? "open" : "after";
+}
+
+/** The instant today's window opens, as UTC. Arizona never observes daylight
+ *  saving, so Phoenix is UTC-7 all year and 09:00 is always 16:00Z. */
+export function customerSendWindowOpensAt(phoenixDate: string): string | null {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(phoenixDate)) return null;
+  const hour = String(Math.floor(CUSTOMER_SEND_WINDOW.startSeconds / 3600) + 7).padStart(2, "0");
+  const minute = String(Math.floor((CUSTOMER_SEND_WINDOW.startSeconds % 3600) / 60)).padStart(2, "0");
+  return `${phoenixDate}T${hour}:${minute}:00.000Z`;
+}
 
 /** Not a default, and not inferred from a quiet ledger. Bare true/yes/1 do not match. */
 export const APP_ONLY_SENDER_CONFIRMATION = "app-only-ghl-workflows-confirmed-idle";
@@ -216,8 +246,7 @@ function classify(invoice: ReminderSourceInvoice, ctx: {
 
   const steps = invoiceReminderMilestones(paulaNumber ? "irrigation" : "maintenance", invoice.issuedDate, invoice.dueDate, ctx.now) ?? [];
   const todaySteps = steps.filter(step => step.scheduledOn === ctx.today);
-  const window = ctx.seconds < CUSTOMER_SEND_WINDOW.startSeconds ? "before"
-    : ctx.seconds < CUSTOMER_SEND_WINDOW.endExclusiveSeconds ? "open" : "after";
+  const window = customerSendWindowState(ctx.seconds);
   if (todaySteps.length && window === "before") reasons.push("waiting_for_window");
   if (todaySteps.length && window === "after") reasons.push("missed_window_no_catch_up");
   if (todaySteps.length && window === "open") reasons.push("in_customer_send_window");
@@ -232,19 +261,21 @@ function classify(invoice: ReminderSourceInvoice, ctx: {
   const day10 = steps.find(step => step.dayPastDue === PAULA_DAY10_ALLOWLIST.dayPastDue && step.audience === "homeowner");
   const laterToday = steps.filter(step => step.scheduledOn === ctx.today && step.dayPastDue !== PAULA_DAY10_ALLOWLIST.dayPastDue);
   if (laterToday.length) reasons.push("milestone_gate_off");
-  if (!day10 || day10.scheduledOn !== PAULA_DAY10_ALLOWLIST.scheduledOn || day10.timing !== "today" || official.daysPastDue !== 10) {
-    if (day10 && day10.timing === "today" && day10.scheduledOn !== PAULA_DAY10_ALLOWLIST.scheduledOn) reasons.push("paula_schedule_mismatch");
+  if (!day10 || day10.scheduledOn !== ctx.today || day10.timing !== "today" || official.daysPastDue !== 10) {
+    if (day10 && day10.timing === "today" && day10.scheduledOn !== ctx.today) reasons.push("paula_schedule_mismatch");
     const action = reasons.includes("milestone_gate_off") || reasons.includes("paula_schedule_mismatch") ? "hold" : "reconcile";
     return decision(invoice, official.daysPastDue, action, reasons);
   }
-  const scheduled = addInvoiceCalendarDays(official.dueOn, 10);
-  if (scheduled !== PAULA_DAY10_ALLOWLIST.scheduledOn || ctx.today !== PAULA_DAY10_ALLOWLIST.scheduledOn) {
+  // The milestone is derived from the invoice's own due date and must land on
+  // today's Phoenix date. No frozen date, and no catch-up for a day gone by.
+  const scheduled = addInvoiceCalendarDays(official.dueOn, PAULA_DAY10_ALLOWLIST.dayPastDue);
+  if (scheduled !== ctx.today) {
     return decision(invoice, official.daysPastDue, "hold", [...reasons, "paula_schedule_mismatch"]);
   }
-  if (window === "after" || ctx.seconds >= PAULA_DAY10_ALLOWLIST.windowEndExclusiveSeconds) {
+  if (window === "after") {
     return decision(invoice, official.daysPastDue, "reconcile", [...reasons, "missed_window_no_catch_up"]);
   }
-  if (ctx.seconds < CUSTOMER_SEND_WINDOW.startSeconds) {
+  if (window === "before") {
     return decision(invoice, official.daysPastDue, "reconcile", [...reasons, "waiting_for_window"]);
   }
 
@@ -254,12 +285,10 @@ function classify(invoice: ReminderSourceInvoice, ctx: {
   if (ctx.config.contactId !== PAULA_DAY10_ALLOWLIST.contactId) sendBlockers.push("allowlist_contact_mismatch");
   if (ctx.config.invoiceId !== invoice.jobberInvoiceId) sendBlockers.push("allowlist_invoice_mismatch");
   if (ctx.config.clientId !== invoice.jobberClientId) sendBlockers.push("allowlist_client_mismatch");
-  if (ctx.config.scheduledOn !== PAULA_DAY10_ALLOWLIST.scheduledOn) sendBlockers.push("allowlist_schedule_mismatch");
+  // A config reviewed for one day cannot fire on another.
+  if (ctx.config.scheduledOn !== ctx.today) sendBlockers.push("allowlist_schedule_mismatch");
   if (ctx.prior.has(invoice.jobberInvoiceId)) sendBlockers.push("duplicate_no_second_send");
   if (ctx.tokenBlocker) sendBlockers.push(ctx.tokenBlocker);
   if (sendBlockers.length) return decision(invoice, official.daysPastDue, "hold", [...reasons, ...sendBlockers]);
-  if (ctx.seconds < PAULA_DAY10_ALLOWLIST.windowStartSeconds) {
-    return decision(invoice, official.daysPastDue, "wait_for_paula_window", [...reasons, "waiting_for_paula_window"], PAULA_DAY10_ALLOWLIST.waitUntil);
-  }
   return decision(invoice, official.daysPastDue, "eligible_send", [...reasons, "paula_day10_window"]);
 }

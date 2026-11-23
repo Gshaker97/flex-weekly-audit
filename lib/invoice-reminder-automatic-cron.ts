@@ -3,7 +3,8 @@
  * Importing this module does not read env, Jobber, or the database.
  */
 import { log } from "./log";
-import { evaluateAutomaticReminders, normalizeAutomaticReminderMode, PAULA_DAY10_ALLOWLIST, phoenixClock, singleSenderConfirmed,
+import { customerSendWindowState, evaluateAutomaticReminders, normalizeAutomaticReminderMode, PAULA_DAY10_ALLOWLIST,
+  phoenixClock, singleSenderConfirmed,
   type AutomaticReminderEvaluation, type AutomaticReminderToken, type ReminderSourceInvoice } from "./invoice-reminder-automatic";
 import { inspectAutomaticReminderConfig } from "./invoice-reminder-automatic-config";
 
@@ -11,7 +12,6 @@ const JOBBER_API_URL = "https://api.getjobber.com/api/graphql";
 const JOBBER_API_VERSION = "2025-04-16";
 const BATCH = 25;
 const MAX_INVOICES = 1000;
-const MAX_WAIT_MS = 5 * 60 * 1000;
 
 export type AutomaticReminderSummary = Readonly<{
   state: "disabled" | "evaluated" | "held" | "sent" | "unknown";
@@ -37,7 +37,8 @@ export type AutomaticReminderDependencies = Readonly<{
   readInvoices(accessToken: string, ids: readonly string[]): Promise<readonly ReminderSourceInvoice[]>;
   priorAttempts(invoiceIds: readonly string[]): Promise<readonly string[]>;
   loadConfig(): { raw: string | undefined; sha256: string | undefined; reviewRef: string | undefined };
-  sleep(ms: number): Promise<void>;
+  /** Kept so existing callers compile; the daily 09:00 window needs no sleep. */
+  sleep?(ms: number): Promise<void>;
   sendPaulaDay10(raw: string, sha256: string, reviewRef: string): Promise<Readonly<{ state: string; attempted: boolean }>>;
 }>;
 
@@ -79,39 +80,19 @@ export async function runAutomaticReminderPass(deps: AutomaticReminderDependenci
     const prior = await deps.priorAttempts(invoices.map(item => item.jobberInvoiceId));
     const clockNow = phoenixClock(now);
     // An empty ledger is not clearance: a workflow wait may still text later the same day.
-    const paulaWindow = senderConfirmed && mode.mode === "paula-day10-attempt" && clockNow?.today === PAULA_DAY10_ALLOWLIST.scheduledOn &&
-      clockNow.seconds >= 9 * 3600 && clockNow.seconds < 9 * 3600 + 15 * 60;
+    // Read the reviewed config only inside today's window, so a pass at any
+    // other hour cannot even load it.
+    const paulaWindow = senderConfirmed && mode.mode === "paula-day10-attempt" &&
+      !!clockNow && customerSendWindowState(clockNow.seconds) === "open";
     const loaded = paulaWindow ? deps.loadConfig() : { raw: undefined, sha256: undefined, reviewRef: undefined };
     const inspected = paulaWindow
-      ? inspectAutomaticReminderConfig(loaded.raw, loaded.sha256, loaded.reviewRef)
+      ? inspectAutomaticReminderConfig(loaded.raw, loaded.sha256, loaded.reviewRef, clockNow!.today)
       : { blockers: [] as const, binding: { contactId: null, invoiceId: null, clientId: null, scheduledOn: null } };
-    let evaluation = evaluateAutomaticReminders({
+    const evaluation = evaluateAutomaticReminders({
       now, invoices, mode: mode.mode, token: tokenValue(token, now), priorAttemptInvoiceIds: prior,
       config: inspected.binding, configBlockers: inspected.blockers.filter(item => item !== "send_mode_off"),
       singleSenderConfirmed: senderConfirmed,
     });
-    const waiting = evaluation.paula?.action === "wait_for_paula_window" ? evaluation.paula : null;
-    if (waiting?.waitUntil === PAULA_DAY10_ALLOWLIST.waitUntil) {
-      const delay = Date.parse(waiting.waitUntil) - deps.now().getTime();
-      if (!Number.isFinite(delay) || delay < 0 || delay > MAX_WAIT_MS) return summary("held", "wait_exceeds_bound", evaluation);
-      await deps.sleep(delay);
-      const refreshed = await deps.readToken();
-      const after = deps.now();
-      if (!usable(refreshed, after)) return summary("held", "token_unavailable", evaluation);
-      const fresh = await deps.readInvoices(refreshed!.accessToken, [waiting.jobberInvoiceId]);
-      const freshPrior = await deps.priorAttempts(fresh.map(item => item.jobberInvoiceId));
-      const again = evaluateAutomaticReminders({
-        now: after, invoices: fresh, mode: mode.mode, token: tokenValue(refreshed, after), priorAttemptInvoiceIds: freshPrior,
-        config: inspected.binding, configBlockers: inspected.blockers.filter(item => item !== "send_mode_off"),
-        singleSenderConfirmed: senderConfirmed,
-      });
-      const others = evaluation.invoices.filter(item => item.jobberInvoiceId !== waiting.jobberInvoiceId);
-      evaluation = {
-        invoices: Object.freeze([...others, ...again.invoices]),
-        sends: again.sends,
-        paula: again.paula,
-      };
-    }
     const codeBase = mode.unrecognized ? "unrecognized_mode_no_send"
       : evaluation.paula?.reasons.includes("duplicate_sender_unconfirmed") ? "duplicate_sender_unconfirmed"
       : evaluation.paula?.action ?? "no_paula_invoice";
@@ -231,7 +212,6 @@ export function runConfiguredAutomaticReminders(context: Readonly<{ entrypoint: 
       sha256: process.env.FLEXX_AUTOMATIC_REMINDER_CONFIG_SHA256,
       reviewRef: process.env.FLEXX_AUTOMATIC_REMINDER_REVIEW_REF,
     }),
-    sleep: ms => new Promise(resolve => { setTimeout(resolve, ms); }),
     sendPaulaDay10: async (raw, sha256, reviewRef) => {
       if (!singleSenderConfirmed(process.env.FLEXX_REMINDER_SINGLE_SENDER, process.env.FLEXX_REMINDER_SINGLE_SENDER_REVIEW_REF)) {
         return { state: "held", attempted: false };
