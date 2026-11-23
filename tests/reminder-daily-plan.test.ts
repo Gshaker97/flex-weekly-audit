@@ -11,6 +11,8 @@ const row = (patch: Partial<ReminderEvaluationRow> & { jobberInvoiceId: string }
   jobberInvoiceId: patch.jobberInvoiceId,
   invoiceNumber: patch.invoiceNumber ?? null,
   clientName: patch.clientName ?? null,
+  unpaidInvoicesForOwner: patch.unpaidInvoicesForOwner ?? null,
+  pastDueCatchUp: patch.pastDueCatchUp ?? false,
   decision: patch.decision ?? "eligible",
   holds: patch.holds ?? [],
   category: patch.category ?? "maintenance",

@@ -431,16 +431,29 @@ export async function readOpportunity(opportunityId: string): Promise<GhlOpportu
   return data.opportunity;
 }
 
+/** The only two statuses this code may ever write. "lost" is never set here. */
+export type GhlOpportunityStatusWrite = "open" | "won";
+
 export async function moveOpportunityToStage(
   opportunityId: string,
   pipelineStageId: string,
   monetaryValue?: number,
-  name?: string
+  name?: string,
+  status?: GhlOpportunityStatusWrite
 ): Promise<void> {
-  // Preserve status. A stale snapshot must never automatically reopen a card.
+  // Status is PRESERVED unless the caller names one. A stale snapshot must
+  // never automatically reopen or close a card; only a caller holding fresh
+  // Jobber evidence may pass `status`, and the two cases that do are:
+  //   - "won"  : every invoice behind the card is paid, so the card is closed;
+  //   - "open" : the card is closed but Jobber still shows a balance, so it is
+  //              reopened to be chased.
   const body: Record<string, any> = { pipelineStageId };
   if (monetaryValue != null) body.monetaryValue = monetaryValue;
   if (name != null) body.name = name;
+  if (status != null) {
+    if (status !== "open" && status !== "won") throw new Error("Unsupported opportunity status write");
+    body.status = status;
+  }
   await ghlFetch(`/opportunities/${opportunityId}`, {
     method: "PUT",
     body: JSON.stringify(body),

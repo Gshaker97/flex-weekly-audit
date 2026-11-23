@@ -124,16 +124,18 @@ test("the waiver reaches no other milestone", async () => {
   assert.equal(plan.rows[0].audience, "internal");
 });
 
-test("DEPENDENCY 1: a maintenance invoice can never clear the service-type rule", () => {
+test("DEPENDENCY 1: a maintenance invoice is confirmed by Jobber alone", () => {
   // GoHighLevel is only permitted to positively assert irrigation, so "agreed"
-  // is unreachable for maintenance no matter what either system says.
+  // is unreachable for maintenance no matter what either system says. That used
+  // to mean maintenance could never be confirmed at all; since 2026-11-23 the
+  // rule is Jobber-decides, so "jobber_only" is confirmation.
   for (const ghlContactTags of [[], ["Maintenance"], ["Monthly Maintenance"], null]) {
     const resolution = resolveServiceType({
       jobberClientTags: ["Maintenance"], jobberLineItemNames: ["Monthly maintenance"], ghlContactTags,
     });
     assert.equal(resolution.category, "maintenance");
-    assert.equal(resolution.source, "jobber_only");
-    assert.equal(serviceTypeIsConfirmed(resolution), false, JSON.stringify(ghlContactTags));
+    assert.equal(resolution.source, "jobber_only", "GoHighLevel still cannot corroborate maintenance");
+    assert.equal(serviceTypeIsConfirmed(resolution), true, JSON.stringify(ghlContactTags));
   }
   // Only irrigation, tagged on both sides, is ever confirmed.
   assert.equal(serviceTypeIsConfirmed(resolveServiceType({
@@ -314,7 +316,7 @@ test("email path: only day 15 can ever come due, and there is no catch-up", asyn
   assert.notEqual(atDay21.rows[0].milestoneDay, 21);
 });
 
-test("the NON-email path still requires the card and the service type", async () => {
+test("the NON-email path still requires the card, and Jobber now names the type", async () => {
   const plan = await run({ feeClaimFreeDay15: true }, { cardsForContact: async () => [] });
   assert.ok(plan.rows[0].holds.includes("no_invoice_pipeline_card"));
   const maintenance = await evaluateReminders({ candidates: [CANDIDATE],
@@ -325,6 +327,9 @@ test("the NON-email path still requires the card and the service type", async ()
         phone: "+16025550100", email: "a@example.com" }] } as any,
     now: AT_DAY_15, verifiedExclusions: ["cli-x", "cli-y"], ignoreWindow: true,
     milestoneChannels: () => ["email"], feeClaimFreeDay15: true });
-  assert.ok(maintenance.rows[0].holds.some(h => h.startsWith("service_type_jobber_only")),
+  // Maintenance named by Jobber alone is confirmation since 2026-11-23, so the
+  // service type no longer holds this row. The card requirement is unchanged.
+  assert.ok(!maintenance.rows[0].holds.some(h => h.startsWith("service_type_")),
     JSON.stringify(maintenance.rows[0].holds));
+  assert.equal(maintenance.rows[0].categorySource, "jobber_only");
 });

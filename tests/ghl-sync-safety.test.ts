@@ -36,6 +36,7 @@ function setup() {
   delete process.env.GHL_RECURRING_DUE_DATE_ENABLED;
   delete process.env.GHL_CYCLE_OWNERSHIP_ENABLED;
   delete process.env.GHL_STANDING_IDENTITY_ENABLED;
+  delete process.env.GHL_CARD_STATUS_WRITES_ENABLED;
   process.env.CLEANUP_INVALID_OPPS = "true";
   customers = [{ ...owner }]; contacts = [{ ...contact }]; cards = [{ ...card }];
   invoices = [{ ...cached, customer: customers[0] }]; source = [structuredClone(paid)];
@@ -66,7 +67,15 @@ function setup() {
     const target = cards.find(c => c.id === url.pathname.split("/").pop());
     if (target && init.method === "PUT") {
       const body = JSON.parse(init.body);
-      assert.equal(body.status, undefined, "never force open");
+      // Status is only ever written when the card-status gate is explicitly on,
+      // and then only as "won" (paid, so closed) or "open" (still owed, so
+      // reopened). "lost" is never written by this sync.
+      if (process.env.GHL_CARD_STATUS_WRITES_ENABLED === "true") {
+        assert.ok(body.status === undefined || body.status === "won" || body.status === "open",
+          `unexpected status write: ${body.status}`);
+      } else {
+        assert.equal(body.status, undefined, "never force open with the gate off");
+      }
       writes.push({ method: "PUT", id: target.id, body });
       if (putFailure === "before") throw new Error("synthetic network failure before acceptance");
       Object.assign(target, body);
@@ -701,4 +710,89 @@ test("actual cancellation removes paid A with two unpaid successors while holdin
   assert.equal(writes.length,0);assert.deepEqual(cards[0],before);
   assert.equal((await writerState.writer.readCycleHistory()).at(-1)!.intent.workflowRemoval!.purpose,"paid_cycle_cancellation");
  }finally{delete process.env.GHL_DIRECT_WORKFLOW_REMOVAL_ENABLED;}
+});
+
+
+// --- Paid cards get closed; closed cards that still owe get reopened --------
+// Both behaviours are gated on GHL_CARD_STATUS_WRITES_ENABLED, decided by the
+// account owner 2026-11-23. With the gate off the sync is byte-for-byte what it
+// was: it moves the stage and never touches status.
+
+test("with the gate off, a Paid move still leaves the card open", async () => {
+  setup(); cards[0].pipelineStageId = "sent";
+  assert.equal(await run("sync"), 1);
+  assert.deepEqual(writes.map(w => w.body), [{ pipelineStageId: "paid", monetaryValue: 0 }]);
+  assert.equal(cards[0].status, "open", "status untouched");
+});
+
+test("with the gate on, a Paid move also closes the card as won", async () => {
+  setup(); process.env.GHL_CARD_STATUS_WRITES_ENABLED = "true";
+  cards[0].pipelineStageId = "sent";
+  assert.equal(await run("sync"), 1);
+  assert.deepEqual(writes.map(w => w.body), [{ pipelineStageId: "paid", monetaryValue: 0, status: "won" }]);
+  assert.equal(cards[0].status, "won", "the card is closed, not just moved");
+});
+
+test("with the gate on, a closed card that still owes money is no longer held shut", async () => {
+  // The gate's job is to stop refusing the card. Where it goes next is the
+  // ordinary stage machinery, with its own older gates - so this asserts that
+  // the reopening refusal is gone and the run has moved on to those.
+  const owing = { ...paid, invoiceStatus: "awaiting_payment", amounts: { total: 100, invoiceBalance: 100 } };
+  for (const closed of ["won", "lost"] as const) {
+    setup(); process.env.GHL_CARD_STATUS_WRITES_ENABLED = "true";
+    source = [owing]; cards[0].status = closed; cards[0].pipelineStageId = "sent";
+    await run("sync");
+    const reasons = reviews.map(r => r.reason);
+    assert.ok(!reasons.includes("Closed or unknown status; automatic reopening disabled"),
+      `${closed} must not be refused for being closed: ${JSON.stringify(reasons)}`);
+    assert.ok(reasons.some(r => r === "Fresh complete Jobber source verified"),
+      `${closed} must reach the normal write path: ${JSON.stringify(reasons)}`);
+    assert.equal(cards[0].status, closed, "nothing is written while an older gate is shut");
+  }
+});
+
+test("the status write itself is exactly what reopening and closing need", async () => {
+  const { moveOpportunityToStage } = await import("../lib/ghl");
+  const bodies: any[] = [];
+  globalThis.fetch = async (_input: any, init: any = {}) => {
+    bodies.push(JSON.parse(init.body)); return Response.json({ opportunity: { id: "card-a" } });
+  };
+  await moveOpportunityToStage("card-a", "sent", 100, "Invoice #1");
+  await moveOpportunityToStage("card-a", "paid", 0, "Invoice #1", "won");
+  await moveOpportunityToStage("card-a", "sent", 100, "Invoice #1", "open");
+  assert.deepEqual(bodies.map(b => b.status), [undefined, "won", "open"]);
+  await assert.rejects(
+    () => moveOpportunityToStage("card-a", "sent", 100, "Invoice #1", "deleted" as any),
+    /Unsupported opportunity status write/);
+  assert.equal(bodies.length, 3, "a status the sync does not understand is never sent");
+});
+
+test("with the gate off, a won or lost card that owes money is still held", async () => {
+  const owing = { ...paid, invoiceStatus: "awaiting_payment", amounts: { total: 100, invoiceBalance: 100 } };
+  for (const closed of ["won", "lost"] as const) {
+    setup(); source = [owing]; cards[0].status = closed; cards[0].pipelineStageId = "sent";
+    assert.equal(await run("sync"), 0, `${closed} must not be reopened with the gate off`);
+    assert.equal(writes.length, 0);
+    assert.ok(reviews.some(r => r.reason === "Closed or unknown status; automatic reopening disabled"),
+      JSON.stringify(reviews.map(r => r.reason)));
+  }
+});
+
+test("a status the sync does not understand is never reopened, gate on or off", async () => {
+  for (const gate of [undefined, "true"]) {
+    setup();
+    if (gate) process.env.GHL_CARD_STATUS_WRITES_ENABLED = gate;
+    source = [debt]; (cards[0] as any).status = "abandoned";
+    assert.equal(await run("sync"), 0);
+    assert.equal(writes.length, 0);
+    assert.ok(reviews.some(r => r.reason === "Closed or unknown status; automatic reopening disabled"),
+      JSON.stringify(reviews.map(r => r.reason)));
+  }
+});
+
+test("an already-won card sitting in Paid is unchanged, not rewritten", async () => {
+  setup(); process.env.GHL_CARD_STATUS_WRITES_ENABLED = "true";
+  cards[0].pipelineStageId = "paid"; cards[0].status = "won"; cards[0].monetaryValue = 0;
+  assert.equal(await run("sync"), 0);
+  assert.equal(writes.length, 0, "no write when the card is already where it belongs");
 });

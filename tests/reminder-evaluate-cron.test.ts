@@ -172,14 +172,23 @@ test("in the window candidates are evaluated and nothing is sent", () => {
   assert.equal(eligible.audience, "internal");
   assert.equal(eligible.daysPastDue, 21);
   assert.equal(eligible.holds, "");
-  assert.equal(recorded.eligible, 1);
+  // 9002's irrigation ladder (10, 15, 21) is all in the past. Since 2026-11-23
+  // that no longer means "never chased": it is admitted as a past-due catch-up.
+  const catchUp = by.get("9002")!;
+  assert.equal(catchUp.decision, "eligible", catchUp.holds);
+  assert.equal(catchUp.milestoneDay, 0, "stamped as a catch-up, not as day 10/15/21");
+  assert.equal(catchUp.audience, "homeowner");
+  assert.equal(recorded.eligible, 2, "the real day 21, plus the past-due catch-up");
   assert.match(stdout, /#9001 eligible .*channels=\[email:eligible,sms:eligible\]/);
 
   // 9003: two exact contacts. Held, never merged, never chosen between.
   const held = by.get("9003")!;
   assert.equal(held.decision, "held");
   assert.match(held.holds, /ambiguous_destination_contacts: 2 exact matches, not merged/);
-  assert.equal(held.milestoneDay, null, "no ladder may be chosen without a confirmed category");
+  // The service type is Jobber-only, which is now confirmation, so a ladder IS
+  // consulted. What holds the row is that there is no single contact to send
+  // to - which is the point of the rule.
+  assert.match(held.holds, /ambiguous_destination_contacts/);
 
   // 9004: settled in source. Reported separately from "not eligible".
   const settled = by.get("9004")!;
@@ -213,11 +222,12 @@ test("an old milestone stays held and is never replayed, even with --ignore-wind
   assert.equal(passed.decision, "window_passed");
   assert.match(passed.holds, /window_passed_today: day 21 was scheduled for 2026-11-16 09:00 Phoenix and did not send; skipped, never replayed/);
 
-  // 9002's whole irrigation ladder (10, 15, 21) is in the past. It is handed to
-  // a person, never re-sent, and --ignore-window does not change that.
+  // 9002's whole irrigation ladder (10, 15, 21) is in the past. It is now
+  // admitted as a past-due catch-up rather than left alone - but the closed
+  // window still skips it outright, and --ignore-window does not change that.
   const old = by.get("9002")!;
-  assert.equal(old.decision, "not_due");
-  assert.match(old.holds, /past_milestones_for_human_reconciliation: 10,15,21 \(never replayed\)/);
+  assert.equal(old.decision, "window_passed");
+  assert.match(old.holds, /window_passed_today/);
   assert.equal(old.daysPastDue, 76);
   assert.ok(!/eligible/.test(old.decision));
 });
