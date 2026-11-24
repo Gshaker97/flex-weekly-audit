@@ -176,27 +176,75 @@ test("OPTED IN: an unconfirmed pre-issue send is dismissed only on its date, not
 /* ------------------------------------------------------------------ */
 
 test("the reader only ever dates an UNNUMBERED message", async () => {
-  const { createReminderEvaluationReaders } = await import("../lib/reminder-evaluation-readers");
+  const { createReminderEvaluationReaders, classifyPriorSend } =
+    await import("../lib/reminder-evaluation-readers");
   assert.equal(typeof createReminderEvaluationReaders, "function");
-  // The classification itself is proved through priorSendRelevance above; this
-  // asserts the rule it is wired to, in one place, so the two cannot drift:
-  // a body naming this invoice is "exact", a body naming another is
-  // "other_invoice", and neither is ever dated.
-  const minePattern = new RegExp(`(?:^|[^0-9])7226(?:[^0-9]|$)`);
-  const anyInvoiceNumber = /#\s?\d{3,6}|invoice\s+#?\s?\d{3,6}/i;
-  const classify = (body: string, sentAt: Date) => {
-    const namesMine = minePattern.test(body);
-    const namesSome = anyInvoiceNumber.test(body);
-    if (namesMine) return "exact";
-    if (namesSome) return "other_invoice";
-    return priorSendRelevance(sentAt, ISSUED) === "predates_invoice" ? "predates_invoice" : "ambiguous";
-  };
+  // The REAL classifier is called here, not a copy of it, so the rule and the
+  // test cannot drift: a body naming this invoice is "exact", a body naming
+  // another is "other_invoice", and neither is ever dated.
+  const classify = (body: string, sentAt: Date) => classifyPriorSend({
+    body, sentAt, invoiceNumber: "7226", issuedDate: ISSUED, dueDate: "2026-11-10",
+  }).attribution;
   const longBefore = new Date("2026-07-06T18:00:00.000Z");
   assert.equal(classify("Your invoice #7226 is past due", longBefore), "exact");
   assert.equal(classify("Your invoice #7100 is past due", longBefore), "other_invoice");
   assert.equal(classify("Just a reminder about your balance", longBefore), "predates_invoice");
   assert.equal(classify("Just a reminder about your balance",
     new Date("2026-11-25T16:00:00.000Z")), "ambiguous");
+});
+
+/* ------------------------------------------------------------------ */
+/* The day count in a legacy body, through the real classifier.        */
+/* ------------------------------------------------------------------ */
+
+test("a legacy reminder's own day count decides which invoice it was about", async () => {
+  const { classifyPriorSend } = await import("../lib/reminder-evaluation-readers");
+  // #7226 fell due 2026-11-10. Nothing below quotes an invoice number or an
+  // amount, which is exactly why the number-only rule could not place them.
+  const classify = (body: string, sentAt: Date, corroborating?: string[]) => classifyPriorSend({
+    body, sentAt, invoiceNumber: "7226", issuedDate: ISSUED, dueDate: "2026-11-10",
+    corroboratingDueDates: corroborating,
+  });
+
+  // Day 15 for THIS invoice: 2026-11-10 + 15 = 2026-11-25.
+  const mine = classify("your invoice is 15 days past due", new Date("2026-11-25T16:05:00.000Z"));
+  assert.equal(mine.attribution, "exact");
+  assert.equal(mine.milestoneDay, 15, "the rung comes from the body, so day 15 is closed");
+
+  // The real July text: "10 days past due" on 2026-07-06 means an invoice that
+  // fell due 2026-06-26. It cannot hold #7226, and it no longer does.
+  const older = classify("your invoice is 10 days past due", new Date("2026-07-06T22:00:00.000Z"));
+  assert.equal(older.attribution, "other_invoice");
+  assert.equal(older.milestoneDay, null);
+
+  // The fee template states no day count, so on its own it is never released
+  // as another invoice's. Here it also predates the invoice, which is a firmer
+  // answer than "ambiguous" - and both of them still hold the row.
+  const fee = classify("A late fee of 3% has been applied", new Date("2026-08-14T18:00:00.000Z"));
+  assert.equal(fee.attribution, "predates_invoice", "an inference must not release a hold");
+
+  // A fee text sent AFTER issuance has neither signal left, so it is ambiguous
+  // and holds - the case the number-only rule produced for every legacy text.
+  const after = classify("A late fee of 3% has been applied", new Date("2026-11-20T18:00:00.000Z"));
+  assert.equal(after.attribution, "ambiguous");
+  assert.equal(after.milestoneDay, null);
+
+  // ...but the Aug 9 "10 days" text puts an invoice at due 2026-07-30, which is
+  // just what the Aug 14 fee text implies. Corroborated, it is dismissed.
+  const corroborated = classify("A late fee of 3% has been applied",
+    new Date("2026-08-14T18:00:00.000Z"), ["2026-07-30"]);
+  assert.equal(corroborated.attribution, "other_invoice");
+});
+
+test("a numbered body is never re-decided by its day count", async () => {
+  const { classifyPriorSend } = await import("../lib/reminder-evaluation-readers");
+  // Naming the invoice settles it. A day count that disagrees must not demote
+  // an exact match to "other_invoice" and let a duplicate through.
+  const result = classifyPriorSend({
+    body: "Invoice #7226 is 10 days past due", sentAt: new Date("2026-07-06T22:00:00.000Z"),
+    invoiceNumber: "7226", issuedDate: ISSUED, dueDate: "2026-11-10",
+  });
+  assert.equal(result.attribution, "exact");
 });
 
 
