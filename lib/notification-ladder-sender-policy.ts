@@ -17,9 +17,18 @@
  * replied to nobody. The office number already lives in the pinned copy for the
  * same reason. Neither is a secret - both are numbers customers see.
  *
- * WHAT EACH RUNG DELIVERS. Days 10, 15, 20, 25 and 30 are texts to the
- * customer. Days 21 and 35 are internal: day 21 is Angie's call, day 35 is her
- * collections decision.
+ * WHAT EACH RUNG DELIVERS. Days 10, 15, 20, 25 and 30 are messages to the
+ * customer: ONE TEXT AND ONE EMAIL, carrying the same words. Days 21 and 35 are
+ * internal: day 21 is Angie's call, day 35 is her collections decision.
+ *
+ * ONE TEXT AND ONE EMAIL, decided by the owner on 2026-11-24. Until then a
+ * homeowner rung was a text only. The two are one message delivered twice, not
+ * two messages: the email body is the text body, the identical string, so the
+ * words cannot drift apart. See `notification-ladder-email.ts`.
+ *
+ * ONE PAIR PER CUSTOMER PER DAY, not one pair per invoice. A customer with
+ * three overdue invoices gets one text and one email. That cap is enforced
+ * where sends are reserved, not here.
  *
  * DAY 21 IS A TASK ONLY. Decided by the owner on 2026-11-19. The legacy Fixed
  * Automation workflow sends an email AND an internal text on day 21, and the
@@ -28,6 +37,7 @@
  * no message at all. One call should be raised once.
  */
 import type { GhlSenderReview } from "./notification-ghl-contract";
+import { LADDER_CUSTOMER_CHANNELS } from "./notification-ladder-email";
 
 export const LADDER_SMS_SENDER = Object.freeze({
   /** E.164. The only SMS-capable number on this location, and the proven one. */
@@ -40,13 +50,18 @@ export const LADDER_SMS_SENDER = Object.freeze({
   provenBy: "staff-test-sms-2026-11-18-delivered",
 } as const);
 
-/** What a rung delivers. A rung the ladder does not have returns null. */
-export type LadderDelivery = "customer_sms" | "internal_task";
+/**
+ * What a rung delivers. A rung the ladder does not have returns null.
+ *
+ * `customer_message` is one text AND one email with the same body. The old name
+ * for it was "customer_sms", which stopped being true on 2026-11-24.
+ */
+export type LadderDelivery = "customer_message" | "internal_task";
 
 const DELIVERY: Readonly<Record<number, LadderDelivery>> = Object.freeze({
-  10: "customer_sms", 15: "customer_sms", 20: "customer_sms",
+  10: "customer_message", 15: "customer_message", 20: "customer_message",
   21: "internal_task",
-  25: "customer_sms", 30: "customer_sms",
+  25: "customer_message", 30: "customer_message",
   35: "internal_task",
 });
 
@@ -55,9 +70,15 @@ export function ladderDelivery(dayPastDue: number): LadderDelivery | null {
     ? DELIVERY[dayPastDue] : null;
 }
 
-/** Days that send the customer a text, in ladder order. */
-export const LADDER_CUSTOMER_SMS_DAYS: readonly number[] = Object.freeze(
-  Object.keys(DELIVERY).map(Number).filter(day => DELIVERY[day] === "customer_sms").sort((a, b) => a - b));
+/** Days that message the customer - one text and one email - in ladder order. */
+export const LADDER_CUSTOMER_MESSAGE_DAYS: readonly number[] = Object.freeze(
+  Object.keys(DELIVERY).map(Number).filter(day => DELIVERY[day] === "customer_message").sort((a, b) => a - b));
+
+/**
+ * The old name, kept so no caller silently reads an undefined list. It is the
+ * same days; each of them now delivers an email beside the text.
+ */
+export const LADDER_CUSTOMER_SMS_DAYS: readonly number[] = LADDER_CUSTOMER_MESSAGE_DAYS;
 
 /** Days that raise internal work instead of messaging anyone. */
 export const LADDER_INTERNAL_TASK_DAYS: readonly number[] = Object.freeze(
@@ -87,5 +108,18 @@ export function ladderSenderReview(accountId: string, locationId: string): GhlSe
  * reading an empty channel list as a fault.
  */
 export function ladderMilestoneIsCustomerMessage(dayPastDue: number): boolean {
-  return ladderDelivery(dayPastDue) === "customer_sms";
+  return ladderDelivery(dayPastDue) === "customer_message";
 }
+
+/**
+ * The channels a rung delivers on. A homeowner rung is both, always; an
+ * internal rung messages nobody, so it is empty.
+ *
+ * This is the single place the "text AND email" decision is read from, so a
+ * caller cannot deliver one half of a pair by accident.
+ */
+export function ladderCustomerChannels(dayPastDue: number): readonly ("sms" | "email")[] {
+  return ladderMilestoneIsCustomerMessage(dayPastDue) ? LADDER_CUSTOMER_CHANNELS : EMPTY_CHANNELS;
+}
+
+const EMPTY_CHANNELS: readonly ("sms" | "email")[] = Object.freeze([]);

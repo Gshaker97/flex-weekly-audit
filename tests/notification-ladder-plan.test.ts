@@ -56,8 +56,8 @@ const reasons = (over: Partial<LadderStepInput>) => {
 test("each homeowner rung sends its own pinned text", () => {
   for (const [day, body] of [[10, ORIGINAL_DAY10_SMS_BODY], [20, DAY20_SMS_BODY], [25, DAY25_SMS_BODY]] as const) {
     const action = planLadderStep(step({ dayPastDue: day }));
-    assert.equal(action.kind, "send_sms", `day ${day}`);
-    if (action.kind !== "send_sms") return;
+    assert.equal(action.kind, "send_message", `day ${day}`);
+    if (action.kind !== "send_message") return;
     assert.equal(action.body, body, `day ${day}`);
     assert.equal(action.contactId, "contact-1");
     assert.equal(action.dayPastDue, day);
@@ -70,8 +70,8 @@ test("day 15 sends the fee WARNING, and only with evidence behind it", () => {
     ["invoice_terms_or_written_policy_must_support_the_fee_warning"]);
 
   const action = planLadderStep(step({ dayPastDue: 15, termsEvidence: POLICY_TERMS }));
-  assert.equal(action.kind, "send_sms");
-  if (action.kind !== "send_sms") return;
+  assert.equal(action.kind, "send_message");
+  if (action.kind !== "send_message") return;
   assert.equal(action.body, PROPOSED_DAY15_SMS_FEE_WARNING_BODY);
   assert.match(action.body, /may apply/);
   assert.ok(!/has been applied/.test(action.body), "never assert the fee");
@@ -87,21 +87,21 @@ test("an invoice issued before the policy took effect gets no fee warning", () =
 test("day 30 tells the truth about suspension either way", () => {
   // Nothing records suspensions, so this is the path every real invoice takes.
   const unproven = planLadderStep(step({ dayPastDue: 30 }));
-  assert.equal(unproven.kind, "send_sms");
-  if (unproven.kind === "send_sms") {
+  assert.equal(unproven.kind, "send_message");
+  if (unproven.kind === "send_message") {
     assert.equal(unproven.body, DAY30_SMS_BODY_UNVERIFIED);
     assert.ok(!/have been temporarily suspended/.test(unproven.body));
   }
   const proven = planLadderStep(step({ dayPastDue: 30, suspensionEvidence: SUSPENDED }));
-  assert.equal(proven.kind, "send_sms");
-  if (proven.kind === "send_sms") assert.equal(proven.body, DAY30_SMS_BODY_SUSPENDED);
+  assert.equal(proven.kind, "send_message");
+  if (proven.kind === "send_message") assert.equal(proven.body, DAY30_SMS_BODY_SUSPENDED);
 });
 
 test("suspension evidence for a DIFFERENT client does not change day 30's words", () => {
   const action = planLadderStep(step({
     dayPastDue: 30, suspensionEvidence: { ...SUSPENDED, jobberClientId: "someone-else" } }));
-  assert.equal(action.kind, "send_sms");
-  if (action.kind === "send_sms") assert.equal(action.body, DAY30_SMS_BODY_UNVERIFIED);
+  assert.equal(action.kind, "send_message");
+  if (action.kind === "send_message") assert.equal(action.body, DAY30_SMS_BODY_UNVERIFIED);
 });
 
 // --------------------------------------------------------- the internal rungs
@@ -136,7 +136,7 @@ test("irrigation stops at 21: no day 25 or 30 text for an irrigation invoice", (
       ["day_is_not_a_rung_of_this_ladder"], `irrigation day ${day}`);
   }
   // The rungs it does have still work.
-  assert.equal(planLadderStep(step({ category: "irrigation", dayPastDue: 10 })).kind, "send_sms");
+  assert.equal(planLadderStep(step({ category: "irrigation", dayPastDue: 10 })).kind, "send_message");
   assert.equal(planLadderStep(step({ category: "irrigation", dayPastDue: 21 })).kind, "create_task");
 });
 
@@ -216,7 +216,9 @@ test("a day's plan accounts for every step handed to it", () => {
     step({ dayPastDue: 30, scheduledOn: "2026-12-01" }),
   ], TODAY);
   assert.equal(plan.actions.length, 6);
-  assert.deepEqual(plan.summary, { sends: 3, tasks: 1, holds: 1, notDue: 1 });
+  // One "send" is one customer message, delivered as a text AND an email, so
+  // the text and email counts equal the send count rather than doubling it.
+  assert.deepEqual(plan.summary, { sends: 3, texts: 3, emails: 3, tasks: 1, holds: 1, notDue: 1 });
   // The counts must sum: a step cannot fall out of the plan unnoticed.
   const { sends, tasks, holds, notDue } = plan.summary;
   assert.equal(sends + tasks + holds + notDue, plan.actions.length);
@@ -227,13 +229,13 @@ test("the plan imposes its own run date on every step", () => {
   // A step carrying yesterday's date cannot make itself due by saying so.
   const plan = planLadderDay([step({ today: "2026-01-01" })], TODAY);
   assert.equal(plan.today, TODAY);
-  assert.equal(plan.actions[0].kind, "send_sms");
+  assert.equal(plan.actions[0].kind, "send_message");
 });
 
 test("an empty or unusable list plans nothing rather than failing", () => {
   for (const bad of [[], null, undefined, "steps"]) {
     const plan = planLadderDay(bad as never, TODAY);
     assert.equal(plan.actions.length, 0);
-    assert.deepEqual(plan.summary, { sends: 0, tasks: 0, holds: 0, notDue: 0 });
+    assert.deepEqual(plan.summary, { sends: 0, texts: 0, emails: 0, tasks: 0, holds: 0, notDue: 0 });
   }
 });

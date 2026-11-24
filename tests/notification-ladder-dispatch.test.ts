@@ -67,8 +67,8 @@ const step = (over: Partial<LadderStepInput> = {}): LadderStepInput => ({
 
 const plannedSend = () => {
   const action = planLadderStep(step());
-  assert.equal(action.kind, "send_sms");
-  return action as Extract<LadderAction, { kind: "send_sms" }>;
+  assert.equal(action.kind, "send_message");
+  return action as Extract<LadderAction, { kind: "send_message" }>;
 };
 const plannedTask = (day: 21 | 35) => {
   const action = planLadderStep(step({ dayPastDue: day }));
@@ -182,7 +182,9 @@ test("if the ledger will not move to pending, the customer is NOT texted", async
 
 test("an event that does not match the planned message is refused, unsent", async () => {
   const cases: Array<[string, LadderSendContext]> = [
-    ["event_channel_is_not_sms", context({ event: event({ channel: "email" }) })],
+    // Email is a real ladder channel since 2026-11-24, so the refusal case is a
+    // channel the ladder does not deliver on at all.
+    ["event_channel_is_not_a_ladder_channel", context({ event: event({ channel: "voice" as any }) })],
     ["event_day_does_not_match_the_plan", context({ event: event({ dayPastDue: 25 }) })],
     ["event_contact_does_not_match_the_plan", context({ event: event({ contactId: "someone-else" }) })],
     ["event_body_digest_does_not_match_the_words", context({ event: event({ bodyDigest: notificationBodyDigest("different words") }) })],

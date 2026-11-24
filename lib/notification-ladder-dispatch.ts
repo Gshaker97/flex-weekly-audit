@@ -142,12 +142,23 @@ const out = (
  * safe direction. The one irreversible step - the attempt - happens after the
  * ledger has handed over a reservation and accepted it as pending.
  */
+/**
+ * ONE HALF OF A PAIR. A homeowner rung is one message delivered as a text AND
+ * an email, so this is called once per channel, with `context.event.channel`
+ * naming which half this call is. The words are the same string either way -
+ * the planner has already proved `action.email.body === action.body` - so the
+ * two halves cannot say different things even though they reserve separately.
+ *
+ * Reserving separately is deliberate: the ledger keys on channel, so a failed
+ * text does not consume the email's reservation and a delivered text is not
+ * re-sent when the email fails.
+ */
 export async function dispatchLadderSend(
-  action: Extract<LadderAction, { kind: "send_sms" }>,
+  action: Extract<LadderAction, { kind: "send_message" }>,
   context: LadderSendContext,
   io: LadderDispatchIO,
 ): Promise<LadderDispatchOutcome> {
-  if (!action || action.kind !== "send_sms") return out("held", -1, ["not_a_planned_send"]);
+  if (!action || action.kind !== "send_message") return out("held", -1, ["not_a_planned_send"]);
   const day = action.dayPastDue;
   if (!context?.event || !io?.ledger || typeof io?.attemptSend !== "function")
     return out("held", day, ["dispatch_io_unavailable"]);
@@ -158,7 +169,11 @@ export async function dispatchLadderSend(
   // about THIS message. A mismatch here would mean reserving one thing and
   // sending another - the ledger would show a message nobody received.
   const mismatches: string[] = [];
-  if (event.channel !== "sms") mismatches.push("event_channel_is_not_sms");
+  const channel = event.channel;
+  // The rung has to deliver on this channel at all. A channel the policy does
+  // not declare for this rung is a held message, not an improvised one.
+  if (channel !== "sms" && channel !== "email") mismatches.push("event_channel_is_not_a_ladder_channel");
+  else if (!action.channels.includes(channel)) mismatches.push("rung_does_not_deliver_on_this_channel");
   if (event.dayPastDue !== day) mismatches.push("event_day_does_not_match_the_plan");
   if (event.contactId !== action.contactId) mismatches.push("event_contact_does_not_match_the_plan");
   if (event.bodyDigest !== notificationBodyDigest(action.body)) mismatches.push("event_body_digest_does_not_match_the_words");
@@ -170,15 +185,18 @@ export async function dispatchLadderSend(
   // recipient read or the sender review does not support it.
   const binding: GhlMessageBinding = {
     accountId: event.accountId, locationId: context.senderReview?.locationId ?? "",
-    contactId: event.contactId, channel: "sms", destination: event.destination,
+    contactId: event.contactId, channel: channel as "sms" | "email", destination: event.destination,
     // The ledger's own key for this event, so the request and the ledger row
     // describe the same thing and cannot drift apart.
     eventKey: eventKey(event), invoiceId: event.invoiceId,
     sender: context.senderReview?.sender ?? "", bodyHash: notificationBodyDigest(action.body),
   };
+  // The email needs a subject; the SMS must NOT have one. Both carry the same
+  // body, which is the point of the pair.
   const construction = buildGhlMessageRequest({
     binding, recipient: context.recipient, senderReview: context.senderReview,
     review: context.review, body: action.body, contentType: "text/plain",
+    ...(channel === "email" ? { subject: action.email.subject } : {}),
   });
   if (construction.state !== "constructed_disabled" || !construction.request)
     return out("held", day, construction.reasons.length ? construction.reasons : ["send_request_not_constructible"]);
@@ -192,7 +210,7 @@ export async function dispatchLadderSend(
   // Step 4. The reservation is the right to send this exact message once.
   const reserved = await io.ledger.reserve({
     event, body: action.body, destination: event.destination,
-    channel: "sms", contactId: event.contactId, scheduledOn: context.scheduledOn,
+    channel, contactId: event.contactId, scheduledOn: context.scheduledOn,
   });
   if (reserved.state !== "reserved") return out("held", day, [`ledger_${reserved.reason}`]);
   const handle = reserved.reservation;
@@ -322,7 +340,7 @@ export async function dispatchLadderAction(
       return out("held", action.dayPastDue, action.reasons);
     case "create_task":
       return dispatchLadderTask(action, io);
-    case "send_sms":
+    case "send_message":
       return context
         ? dispatchLadderSend(action, context, io)
         : out("held", action.dayPastDue, ["no_send_context_established"]);
