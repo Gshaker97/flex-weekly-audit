@@ -46,6 +46,8 @@ import {
   LADDER_SMS_BODIES, ladderWarningCopyIsValid, ladderCopyClaims,
   day30Copy, day30CopyIsValid, type LadderClaim, type SuspensionEvidence,
 } from "./notification-ladder-copy";
+import { ladderEmail, ladderEmailMatchesText, type LadderEmail } from "./notification-ladder-email";
+import { ladderCustomerChannels } from "./notification-ladder-sender-policy";
 import {
   constructInternalTask, internalTaskDay,
   type InternalAssignee, type InternalTaskRequest, type InternalTaskKind,
@@ -92,10 +94,20 @@ export type LadderAction =
   /** This rung is not today's. Nothing to do, nothing wrong. */
   | Readonly<{ kind: "not_due"; dayPastDue: number; reason: "future" | "already_past" }>
   | Readonly<{ kind: "hold"; dayPastDue: number; reasons: readonly string[] }>
+  /**
+   * One message for the customer, delivered as a text AND an email.
+   *
+   * `body` is the single validated string. `email.body` is that same string -
+   * not a copy written elsewhere - so the two halves of the pair cannot say
+   * different things. The planner asserts that before returning.
+   */
   | Readonly<{
-      kind: "send_sms"; dayPastDue: number; contactId: string; body: string;
+      kind: "send_message"; dayPastDue: number; contactId: string; body: string;
       /** What these words actually claim, read from the words themselves. */
       claims: readonly LadderClaim[];
+      /** Always ["sms", "email"]. Read from the delivery policy, not inlined. */
+      channels: readonly ("sms" | "email")[];
+      email: LadderEmail;
     }>
   | Readonly<{ kind: "create_task"; dayPastDue: number; taskKind: InternalTaskKind; request: InternalTaskRequest }>;
 
@@ -184,7 +196,8 @@ export function planLadderStep(step: LadderStepInput): LadderAction {
     return Object.freeze({ kind: "create_task", dayPastDue: day, taskKind, request: Object.freeze(request) });
   }
 
-  // A homeowner rung is a text. It needs somewhere to go and words that pass.
+  // A homeowner rung is one message on two channels. It needs somewhere to go
+  // and words that pass their validator.
   if (!text(step.homeownerContactId) || !ID.test(step.homeownerContactId as string))
     return hold(day, ["no_usable_homeowner_contact"]);
 
@@ -200,9 +213,20 @@ export function planLadderStep(step: LadderStepInput): LadderAction {
   // pinned string that has drifted becomes silence and a reason, never a send.
   if (!copy.valid) return hold(day, ["pinned_copy_failed_its_own_validator"]);
 
+  // The email is built from the body that just passed its validator, so the
+  // pair is one message. A subject that cannot be formed is a hold, never a
+  // text sent on its own: half a pair is not what the owner approved.
+  const email = ladderEmail({ body: copy.body, invoiceNumber: step.invoiceNumber, dayPastDue: day });
+  if (!email) return hold(day, ["email_subject_unavailable"]);
+  if (!ladderEmailMatchesText(email, copy.body)) return hold(day, ["email_body_differs_from_text"]);
+
+  const channels = ladderCustomerChannels(day);
+  if (channels.length !== 2) return hold(day, ["rung_does_not_declare_both_channels"]);
+
   return Object.freeze({
-    kind: "send_sms", dayPastDue: day, contactId: step.homeownerContactId as string,
+    kind: "send_message", dayPastDue: day, contactId: step.homeownerContactId as string,
     body: copy.body, claims: Object.freeze(ladderCopyClaims(copy.body)),
+    channels, email,
   });
 }
 
@@ -227,7 +251,10 @@ export function planLadderDay(steps: readonly LadderStepInput[], today: string):
     today,
     actions: Object.freeze(actions),
     summary: Object.freeze({
-      sends: actions.filter(a => a.kind === "send_sms").length,
+      // One "send" is one customer message: a text and an email together.
+      sends: actions.filter(a => a.kind === "send_message").length,
+      texts: actions.filter(a => a.kind === "send_message").length,
+      emails: actions.filter(a => a.kind === "send_message").length,
       tasks: actions.filter(a => a.kind === "create_task").length,
       holds: actions.filter(a => a.kind === "hold").length,
       notDue: actions.filter(a => a.kind === "not_due").length,

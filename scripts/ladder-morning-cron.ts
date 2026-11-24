@@ -48,19 +48,28 @@ import { COLLECTIONS_SINCE } from "../lib/lateInvoices";
 import { planLadderDay, type LadderStepInput } from "../lib/notification-ladder-plan";
 import {
   ladderDelivery, ladderMilestoneIsCustomerMessage, LADDER_SMS_SENDER,
-  LADDER_CUSTOMER_SMS_DAYS, LADDER_INTERNAL_TASK_DAYS,
+  LADDER_CUSTOMER_MESSAGE_DAYS, LADDER_INTERNAL_TASK_DAYS, ladderCustomerChannels,
 } from "../lib/notification-ladder-sender-policy";
+import { planDailyReminders } from "../lib/reminder-daily-plan";
 import type { Day15TermsEvidence } from "../lib/notification-day15-pilot";
 
 const TAG = "[ladder-morning]";
 
 /**
- * The same channel policy the evaluate-only runner uses, for the same reason:
- * it keys the prior-send check against the LEGACY workflow's messages. It does
- * not decide what the ladder delivers - `ladderDelivery()` does.
+ * Every homeowner rung is one text AND one email, so both channels are declared
+ * at every rung (owner's decision, 2026-11-24). Internal day 21 already was.
+ *
+ * This keys the prior-send check against the LEGACY workflow's messages. It
+ * does not decide what the ladder delivers - `ladderDelivery()` does - but the
+ * two must agree, so it is read from the same policy rather than inlined.
+ *
+ * ONE CONSEQUENCE WORTH KNOWING. The legacy workflow only ever sent texts. At a
+ * rung where a legacy text already went out, the sms half is suppressed and the
+ * email half stays eligible, so the pair is completed rather than repeated. The
+ * customer does not get the same words twice on the same channel.
  */
 const MILESTONE_CHANNELS = (step: { dayPastDue: number; audience: string }): readonly SendChannel[] =>
-  step.dayPastDue === 21 ? ["email", "sms"] : ["sms"];
+  step.audience === "internal" ? ["email", "sms"] : [...ladderCustomerChannels(step.dayPastDue)];
 
 function configuredExclusions(): string[] | null {
   const raw = process.env.FLEXX_REMINDER_VERIFIED_EXCLUSIONS;
@@ -107,7 +116,7 @@ async function main() {
   const today = parts?.date ?? null;
   console.log(`${TAG} phoenix=${today} ${String(parts?.hour).padStart(2, "0")}:${String(parts?.minute).padStart(2, "0")} ` +
     `inWindow=${withinArizonaWindow(now)} ignoreWindow=${ignoreWindow}`);
-  console.log(`${TAG} ladder: texts on days ${LADDER_CUSTOMER_SMS_DAYS.join(", ")}; ` +
+  console.log(`${TAG} ladder: texts on days ${LADDER_CUSTOMER_MESSAGE_DAYS.join(", ")}; ` +
     `internal tasks on days ${LADDER_INTERNAL_TASK_DAYS.join(", ")}`);
   console.log(`${TAG} sender approved: ${LADDER_SMS_SENDER.approvalRef}`);
   if (!today) { console.log(`${TAG} no Phoenix date; nothing planned`); return; }
@@ -151,6 +160,33 @@ async function main() {
   for (const note of evaluation.notes) console.log(`${TAG} note: ${note}`);
   console.log(`${TAG} destinations resolved: ${destinations.size} of ${candidates.length}`);
 
+  // ONE PAIR PER CUSTOMER PER DAY. The reservation gate refuses two milestones
+  // for one contact on one day outright (`simultaneous_contact_event_conflict`),
+  // which would leave a customer with three overdue invoices getting NOTHING.
+  // So the choice of which invoice carries the day's pair is made here, by the
+  // module that exists for it: furthest-along rung, then longest overdue, then
+  // lowest invoice number. It only ever removes rows the evaluator already
+  // called eligible - it can never create a send.
+  const daily = planDailyReminders({
+    rows: evaluation.rows,
+    candidates: candidates.map(c => ({
+      jobberInvoiceId: c.jobberInvoiceId, jobberClientId: c.jobberClientId,
+      clientName: c.clientName, invoiceNumber: c.invoiceNumber,
+    })),
+    phoenixDate: today,
+  });
+  const carriesTodaysPair = new Set<string>();
+  for (const customer of daily.customers) {
+    for (const pick of customer.picks) carriesTodaysPair.add(pick.jobberInvoiceId);
+  }
+  console.log(`${TAG} daily cap: ${daily.customersWithASend} customers with a send, `
+    + `${daily.smsPicked} texts, ${daily.emailPicked} emails, ${daily.droppedToCap} dropped to the cap`);
+  for (const customer of daily.customers) {
+    for (const drop of customer.drops) {
+      console.log(`${TAG} capped   #${drop.invoiceNumber ?? "?"} ${drop.channel}: ${drop.reason}`);
+    }
+  }
+
   const terms = writtenPolicyEvidence();
   const assignee = internalAssignee();
   console.log(`${TAG} written late-fee policy evidence: ${terms ? "supplied" : "ABSENT (day 15 will hold)"}`);
@@ -167,6 +203,11 @@ async function main() {
     if (row.milestoneDay == null || !category) {
       skipped.push(`#${row.invoiceNumber ?? "?"} eligible but no milestone or usable category resolved` +
         (row.category ? ` (category=${row.category})` : ""));
+      continue;
+    }
+    // Held back by the one-pair-per-customer-per-day cap.
+    if (row.audience !== "internal" && !carriesTodaysPair.has(row.jobberInvoiceId)) {
+      skipped.push(`#${row.invoiceNumber ?? "?"} eligible but another invoice carries this customer's pair today`);
       continue;
     }
     const delivery = ladderDelivery(row.milestoneDay);
@@ -206,8 +247,10 @@ async function main() {
     const action = plan.actions[index];
     const step = steps[index];
     const label = `#${step.invoiceNumber || "?"} day ${step.dayPastDue} ${step.category}`;
-    if (action.kind === "send_sms") {
-      console.log(`${TAG} TEXT     ${label} claims=[${action.claims.join(",")}] chars=${action.body.length}`);
+    if (action.kind === "send_message") {
+      console.log(`${TAG} TEXT+EMAIL ${label} claims=[${action.claims.join(",")}]`
+        + ` chars=${action.body.length} channels=[${action.channels.join(",")}]`
+        + ` subject="${action.email.subject}" sameWords=${action.email.body === action.body}`);
     } else if (action.kind === "create_task") {
       console.log(`${TAG} TASK     ${label} ${action.taskKind}`);
     } else if (action.kind === "hold") {
@@ -289,10 +332,20 @@ async function main() {
   }
 
   const messageDays = plan.actions.filter((action, index) =>
-    action.kind === "send_sms" && !ladderMilestoneIsCustomerMessage(steps[index].dayPastDue));
+    action.kind === "send_message" && !ladderMilestoneIsCustomerMessage(steps[index].dayPastDue));
   if (messageDays.length) {
-    console.log(`${TAG} REFUSING TO REPORT A CLEAN RUN: ${messageDays.length} planned text(s) ` +
+    console.log(`${TAG} REFUSING TO REPORT A CLEAN RUN: ${messageDays.length} planned message(s) ` +
       `fall on a day the policy says is internal. This is a contradiction and must be looked at.`);
+  }
+
+  // Both halves of every pair, or neither. A planned message that somehow
+  // declares one channel is the same class of contradiction as the above.
+  const halfPairs = plan.actions.filter(action =>
+    action.kind === "send_message" &&
+    (action.channels.length !== 2 || action.email.body !== action.body));
+  if (halfPairs.length) {
+    console.log(`${TAG} REFUSING TO REPORT A CLEAN RUN: ${halfPairs.length} planned message(s) ` +
+      `are not one text and one email with the same words. Must be looked at.`);
   }
 
   console.log(`\n${TAG} sends attempted: 0 (this runner has no send path)`);
