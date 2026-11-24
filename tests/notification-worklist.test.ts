@@ -65,8 +65,12 @@ test("mixed labels are surfaced while the inspected exact irrigation-tag rule st
 test("all conditional copy remains unapproved and required effects are never asserted", () => {
   const result = plan();
   assert.deepEqual(result.homeowner.find(x => x.dayPastDue === 15)!.requiredFacts, ["three_percent_fee_applied"]);
-  for (const day of [20, 25]) assert.deepEqual(result.homeowner.find(x => x.dayPastDue === day)!.requiredFacts, ["recurring_late_fee_policy"]);
-  assert.deepEqual(result.homeowner.find(x => x.dayPastDue === 30)!.requiredFacts, ["service_suspended", "collections_after_day_35_policy"]);
+  // Days 20, 25 and 30 warn rather than assert, so they carry no fact
+  // requirement. What they may actually SAY is still policed by
+  // `ladderCopyClaims` at copy level.
+  for (const day of [20, 25, 30]) {
+    assert.deepEqual(result.homeowner.find(x => x.dayPastDue === day)!.requiredFacts, [], `day ${day}`);
+  }
   assert.ok(result.homeowner.filter(x => x.dayPastDue !== 10).every(x => x.copyStatus === "conditional_copy_unapproved"));
   assert.equal(result.homeowner[0].copyStatus, "bind_existing_day10_authorization");
   assert.doesNotMatch(JSON.stringify(result), /"approved":true|"value":true|currency|destination|bodyDigest/);
