@@ -854,7 +854,7 @@ export async function syncGhlInvoicePipeline(opts: {
           monetaryValue: card.monetaryValue ?? null,
         }));
         const plan = planInvoiceCards({
-            contactId, now, clocks, windowStart, legacySending: opts.legacySending ?? legacySendingFromEnv(),
+            contactId, now, clocks, windowStart, legacySending: opts.legacySending ?? legacySendingFromEnv(process.env, now),
             legacyWorkflowId: process.env.GHL_LEGACY_INVOICE_WORKFLOW_ID ?? "",
             label: ownInvoices[0]?.clientName ?? customer.companyName ?? customer.name ?? customer.jobberClientId,
             invoices: mine.map(inv => ({
