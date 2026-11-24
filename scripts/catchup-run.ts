@@ -1,14 +1,26 @@
 /**
  * THE CATCH-UP, AGAINST LIVE DATA. Plans by default. Sends nothing on its own.
  *
- *   npx tsx scripts/catchup-run.ts            plan and print the report
- *   npx tsx scripts/catchup-run.ts --send     attempt the send
+ *   npx tsx scripts/catchup-run.ts                         plan and print
+ *   npx tsx scripts/catchup-run.ts --prepare out.json      write the manifest
+ *   npx tsx scripts/catchup-run.ts --send \
+ *       --manifest out.json --approve <manifestSha256>     send the approved set
  *
- * `--send` is necessary and NOT sufficient. The run still holds unless reviewed
- * senders are injected, and nothing in this repo can produce those from the
- * environment - see the note in `lib/catchup-runner.ts`. So on a normal
- * deployment `--send` prints a held run naming `reviewed_senders_required`,
- * which is the correct outcome rather than a bug.
+ * THREE PHASES, BECAUSE AN APPROVAL HAS TO BE READABLE BEFORE IT IS GIVEN.
+ *
+ *   plan      what would go out, in counts and hold reasons. Touches nothing.
+ *   prepare   constructs every message and writes a manifest: the exact words,
+ *             the amount, the day, the last four of each destination, and the
+ *             SHA-256 of the byte-exact request that would be posted. Sends
+ *             nothing. Reads consent live, because a manifest built from a
+ *             stale opt-out is worthless.
+ *   send      takes that manifest back plus its hash, named explicitly on the
+ *             command line. The hash IS the approval: it says "this exact set,
+ *             these words, these people". Only messages whose request hash is
+ *             in the approved manifest can be posted, each once.
+ *
+ * `--send` alone is still not enough and never will be. Without a manifest and
+ * a matching hash the run holds, because there is nothing authorizing it.
  *
  * WHAT IT READS, AND WHY EACH READ IS LIVE.
  *   Jobber invoices    the local mirror, for the candidate set
@@ -27,12 +39,31 @@ import { prisma } from "../lib/prisma";
 import { findExactContactMatches } from "../lib/ghl";
 import { COLLECTIONS_SINCE } from "../lib/lateInvoices";
 import { invoiceCalendarDate } from "../lib/invoice-reminder-clock";
-import { catchupRunnerReadiness, runCatchup } from "../lib/catchup-runner";
+import { catchupRunnerReadiness, planCatchupRun, runCatchup } from "../lib/catchup-runner";
 import { CATCHUP_EMAIL_SENDER, CATCHUP_SMS_SENDER } from "../lib/catchup-sender-policy";
 import type { CatchupRecipientInput } from "../lib/catchup-plan";
+import { readFileSync, writeFileSync } from "node:fs";
+import { constructCatchupRequest } from "../lib/catchup-dispatch";
+import { assembleCatchupSenders, catchupPreparationSenders } from "../lib/catchup-senders";
+import {
+  approveCatchupManifest, buildCatchupManifest, catchupRequestSha256, parseCatchupManifest,
+  type CatchupAttestation,
+} from "../lib/catchup-attestation";
+import { catchupTransportReadiness, createCatchupTransport, CATCHUP_TRANSPORT_MODE } from "../lib/catchup-transport";
+import { createPrismaNotificationLedger } from "../lib/notification-ledger";
+import { GHL_NOTIFICATION_CONTRACT, parseGhlRecipient } from "../lib/notification-ghl-contract";
 
 const TAG = "[catchup]";
 const WANTS_SEND = process.argv.includes("--send");
+const argOf = (flag: string): string | null => {
+  const at = process.argv.indexOf(flag);
+  return at >= 0 && process.argv[at + 1] && !process.argv[at + 1].startsWith("--") ? process.argv[at + 1] : null;
+};
+const PREPARE_TO = argOf("--prepare");
+const MANIFEST_FROM = argOf("--manifest");
+const APPROVE_SHA = argOf("--approve");
+const ACCOUNT_ID = "flexx";
+const last4 = (value: string) => value.replace(/[^A-Za-z0-9]/g, "").slice(-4);
 
 /** Excluded by the owner, by name. Written here so the list is auditable. */
 const EXCLUDED_NAMES = ["Paula Rose", "Sherrie Woods"] as const;
@@ -154,12 +185,205 @@ async function main(): Promise<void> {
     });
   }
 
-  // No dependencies are supplied, so `--send` holds rather than sends. Wiring a
-  // real one means handing `runCatchup` reviewed senders, a consent reader and
-  // a dispatch IO - deliberately a deployment's job, not this script's.
-  const report = await runCatchup({
-    recipients, sendDate, mode: WANTS_SEND ? "send" : "plan",
+  const locationId = process.env.GHL_LOCATION_ID?.trim();
+  const credential = process.env.GHL_API_KEY?.trim();
+  const scope = { accountId: ACCOUNT_ID, locationId: locationId ?? "" };
+
+  /** Consent, read LIVE per contact and channel. Never cached across phases. */
+  const readRecipient = async (contactId: string, channel: "sms" | "email") => {
+    const response = await fetch(`${GHL_NOTIFICATION_CONTRACT.baseUrl}/contacts/${encodeURIComponent(contactId)}`, {
+      headers: {
+        Authorization: `Bearer ${credential}`, Version: GHL_NOTIFICATION_CONTRACT.version,
+        Accept: "application/json",
+      },
+      redirect: "error",
+    });
+    const body = await response.json() as { contact?: { phone?: string; email?: string } };
+    const destination = channel === "sms" ? body?.contact?.phone : body?.contact?.email;
+    return parseGhlRecipient({
+      version: GHL_NOTIFICATION_CONTRACT.version, body,
+      expected: {
+        accountId: ACCOUNT_ID, locationId: locationId as string, contactId, channel,
+        destination: destination ?? "",
+      },
+    });
+  };
+
+  const senderContext = (
+    senders: ReturnType<typeof catchupPreparationSenders>,
+    channel: "sms" | "email",
+    recipient: Awaited<ReturnType<typeof readRecipient>>,
+  ) => ({
+    accountId: ACCOUNT_ID, locationId,
+    senderReview: channel === "sms" ? senders.sms.senderReview : senders.email.senderReview,
+    review: channel === "sms" ? senders.sms.review : senders.email.review,
+    recipient, scheduledOn: sendDate,
+    ...(channel === "sms" ? { smsReceiptSuffixPolicy: senders.sms.smsReceiptSuffixPolicy } : {}),
   });
+
+  // ============================ PREPARE ============================
+  if (PREPARE_TO) {
+    if (!locationId || !credential) throw new Error("GHL_LOCATION_ID and GHL_API_KEY are required to read consent");
+    const plan = planCatchupRun(recipients, sendDate);
+    const prep = catchupPreparationSenders(scope);
+    const entries: CatchupAttestation[] = [];
+    const skipped: string[] = [];
+
+    for (const action of plan.actions) {
+      if (action.state !== "send") continue;
+      for (const send of action.sends) {
+        const channel = send.channel as "sms" | "email";
+        let recipient: Awaited<ReturnType<typeof readRecipient>>;
+        try { recipient = await readRecipient(action.contactId, channel); }
+        catch { skipped.push(`${action.clientName} ${channel}: consent read failed`); continue; }
+        const constructed = constructCatchupRequest(action, send, senderContext(prep, channel, recipient) as never);
+        if (!constructed.request) {
+          skipped.push(`${action.clientName} ${channel}: ${constructed.reasons.join("; ")}`);
+          continue;
+        }
+        entries.push({
+          requestSha256: catchupRequestSha256(constructed.request.serializedBody),
+          channel, clientName: action.clientName,
+          invoiceNumbers: action.covers,
+          balanceMinorTotal: send.reservations.reduce((total, row) => total + row.balanceMinor, 0),
+          daysPastDue: send.reservations.map(row => row.dayPastDue),
+          destinationLast4: last4(send.destination),
+          subject: channel === "email" ? action.subject : null,
+          body: action.body,
+        });
+      }
+    }
+
+    const manifest = buildCatchupManifest({
+      preparedAt: new Date().toISOString(), sendDate,
+      accountId: ACCOUNT_ID, locationId,
+      smsSender: CATCHUP_SMS_SENDER.number, emailSender: CATCHUP_EMAIL_SENDER.address,
+      entries,
+    });
+    writeFileSync(PREPARE_TO, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+
+    const totalMinor = entries.reduce((total, row) => total + row.balanceMinorTotal, 0);
+    console.log(`\n${TAG} ===== manifest written =====`);
+    console.log(`${TAG} file     = ${PREPARE_TO}`);
+    console.log(`${TAG} messages = ${manifest.entries.length}`);
+    console.log(`${TAG} total    = $${(totalMinor / 100).toFixed(2)}`
+      + ` across ${new Set(entries.flatMap(row => row.invoiceNumbers)).size} invoices`);
+    console.log(`${TAG} texts    = ${entries.filter(row => row.channel === "sms").length}`);
+    console.log(`${TAG} emails   = ${entries.filter(row => row.channel === "email").length}`);
+    for (const line of skipped) console.log(`${TAG} SKIP  ${line}`);
+    console.log(`\n${TAG} READ THE FILE, THEN APPROVE IT BY NAMING THIS HASH:`);
+    console.log(`${TAG}   ${manifest.manifestSha256}`);
+    console.log(`${TAG} nothing has been sent.`);
+    return;
+  }
+
+  // ============================ SEND ============================
+  if (WANTS_SEND) {
+    if (!MANIFEST_FROM || !APPROVE_SHA) {
+      console.log(`${TAG} HELD: --send needs --manifest <file> and --approve <manifestSha256>.`);
+      console.log(`${TAG} Run --prepare first, read the file, then approve its hash. Nothing sent.`);
+      return;
+    }
+    if (!locationId || !credential) throw new Error("GHL_LOCATION_ID and GHL_API_KEY are required to send");
+
+    const manifest = parseCatchupManifest(JSON.parse(readFileSync(MANIFEST_FROM, "utf8")));
+    const approval = approveCatchupManifest(manifest, APPROVE_SHA);
+    if (approval.state !== "approved" || !approval.approval) {
+      console.log(`${TAG} HELD: ${approval.reasons.join(", ")}. Nothing sent.`);
+      return;
+    }
+    const assembled = assembleCatchupSenders(approval.approval, scope);
+    if (assembled.state !== "assembled" || !assembled.senders) {
+      console.log(`${TAG} HELD: ${assembled.reasons.join(", ")}. Nothing sent.`);
+      return;
+    }
+    if (!assembled.emailSendingDomainVerified) {
+      console.log(`${TAG} NOTE: ${CATCHUP_EMAIL_SENDER.address} has no API-provable verified`);
+      console.log(`${TAG}       sending domain. Emails may bounce or land in spam. Texts unaffected.`);
+    }
+
+    const transportOptions = {
+      mode: CATCHUP_TRANSPORT_MODE, fetch: fetch as never, credential,
+      accountId: ACCOUNT_ID, locationId, scopes: [GHL_NOTIFICATION_CONTRACT.writeScope],
+      approval: approval.approval, now: () => new Date(),
+    };
+    const ready = catchupTransportReadiness(transportOptions);
+    if (!ready.ready) {
+      console.log(`${TAG} HELD: transport not ready - ${ready.missing.join(", ")}. Nothing sent.`);
+      return;
+    }
+    const transport = createCatchupTransport(transportOptions);
+
+    // PRE-FLIGHT, BEFORE ANY LEDGER ROW IS TAKEN. The ledger has no release, so
+    // a row reserved for a message the transport would then refuse is stuck for
+    // good. Every planned message must already be covered, or nothing runs.
+    const plan = planCatchupRun(recipients, sendDate);
+    const uncovered: string[] = [];
+    for (const action of plan.actions) {
+      if (action.state !== "send") continue;
+      for (const send of action.sends) {
+        const channel = send.channel as "sms" | "email";
+        const recipient = await readRecipient(action.contactId, channel);
+        const constructed = constructCatchupRequest(
+          action, send, senderContext(assembled.senders, channel, recipient) as never);
+        if (!constructed.request || !transport.covers(constructed.request)) {
+          uncovered.push(`${action.clientName} ${channel}`
+            + (constructed.request ? " (not in the approved manifest)" : ` (${constructed.reasons.join("; ")})`));
+        }
+      }
+    }
+    if (uncovered.length) {
+      console.log(`${TAG} HELD: ${uncovered.length} planned message(s) are not covered by the approval:`);
+      for (const line of uncovered) console.log(`${TAG}   ${line}`);
+      console.log(`${TAG} The data moved since the manifest was prepared. Re-run --prepare,`);
+      console.log(`${TAG} read the new file and approve the new hash. NOTHING WAS SENT.`);
+      return;
+    }
+
+    const { prisma: db } = await import("../lib/prisma");
+    const sent = await runCatchup({
+      recipients, sendDate, mode: "send",
+      dependencies: {
+        io: {
+          ledger: createPrismaNotificationLedger(db as never),
+          confirmStillDue: async (invoiceId: string) => {
+            const data = await jobberQuery<{ invoice?: { invoiceStatus?: string;
+              amounts?: { invoiceBalance?: number }; dueDate?: string } }>(
+              "query($id:EncodedId!){ invoice(id:$id){ invoiceStatus dueDate amounts { invoiceBalance } } }",
+              { id: invoiceId });
+            const invoice = data?.invoice;
+            const balanceMinor = typeof invoice?.amounts?.invoiceBalance === "number"
+              ? Math.round(invoice.amounts.invoiceBalance * 100) : null;
+            const dueOn = invoice?.dueDate ? invoiceCalendarDate(new Date(invoice.dueDate)) : null;
+            return {
+              stillOpen: Boolean(invoice) && (balanceMinor ?? 0) > 0,
+              balanceMinor,
+              dayPastDue: dueOn ? dayNumber(sendDate) - dayNumber(dueOn) : null,
+            };
+          },
+          attemptSend: transport.attemptSend,
+        },
+        readRecipient,
+        senders: assembled.senders,
+      },
+    });
+
+    console.log(`\n${TAG} ===== outcome =====`);
+    console.log(`${TAG} state = ${sent.state}`
+      + (sent.reasons.length ? `  reasons = ${sent.reasons.join(", ")}` : ""));
+    console.log(`${TAG} ${JSON.stringify(sent.summary)}`);
+    for (const row of sent.results) {
+      console.log(`${TAG} ${String(row.clientName).padEnd(24)} #${row.invoiceNumbers.join(",#").padEnd(14)}`
+        + ` ${row.outcome.state}`
+        + ("reasons" in row.outcome && row.outcome.reasons.length ? `  [${row.outcome.reasons.join("; ")}]` : ""));
+    }
+    console.log(`${TAG} attempted = ${transport.attempted.length}`);
+    for (const row of transport.refused) console.log(`${TAG} REFUSED ${row.reason}`);
+    return;
+  }
+
+  // ============================ PLAN ============================
+  const report = await runCatchup({ recipients, sendDate, mode: "plan" });
 
   console.log(`\n${TAG} ===== plan =====`);
   console.log(`${TAG} ${JSON.stringify(report.summary)}`);

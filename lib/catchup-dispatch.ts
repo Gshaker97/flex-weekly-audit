@@ -46,7 +46,8 @@ import type { CatchupAction, CatchupChannel, CatchupSend } from "./catchup-plan"
 import { CATCHUP_SMS_SUFFIX, catchupSmsReceiptBody } from "./catchup-copy";
 import {
   buildGhlMessageRequest, parseGhlAcceptance,
-  type GhlConstructionReview, type GhlHttpObservation, type GhlRecipientResult,
+  type GhlConstructionResult, type GhlConstructionReview, type GhlHttpObservation,
+  type GhlRecipientResult,
   type GhlRequestDescriptor, type GhlSenderReview,
 } from "./notification-ghl-contract";
 import {
@@ -101,6 +102,69 @@ const sorted = (values: readonly string[]) => Object.freeze([...new Set(values)]
  * Called twice per recipient - once for the text, once for the email - because
  * the ledger keys on channel and the two halves are two reservations each.
  */
+/**
+ * The construction step on its own, exported so NOTHING ELSE HAS TO REBUILD IT.
+ *
+ * The approval manifest must name the byte-exact request that will later be
+ * posted, which means the manifest and the sender have to construct through one
+ * code path. Two paths would eventually disagree, and a disagreement here is a
+ * message a person approved in one form and a customer received in another.
+ *
+ * Sends nothing, reads nothing, reserves nothing. `buildGhlMessageRequest`
+ * returns a descriptor that deliberately carries no credential and no place to
+ * put one, so a constructed request is still not a sent one.
+ */
+export type CatchupConstruction = Readonly<{
+  state: "constructed" | "refused";
+  construction: GhlConstructionResult | null;
+  request: GhlRequestDescriptor | null;
+  bodyHash: string;
+  reasons: readonly string[];
+}>;
+
+export function constructCatchupRequest(
+  action: CatchupAction, send: CatchupSend, context: CatchupSendContext,
+): CatchupConstruction {
+  const channel = send?.channel;
+  const no = (...reasons: string[]): CatchupConstruction => Object.freeze({
+    state: "refused", construction: null, request: null, bodyHash: "", reasons: sorted(reasons) });
+  if (!action || action.state !== "send") return no("action_is_not_a_send");
+  if (channel !== "sms" && channel !== "email") return no("channel_is_not_a_catchup_channel");
+  if (!send.reservations?.length) return no("no_reservations_planned");
+
+  const bodyHash = notificationBodyDigest(action.body);
+  const built = buildGhlMessageRequest({
+    binding: {
+      accountId: context.accountId, locationId: context.locationId,
+      // One binding serves every invoice in this message; the ledger rows carry
+      // the per-invoice identity. The FIRST reservation's key is the binding's,
+      // so a binding can never name an invoice this message does not cover.
+      eventKey: send.reservations[0].eventKey,
+      invoiceId: send.reservations[0].invoiceId,
+      contactId: action.contactId, channel,
+      sender: context.senderReview?.sender, destination: send.destination,
+      bodyHash,
+    },
+    recipient: context.recipient,
+    senderReview: context.senderReview,
+    review: context.review,
+    body: action.body,
+    contentType: "text/plain",
+    ...(channel === "email" ? { subject: action.subject } : {}),
+    ...(channel === "sms" ? { smsReceiptSuffixPolicy: context.smsReceiptSuffixPolicy } : {}),
+  } as never);
+  if (!built.request) return no(...(built.reasons ?? ["request_could_not_be_constructed"]));
+
+  // The text must carry the opt-out line, and the contract's own suffix policy
+  // is the only sanctioned way to add it. Prove it is actually in play.
+  if (channel === "sms") {
+    const receipt = catchupSmsReceiptBody(action.body);
+    if (!receipt || !receipt.endsWith(CATCHUP_SMS_SUFFIX)) return no("sms_opt_out_line_unavailable");
+  }
+  return Object.freeze({ state: "constructed", construction: built,
+    request: built.request, bodyHash, reasons: Object.freeze([]) });
+}
+
 export async function dispatchCatchupSend(
   action: Extract<CatchupAction, { state: "send" }>,
   send: CatchupSend,
@@ -132,35 +196,10 @@ export async function dispatchCatchupSend(
   // 1. The request is built through the pinned contract, which refuses anything
   //    the consent read or the sender review does not allow. Built BEFORE the
   //    live look so a construction failure costs nothing.
-  const bodyHash = notificationBodyDigest(action.body);
-  const built = buildGhlMessageRequest({
-    binding: {
-      accountId: context.accountId, locationId: context.locationId,
-      // One binding serves every invoice in this message; the ledger rows carry
-      // the per-invoice identity. The FIRST reservation's key is the binding's,
-      // so a binding can never name an invoice this message does not cover.
-      eventKey: send.reservations[0].eventKey,
-      invoiceId: send.reservations[0].invoiceId,
-      contactId: action.contactId, channel,
-      sender: context.senderReview?.sender, destination: send.destination,
-      bodyHash,
-    },
-    recipient: context.recipient,
-    senderReview: context.senderReview,
-    review: context.review,
-    body: action.body,
-    contentType: "text/plain",
-    ...(channel === "email" ? { subject: action.subject } : {}),
-    ...(channel === "sms" ? { smsReceiptSuffixPolicy: context.smsReceiptSuffixPolicy } : {}),
-  } as never);
-  if (!built.request) return refuse(...(built.reasons ?? ["request_could_not_be_constructed"]));
-
-  // The text must carry the opt-out line, and the contract's own suffix policy
-  // is the only sanctioned way to add it. Prove it is actually in play.
-  if (channel === "sms") {
-    const receipt = catchupSmsReceiptBody(action.body);
-    if (!receipt || !receipt.endsWith(CATCHUP_SMS_SUFFIX)) return refuse("sms_opt_out_line_unavailable");
-  }
+  const constructed = constructCatchupRequest(action, send, context);
+  if (!constructed.request || !constructed.construction) return refuse(...constructed.reasons);
+  const bodyHash = constructed.bodyHash;
+  const built = constructed.construction;
 
   // 2. The last live look, once per invoice. Any disagreement stops everything.
   for (const row of send.reservations) {
@@ -216,7 +255,7 @@ export async function dispatchCatchupSend(
   // 5. Exactly one attempt. Never retried, whatever comes back.
   let observation: GhlHttpObservation;
   try {
-    observation = await io.attemptSend(built.request);
+    observation = await io.attemptSend(constructed.request);
   } catch {
     // A thrown attempt is an outcome, not a reason to try again. An observation
     // the parser cannot accept is exactly the right shape for "we do not know".
