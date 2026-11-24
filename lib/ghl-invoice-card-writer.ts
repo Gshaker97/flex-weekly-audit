@@ -159,7 +159,21 @@ export type InvoiceCardWriteGate =
  * Overdue move happens. There is no default, no inference from an empty value,
  * and no "it was probably off" - the whole point is that somebody looked.
  */
-export function legacySendingFromEnv(env: Record<string, string | undefined> = process.env): LegacySendingEvidence | null {
+export function legacySendingFromEnv(
+  env: Record<string, string | undefined> = process.env,
+  /**
+   * The run's own clock reading, threaded in BY THE CALLER.
+   *
+   * It must be the same `Date` the gate will check this evidence against.
+   * `legacySendingIsOff` rejects evidence observed after its `now` - a check
+   * from the future is a clock problem - and a caller that captures `now`,
+   * does a sync's worth of work, and only then reads the environment would
+   * otherwise stamp `observedAt` minutes LATER than that `now`. The evidence
+   * would be refused on every run, and the Overdue move withheld silently.
+   * `lib/sync.ts` is exactly that caller.
+   */
+  now: Date = new Date(),
+): LegacySendingEvidence | null {
   const workflowId = env.GHL_LEGACY_INVOICE_WORKFLOW_ID?.trim();
   const raw = env.GHL_LEGACY_SENDING_DISABLED?.trim();
   if (!workflowId || !raw) return null;
@@ -170,9 +184,9 @@ export function legacySendingFromEnv(env: Record<string, string | undefined> = p
   // A date that is not a real day, or is in the future, is a mistake not a fact.
   const parsed = new Date(`${day}T00:00:00Z`);
   if (!Number.isFinite(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== day) return null;
-  if (parsed.getTime() > Date.now()) return null;
+  if (parsed.getTime() > now.getTime()) return null;
   return Object.freeze({ source: "operator-confirmed-workflow-sending-disabled",
-    workflowId, disabledOn: day, observedAt: new Date().toISOString(), evidenceRef });
+    workflowId, disabledOn: day, observedAt: now.toISOString(), evidenceRef });
 }
 
 /**
@@ -180,7 +194,11 @@ export function legacySendingFromEnv(env: Record<string, string | undefined> = p
  * `GHL_INVOICE_WRITE_MODE` on purpose: turning the per-customer sync to `sync`
  * must not turn this on, and turning this on must not turn that on.
  */
-export function invoiceCardWriteGate(env: Record<string, string | undefined> = process.env): InvoiceCardWriteGate {
+export function invoiceCardWriteGate(
+  env: Record<string, string | undefined> = process.env,
+  /** One clock reading for the whole decision; see `legacySendingFromEnv`. */
+  now: Date = new Date(),
+): InvoiceCardWriteGate {
   if (env.GHL_PER_INVOICE_CARD_WRITES_ENABLED !== "true") return Object.freeze({ open: false, reason: "per_invoice_card_writes_not_enabled" });
   const approvalId = env.GHL_WRITE_APPROVAL_ID;
   if (!approvalId || !/^[A-Za-z0-9._:-]{1,128}$/.test(approvalId)) return Object.freeze({ open: false, reason: "write_approval_id_missing_or_malformed" });
@@ -198,7 +216,8 @@ export function invoiceCardWriteGate(env: Record<string, string | undefined> = p
   // opt-in because phase one deliberately ignores settled invoices; Overdue is
   // opt-in because it is the stage change the legacy workflow sends on.
   return Object.freeze({ open: true, approvalId, budget, allow: Object.freeze({
-    overdueMoves: legacySendingIsOff(legacySendingFromEnv(env), env.GHL_LEGACY_INVOICE_WORKFLOW_ID?.trim() ?? ""),
+    overdueMoves: legacySendingIsOff(
+      legacySendingFromEnv(env, now), env.GHL_LEGACY_INVOICE_WORKFLOW_ID?.trim() ?? "", now),
     paidExits: env.GHL_PER_INVOICE_PAID_EXITS_ENABLED === "true",
   }) });
 }
