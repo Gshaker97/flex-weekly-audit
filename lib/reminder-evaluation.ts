@@ -154,6 +154,15 @@ export interface ReminderEvaluationReaders {
     context?: {
       issuedDate: string | null;
       /**
+       * This invoice's due date, so a legacy message that states only how many
+       * days past due it was ("your invoice is 10 days past due") can be tied
+       * to the invoice it is actually about. Those texts name no invoice number
+       * and no amount, so the day count is the only thing in them that
+       * identifies an invoice. null leaves every such message ambiguous, which
+       * holds.
+       */
+      dueDate?: string | null;
+      /**
        * The contact the evaluation settled on, when several matched the email
        * or phone and the Jobber property address resolved which one. Without
        * it the reader cannot read a history at all for those rows, because it
@@ -677,7 +686,7 @@ export async function evaluateReminders(input: {
 
     const history = readers.sendHistory
       ? await readers.sendHistory(candidate,
-          { issuedDate: source.issuedDate, contactId: soleContactId })
+          { issuedDate: source.issuedDate, dueDate: source.dueDate, contactId: soleContactId })
       : null;
     if (!history) {
       holds.push("send_history_unavailable: cannot prove this milestone was not already sent");

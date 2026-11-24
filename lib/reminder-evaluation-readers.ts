@@ -1,6 +1,8 @@
 import { jobberGraphQL } from "./jobber";
 import { readLinkedJobText, type LinkedJobsResult } from "./reminder-job-notes-source";
 import { priorSendRelevance } from "./reminder-prior-send-window";
+import { matchMessageToInvoice, statedDueDates } from "./reminder-prior-send-milestone";
+import { withGhlReadRetry } from "./ghl-read-retry";
 import { findExactContactMatches, getInvoicePipelineRefs, getOutboundMessages, searchOpportunities } from "./ghl";
 import type {
   DestinationCard, DestinationContact, PriorSend, ReminderCandidate,
@@ -23,6 +25,68 @@ function cents(value: unknown): number | null {
   const rounded = Math.round(value * 100);
   return Number.isSafeInteger(rounded) && Math.abs(value * 100 - rounded) < 0.000001 ? rounded : null;
 }
+/** Does this body quote an invoice number at all? */
+const ANY_INVOICE_NUMBER = /#\s?\d{3,6}|invoice\s+#?\s?\d{3,6}/i;
+
+/**
+ * Which invoice one past message belongs to, and at which ladder rung.
+ *
+ * EXPORTED so the rule lives in exactly one place. It used to be inline in
+ * `sendHistory`, with the test re-stating it, which let the two drift.
+ *
+ * The order of the checks is the order of how strong the evidence is:
+ *  1. the body names THIS invoice's number           -> exact, however old
+ *  2. the body names SOME OTHER invoice's number     -> other invoice
+ *  3. the body states how many days past due it was, and that day count
+ *     lands on this invoice's due date               -> exact, at that rung
+ *  4. ... and it lands on some other due date        -> other invoice
+ *  5. the message predates this invoice's issue day  -> predates_invoice
+ *     (which still HOLDS unless the evaluator is asked to dismiss it)
+ *  6. nothing decides it                             -> ambiguous, holds
+ *
+ * Step 3 is what makes Flexx's legacy reminders readable at all: they carry no
+ * invoice number and no amount, so the day count is the only identifying thing
+ * in them. It is checked BEFORE the date rule because it says which invoice a
+ * message IS about, where the date rule only says which it cannot be.
+ */
+export function classifyPriorSend(input: Readonly<{
+  body: string;
+  sentAt: Date | null;
+  invoiceNumber: string | null | undefined;
+  issuedDate: string | null;
+  dueDate: string | null;
+  corroboratingDueDates?: readonly string[];
+}>): { attribution: PriorSend["attribution"]; milestoneDay: number | null } {
+  const mine = input.invoiceNumber?.trim() ?? "";
+  const namesMine = mine
+    ? new RegExp(`(?:^|[^0-9])${mine}(?:[^0-9]|$)`).test(input.body)
+    : false;
+  if (namesMine) return { attribution: "exact", milestoneDay: null };
+  if (ANY_INVOICE_NUMBER.test(input.body)) return { attribution: "other_invoice", milestoneDay: null };
+
+  // Unnumbered from here on, so the day count in the body is worth reading.
+  const byDay = matchMessageToInvoice({
+    body: input.body, sentAt: input.sentAt, invoiceDueDate: input.dueDate,
+    corroboratingDueDates: input.corroboratingDueDates,
+  });
+  if (byDay.outcome === "this_invoice") {
+    // The rung comes from the message's own text, so the evaluator can tell
+    // which milestone it closes instead of holding on `send_detail_unknown`.
+    return { attribution: "exact", milestoneDay: byDay.dayPastDue };
+  }
+  if (byDay.outcome === "other_invoice") return { attribution: "other_invoice", milestoneDay: null };
+
+  const predates = priorSendRelevance(input.sentAt, input.issuedDate) === "predates_invoice";
+  return { attribution: predates ? "predates_invoice" : "ambiguous", milestoneDay: null };
+}
+
+/** A survived GoHighLevel blip is worth a line; it is not a failure. */
+function logGhlRetry(detail: { label: string; attempt: number; error: unknown }): void {
+  const message = String((detail.error as { message?: unknown })?.message ?? detail.error);
+  console.log(`[reminder-readers] retrying ${detail.label} after attempt ${detail.attempt}: ` +
+    message.slice(0, 200));
+}
+
 function labelList(nodes: unknown, key: string): string[] | null {
   if (!Array.isArray(nodes)) return null;
   return nodes
@@ -132,9 +196,15 @@ export function createReminderEvaluationReaders(): ReminderEvaluationReaders {
      */
     async sendHistory(
       candidate: ReminderCandidate,
-      context?: { issuedDate: string | null; contactId?: string | null },
+      context?: { issuedDate: string | null; dueDate?: string | null; contactId?: string | null },
     ): Promise<SendHistory | null> {
-      const contacts = await findExactContactMatches({ email: candidate.email, phone: candidate.phone });
+      // Both reads are retried on answer-less failures only (timeout, 5xx), so
+      // one GoHighLevel blip does not end the run. A final failure still throws
+      // and the caller holds; it never becomes an empty history.
+      const contacts = await withGhlReadRetry(
+        `contacts for #${candidate.invoiceNumber ?? candidate.jobberInvoiceId}`,
+        () => findExactContactMatches({ email: candidate.email, phone: candidate.phone }),
+        { onRetry: logGhlRetry });
       // One exact contact, or the one the evaluation resolved by matching the
       // Jobber property address when several shared an email or phone. The id
       // is VERIFIED against the exact matches rather than trusted, so a stale
@@ -150,30 +220,29 @@ export function createReminderEvaluationReaders(): ReminderEvaluationReaders {
           (contacts.length > 1 && resolved.length !== 1 ? " and none was resolved by address" : ""),
           sends: [] };
       }
-      const history = await getOutboundMessages(resolved[0].id);
-      const mine = candidate.invoiceNumber?.trim() ?? "";
-      const minePattern = mine ? new RegExp(`(?:^|[^0-9])${mine}(?:[^0-9]|$)`) : null;
-      const anyInvoiceNumber = /#\s?\d{3,6}|invoice\s+#?\s?\d{3,6}/i;
-
-      const issuedDate = context?.issuedDate ?? null;
+      const history = await withGhlReadRetry(
+        `messages for #${candidate.invoiceNumber ?? candidate.jobberInvoiceId}`,
+        () => getOutboundMessages(resolved[0].id),
+        { onRetry: logGhlRetry });
+      // Due dates named outright by messages that state their own day count.
+      // They are what lets the 3% fee template - which states no day count -
+      // be dismissed on corroborated evidence rather than on an assumption.
+      const corroboratingDueDates = statedDueDates(
+        history.messages.map(message => ({ body: message.body, sentAt: message.dateAdded })));
 
       const sends: PriorSend[] = history.messages.map(message => {
-        const namesMine = minePattern ? minePattern.test(message.body) : false;
-        const namesSome = anyInvoiceNumber.test(message.body);
-        // Only an UNNUMBERED message is ever dated against the invoice. A
-        // message naming this invoice stays "exact" however old it is.
-        const unnumbered = !namesMine && !namesSome;
-        const predates = unnumbered &&
-          priorSendRelevance(message.dateAdded, issuedDate) === "predates_invoice";
-        const attribution: PriorSend["attribution"] =
-          namesMine ? "exact"
-          : namesSome ? "other_invoice"
-          : predates ? "predates_invoice"
-          : "ambiguous";
+        const { attribution, milestoneDay } = classifyPriorSend({
+          body: message.body,
+          sentAt: message.dateAdded,
+          invoiceNumber: candidate.invoiceNumber,
+          issuedDate: context?.issuedDate ?? null,
+          dueDate: context?.dueDate ?? null,
+          corroboratingDueDates,
+        });
         return {
           messageId: message.id,
           channel: message.channel,
-          milestoneDay: null,
+          milestoneDay,
           attribution,
           // A message present in the conversation log did go out. An attempt
           // that failed or is still queued does not appear as outbound here;
