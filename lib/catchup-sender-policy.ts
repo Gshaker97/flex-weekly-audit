@@ -60,16 +60,27 @@ export const CATCHUP_EMAIL_ONLY_EXCEPTIONS = Object.freeze({
     evidenceRef: "Jobber client.phones empty 2026-11-24; GHL contact has no phone",
   }),
   /**
-   * Jobber HAS a phone for Brian Carey, but his GHL contact does not, and the
+   * RESOLVED 2026-11-24, AND KEPT ANYWAY AS A FALLBACK.
+   *
+   * Jobber had a phone for Brian Carey but his GHL contact did not, and the
    * send contract requires the destination to be an exact association of the
-   * contact (`destination_not_exact_contact_association`). Texting him means
-   * first copying that number onto his GHL contact, which is a CRM write
-   * nobody has authorized. Until then, email only.
+   * contact (`destination_not_exact_contact_association`), so he was email
+   * only. The owner then approved a single CRM write and the number was copied
+   * onto his GHL contact (one field, verified before and after, nothing else
+   * touched). He now plans as an ordinary both-channel recipient.
+   *
+   * This entry stays because it costs nothing and protects something: the
+   * exception only applies when the contact has NO phone
+   * (`emailOnly = !phone && catchupIsEmailOnly(...)`). So with the number in
+   * place it is inert, and if that number were ever removed from the contact
+   * again he would fall back to email only rather than holding entirely and
+   * going unmessaged.
    */
   "7299": Object.freeze({
     clientName: "Brian Carey",
     reason: "jobber_has_a_phone_but_the_ghl_contact_does_not" as const,
-    evidenceRef: "Jobber client.phones has 1 primary number 2026-11-24; GHL contact has none",
+    evidenceRef: "Jobber client.phones had 1 primary number 2026-11-24; "
+      + "copied onto the GHL contact by approved write 2026-11-24, exception now inert",
   }),
 } as const);
 
