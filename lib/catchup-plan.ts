@@ -71,6 +71,13 @@ export type CatchupSend = Readonly<{
     invoiceNumber: string;
     dayPastDue: number;
     dueOn: string;
+    /**
+     * The balance the MESSAGE states, carried so the dispatcher's live look can
+     * prove the figure is still true. Without it the last look could only ask
+     * "is anything still owed", and a customer who part-paid would be told a
+     * number that had already moved.
+     */
+    balanceMinor: number;
     eventKey: string;
   }>[];
 }>;
@@ -198,6 +205,7 @@ export function planCatchupRecipient(
         invoiceNumber: invoice.invoiceNumber,
         dayPastDue: when.dayPastDue,
         dueOn: when.dueOn,
+        balanceMinor: invoice.balanceMinor,
         eventKey: eventKey({
           accountId: input.accountId, invoiceId: invoice.invoiceId,
           dayPastDue: when.dayPastDue, audience: "homeowner", channel,

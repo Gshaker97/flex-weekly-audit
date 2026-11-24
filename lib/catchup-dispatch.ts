@@ -173,6 +173,10 @@ export async function dispatchCatchupSend(
     if (!live || live.stillOpen !== true) return refuse("invoice_no_longer_open");
     if (typeof live.balanceMinor !== "number" || live.balanceMinor <= 0) return refuse("invoice_no_longer_owes");
     if (live.dayPastDue !== row.dayPastDue) return refuse("day_past_due_changed_since_planning");
+    // The message states a dollar figure. "Still owes something" is not the same
+    // promise as "still owes THIS", and a part payment between planning and
+    // sending would otherwise go out as a wrong number in the customer's hand.
+    if (live.balanceMinor !== row.balanceMinor) return refuse("balance_changed_since_planning");
   }
 
   // 3. Reserve EVERY row before anything is sent.
