@@ -309,3 +309,127 @@ test("structural refusals: no reservations, a bad channel, a non-send action", a
     context("sms") as never, io());
   assert.equal(held.state, "refused");
 });
+
+// ---------------------------------------------------------------------------
+// THE REAL LEDGER, NOT A PERMISSIVE FAKE.
+//
+// The fake above answers `markPending` with true whether or not the claim was
+// ever asserted. The real ledger does not: `markPending` only accepts a handle
+// it has verified, so a dispatcher that skips `assertReserved` strands every
+// row in "reserved" and sends nothing. That is what happened in production on
+// 2026-11-24 - 31 rows claimed, 31 refused at pending, no message sent - and
+// no test here could see it, because no test used the real phase machine.
+// ---------------------------------------------------------------------------
+
+type Row = Record<string, unknown> & { id: string; state: string };
+
+/** An in-memory stand-in for the three unique indexes and the state column. */
+function memoryLedgerDatabase() {
+  const rows: Row[] = [];
+  const statements: string[] = [];
+  const key = (r: Row) => String(r.eventKey);
+  const perInvoice = (r: Row) => [r.accountId, r.invoiceId, r.dayPastDue, r.audience, r.channel].join("|");
+  const perContact = (r: Row) => [r.accountId, r.contactId, r.scheduledOn, r.channel].join("|");
+  const find = (p: readonly unknown[]) => rows.find(r => r.id === p[0] && r.reservationToken === p[1]
+    && r.eventHash === p[2] && r.bodyHash === p[3] && r.destinationHash === p[4]);
+  return {
+    rows, statements,
+    database: {
+      async transaction<T>(work: (tx: { query: (s: string, p: readonly unknown[]) => Promise<Array<{ id: unknown }>> }) => Promise<T>): Promise<T> {
+        return work({
+          query: async (statement: string, p: readonly unknown[]) => {
+            statements.push(statement.split("\n")[0].trim());
+            if (statement.includes("notification-ledger:reserve")) {
+              const row: Row = { id: String(p[0]), reservationToken: p[1], eventKey: p[2], accountId: p[3],
+                invoiceId: p[4], dayPastDue: p[5], audience: p[6], contactId: p[7], scheduledOn: p[8],
+                channel: p[9], eventPayload: p[10], body: p[11], destination: p[12],
+                eventHash: p[13], bodyHash: p[14], destinationHash: p[15], state: "reserved" };
+              // ON CONFLICT DO NOTHING across all three unique indexes.
+              if (rows.some(r => key(r) === key(row) || perInvoice(r) === perInvoice(row) || perContact(r) === perContact(row))) {
+                return [];
+              }
+              rows.push(row);
+              return [{ id: row.id }];
+            }
+            if (statement.includes("notification-ledger:assert")) {
+              const row = find(p);
+              return row && row.state === "reserved" ? [{ id: row.id }] : [];
+            }
+            if (statement.includes("notification-ledger:pending")) {
+              const row = find(p);
+              if (!row || row.state !== "reserved") return [];
+              row.state = "pending";
+              return [{ id: row.id }];
+            }
+            if (statement.includes("notification-ledger:outcome")) {
+              const row = find(p);
+              if (!row || row.state !== "pending") return [];
+              row.state = String(p[5]);
+              return [{ id: row.id }];
+            }
+            throw new Error(`unexpected statement: ${statement}`);
+          },
+        });
+      },
+    },
+  };
+}
+
+test("AGAINST THE REAL LEDGER: the claim is asserted, marked pending, and sent once", async () => {
+  const { createNotificationLedger } = await import("../lib/notification-ledger");
+  const db = memoryLedgerDatabase();
+  const ledger = createNotificationLedger(db.database as never);
+  const action = planned();
+  const sent: unknown[] = [];
+
+  const result = await dispatchCatchupSend(action, action.sends[0], context("sms") as never,
+    io({ ledger: ledger as never, attemptSend: async (d: never) => { sent.push(d); return OK as never; } }));
+
+  assert.equal(result.state, "sent", JSON.stringify(result));
+  assert.equal(sent.length, 1, "exactly one attempt");
+  assert.equal(db.rows.length, 1);
+  assert.equal(db.rows[0].state, "accepted", "the row must reach a terminal state, not sit in reserved");
+
+  // The order matters: a pending that precedes its assertion is the bug.
+  const order = db.statements.map(s => s.replace(/^\/\* notification-ledger:(\w+).*$/, "$1"));
+  assert.deepEqual(order, ["reserve", "assert", "pending", "outcome"], order.join(" -> "));
+});
+
+test("AGAINST THE REAL LEDGER: one contact cannot take two rows for the same day and channel", async () => {
+  // The per-contact unique index is one message per contact, per day, per
+  // channel. A customer whose message covers TWO invoices needs two rows, and
+  // the second is refused - so an aggregated message cannot be recorded
+  // invoice by invoice. Documented here because it decides how multi-invoice
+  // customers must be handled, and it is not a bug in the index.
+  const { createNotificationLedger } = await import("../lib/notification-ledger");
+  const db = memoryLedgerDatabase();
+  const ledger = createNotificationLedger(db.database as never);
+
+  const two: CatchupRecipientInput = {
+    accountId: ACCOUNT, jobberClientId: "client-2", clientName: "Two Invoices",
+    contactId: CONTACT, exactContactMatches: 1, phone: PHONE, email: EMAIL,
+    smsOptedOut: false, emailOptedOut: false,
+    invoices: [
+      { invoiceId: "inv-a", invoiceNumber: "9001", balanceMinor: 5000, dueOn: "2026-11-17", payLink: LINK },
+      { invoiceId: "inv-b", invoiceNumber: "9002", balanceMinor: 6000, dueOn: "2026-11-16", payLink: LINK },
+    ],
+  };
+  const action = planCatchupRecipient(two, SEND_ON);
+  assert.equal(action.state, "send", JSON.stringify(action));
+  if (action.state !== "send") return;
+
+  const sent: unknown[] = [];
+  const live: Record<string, { stillOpen: boolean; balanceMinor: number; dayPastDue: number }> = {
+    "inv-a": { stillOpen: true, balanceMinor: 5000, dayPastDue: 7 },
+    "inv-b": { stillOpen: true, balanceMinor: 6000, dayPastDue: 8 },
+  };
+  const result = await dispatchCatchupSend(action, action.sends[0], context("sms") as never,
+    io({ ledger: ledger as never,
+      confirmStillDue: (async (id: string) => live[id]) as never,
+      attemptSend: async (d: never) => { sent.push(d); return OK as never; } }));
+
+  assert.equal(result.state, "incomplete", JSON.stringify(result));
+  assert.equal(sent.length, 0, "nothing may be sent when the claim cannot be fully recorded");
+  assert.ok(result.reasons.some(r => r.startsWith("reservation_already_claimed_for_")), result.reasons.join(","));
+  assert.equal(db.rows.length, 1, "the first invoice's row is taken and cannot be released");
+});

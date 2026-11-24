@@ -241,7 +241,25 @@ export async function dispatchCatchupSend(
     taken.push({ handle: result.reservation, invoiceNumber: row.invoiceNumber });
   }
 
-  // 4. Pending, so a crash mid-send cannot read as "never attempted".
+  // 4. Assert every claim before any of them is advanced.
+  //
+  // THIS STEP IS NOT OPTIONAL AND IS NOT A FORMALITY. `markPending` only
+  // accepts a handle the ledger has verified against the stored row, so
+  // without this the next loop refuses every message and leaves the whole set
+  // stranded in "reserved" - rows that are claimed, never sent, and that the
+  // ledger offers no way to release. That is exactly what happened on
+  // 2026-11-24: 31 reservations taken, 31 refused at pending, nothing sent.
+  for (const row of taken) {
+    if (!(await io.ledger.assertReserved(row.handle))) {
+      return Object.freeze({
+        state: "incomplete", channel,
+        reasons: sorted([`reservation_could_not_be_asserted_for_${row.invoiceNumber}`, "nothing_was_sent"]),
+        strandedInvoiceNumbers: Object.freeze(taken.map(t => t.invoiceNumber)),
+      });
+    }
+  }
+
+  // 5. Pending, so a crash mid-send cannot read as "never attempted".
   for (const row of taken) {
     if (!(await io.ledger.markPending(row.handle))) {
       return Object.freeze({
@@ -252,7 +270,7 @@ export async function dispatchCatchupSend(
     }
   }
 
-  // 5. Exactly one attempt. Never retried, whatever comes back.
+  // 6. Exactly one attempt. Never retried, whatever comes back.
   let observation: GhlHttpObservation;
   try {
     observation = await io.attemptSend(constructed.request);
