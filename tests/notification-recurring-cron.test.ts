@@ -175,7 +175,17 @@ test("actual sync has one awaited call after first normal token use and before a
   assert.ok(hook15 < source.indexOf("heavyFeeds = Promise.allSettled(["));
   assert.match(source.slice(hook15, hook15 + 110), /entrypoint: opts.entrypoint \?\? "http"/);
   const cron = readFileSync("scripts/sync-cron.ts", "utf8");
-  assert.match(cron, /await runFullSync\(\{ triggeredBy: "cron", entrypoint: "standalone_cron" \}\)/);
+  // Still exactly one awaited sync, still the standalone-cron entrypoint. The
+  // options are matched individually rather than as one literal line so that
+  // adding an option cannot silently drop either of these two.
+  assert.equal(cron.match(/await runFullSync\(/g)?.length, 1);
+  assert.match(cron, /await runFullSync\(\{[\s\S]{0,200}?triggeredBy: "cron",/);
+  assert.match(cron, /await runFullSync\(\{[\s\S]{0,200}?entrypoint: "standalone_cron",/);
+  // A killed process must give the run up, or the row stays `running` and
+  // admission refuses every later sync (see lib/sync-run-shutdown.ts).
+  assert.match(cron, /process\.on\(signal/);
+  assert.match(cron, /closeRunForShutdown\(active, signal\)/);
+  assert.match(cron, /onAdmitted: handle => \{ active = handle; \}/);
 });
 test("private deployment variable is bounded, immutable during run and needs no filesystem provisioning", () => {
   const source = readFileSync("lib/notification-recurring-cron-config.ts", "utf8");

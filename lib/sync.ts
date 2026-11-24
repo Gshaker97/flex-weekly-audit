@@ -5,6 +5,7 @@ import { readConfiguredStandingIdentityPolicy, readStandingIdentityInventory } f
 import { inspectReviewedIdentityInventory, reviewedIdentityOwnerEvidence } from "./ghl-identity-coverage";
 import { prisma } from "./prisma";
 import { latestCycleOwner, admitSyncRun, SyncEntrypoint, SyncRunWriter, SyncWriterBlockedError } from "./sync-writer-control";
+import type { AbandonableRun } from "./sync-run-shutdown";
 import { buildGhlWriteIntent, approvedGhlCards } from "./ghl-write-intent";
 import { verifyFreshGhlIdentity, readFreshJobberIdentities, strictGhlIdentityHold, validGhlContactIdentity } from "./ghl-write-identity";
 import { refreshOpenInvoiceStatuses } from "./open-invoice-status-refresh";
@@ -141,10 +142,27 @@ function isRecurringJob(j: JobberJobNode): boolean {
 }
 
 export async function runFullSync(
-  opts: { triggeredBy?: "manual" | "cron"; full?: boolean; entrypoint?: SyncEntrypoint } = {}
+  opts: {
+    triggeredBy?: "manual" | "cron"; full?: boolean; entrypoint?: SyncEntrypoint;
+    /**
+     * Called once, immediately after the run row exists, with a handle a
+     * process entrypoint can use to give the run up if the PROCESS is killed
+     * mid-run (see lib/sync-run-shutdown.ts). Never called when admission is
+     * refused, and never called more than once. Omitting it changes nothing:
+     * no handler is installed and the sync behaves exactly as before.
+     *
+     * `abandon` is `SyncRunWriter.finish("failed")`, so it REJECTS — after
+     * escalating the run to `blocked` — when any write intent is pending.
+     */
+    onAdmitted?: (handle: AbandonableRun) => void;
+  } = {}
 ) {
   const { run, since } = await admitSyncRun({ ...opts, entrypoint: opts.entrypoint ?? "http" });
   const writer = new SyncRunWriter(run.id);
+  opts.onAdmitted?.({
+    runId: run.id,
+    abandon: async (reason: string) => { await writer.finish("failed", reason); },
+  });
   let heavyFeeds: Promise<{ ok: true } | { ok: false; err: unknown }> | undefined;
   let recurringDay10Issue: string | null = null;
   let recurringDay15EmailIssue: string | null = null;
