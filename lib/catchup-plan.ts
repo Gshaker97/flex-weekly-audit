@@ -28,6 +28,7 @@
  * is not what was approved.
  */
 import { catchupBody, type CatchupInvoice } from "./catchup-copy";
+import { catchupEmailOnlyReasons, catchupIsEmailOnly } from "./catchup-sender-policy";
 import { addInvoiceCalendarDays, invoiceCalendarDate } from "./invoice-reminder-clock";
 import { eventKey } from "./notification-gate";
 
@@ -84,6 +85,9 @@ export type CatchupAction =
       subject: string;
       covers: readonly string[];
       sends: readonly CatchupSend[];
+      /** Present only for a named exception, with its reason. */
+      emailOnly?: true;
+      emailOnlyReasons?: readonly string[];
     }>
   | Readonly<{
       state: "hold";
@@ -145,8 +149,16 @@ export function planCatchupRecipient(
   // it would be a different thing from what was approved.
   if (input.smsOptedOut) return hold("contact_opted_out_of_sms");
   if (input.emailOptedOut) return hold("contact_opted_out_of_email");
-  if (!text(input.phone)) return hold("no_phone_on_contact");
+  // An email is required of everyone: it is the half both exceptions keep.
   if (!text(input.email)) return hold("no_email_on_contact");
+
+  // A missing phone holds EXCEPT for the two invoices named in the policy, who
+  // were checked against Jobber and approved one by one. The exception is read
+  // from the pinned list rather than inferred from the absence of a phone, so a
+  // contact record that merely happens to be thin still holds.
+  // `numbers` is the list built at the top of this function.
+  const emailOnly = !text(input.phone) && catchupIsEmailOnly(numbers);
+  if (!text(input.phone) && !emailOnly) return hold("no_phone_on_contact");
 
   const reasons: string[] = [];
   const invoices: CatchupInvoice[] = [];
@@ -173,10 +185,12 @@ export function planCatchupRecipient(
   const copy = catchupBody({ clientName: input.clientName, invoices });
   if (!copy) return hold("message_could_not_be_rendered_completely");
 
-  const destinations: Record<CatchupChannel, string> = { sms: input.phone, email: input.email };
-  const sends = CATCHUP_CHANNELS.map(channel => Object.freeze({
+  const destinations: Record<CatchupChannel, string | null> = { sms: input.phone, email: input.email };
+  // Email only for a named exception; otherwise both halves, or nothing.
+  const channels = emailOnly ? (["email"] as const) : CATCHUP_CHANNELS;
+  const sends = channels.map(channel => Object.freeze({
     channel,
-    destination: destinations[channel],
+    destination: destinations[channel] as string,
     reservations: Object.freeze(input.invoices.map(invoice => {
       const when = days.get(invoice.invoiceId)!;
       return Object.freeze({
@@ -196,6 +210,7 @@ export function planCatchupRecipient(
     state: "send", jobberClientId: input.jobberClientId, clientName: input.clientName,
     contactId: input.contactId, body: copy.body, subject: copy.subject,
     covers: copy.covers, sends: Object.freeze(sends),
+    ...(emailOnly ? { emailOnly: true as const, emailOnlyReasons: catchupEmailOnlyReasons(numbers) } : {}),
   });
 }
 
