@@ -117,11 +117,43 @@ test("asserting collections already happened is detected; warning is not", () =>
 });
 
 test("claims are read from the words, not taken on trust", () => {
-  assert.deepEqual([...ladderCopyClaims(DAY20_SMS_BODY)], ["recurring_late_fee_policy"]);
+  // A WARNING IS NOT A CLAIM. Days 20, 25 and the unverified Day 30 all quote
+  // the written policy - fees "may be" added, services "may be" suspended, the
+  // invoice "may be" sent to collections - and assert nothing about this
+  // invoice, so they claim nothing and need no evidence about the account.
+  // The detectors used to fire on the bare words "late fees" and "collections",
+  // which is how those days came to demand proof of what they never said.
+  assert.deepEqual([...ladderCopyClaims(DAY20_SMS_BODY)], []);
+  assert.deepEqual([...ladderCopyClaims(DAY25_SMS_BODY)], []);
+  assert.deepEqual([...ladderCopyClaims(DAY30_SMS_BODY_UNVERIFIED)], []);
+
+  // AN ASSERTION STILL IS A CLAIM. The asserted Day 30 body says services HAVE
+  // been suspended and the invoice WILL go to collections. Both are statements
+  // about this invoice, so both are claimed and both still need proof.
   assert.deepEqual([...ladderCopyClaims(DAY30_SMS_BODY_SUSPENDED)],
     ["service_suspended", "collections_after_day_35_policy"]);
-  assert.deepEqual([...ladderCopyClaims(DAY30_SMS_BODY_UNVERIFIED)],
+});
+
+test("the guard survives for copy that really does assert a fee or a referral", () => {
+  for (const body of [
+    "Late fees have been added to your invoice.",
+    "A late fee has been applied to this invoice.",
+    "Your balance will continue to incur late fees.",
+    "Late fees are now accruing on this invoice.",
+  ]) {
+    assert.deepEqual([...ladderCopyClaims(body)], ["recurring_late_fee_policy"], body);
+  }
+  assert.deepEqual([...ladderCopyClaims("The invoice will be sent to collections.")],
     ["collections_after_day_35_policy"]);
+
+  // And the warning form of each of those claims nothing.
+  for (const body of [
+    "Additional late fees may be added every 15 days.",
+    "The invoice may be sent to collections.",
+    "Services may be temporarily suspended until payment is received.",
+  ]) {
+    assert.deepEqual([...ladderCopyClaims(body)], [], body);
+  }
 });
 
 // ------------------------------------------------------------------- day 30

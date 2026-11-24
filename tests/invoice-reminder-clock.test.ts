@@ -107,8 +107,14 @@ test("irrigation has only two homeowner texts and day21 internal prompt", () => 
 
 test("fee and suspension assertions are evidence requirements, not performed actions", () => {
   const steps = invoiceReminderMilestones("maintenance", "2026-11-01", "2026-11-08", new Date("2026-11-09T12:00:00Z"))!;
+  // Day 15 still demands proof: its copy states the 3% fee as applied.
   assert.deepEqual(steps.find(s => s.dayPastDue === 15)?.requiredFacts, ["three_percent_fee_applied"]);
-  assert.deepEqual(steps.find(s => s.dayPastDue === 30)?.requiredFacts, ["service_suspended", "collections_after_day_35_policy"]);
+  // Days 20, 25 and 30 require nothing, because their copy only WARNS. The
+  // guard lives in `ladderCopyClaims`, which reads the words that will really
+  // be sent, so an asserting Day 30 body is still held for evidence.
+  for (const day of [20, 25, 30]) {
+    assert.deepEqual(steps.find(s => s.dayPastDue === day)?.requiredFacts, [], `day ${day}`);
+  }
   assert.equal(steps.some(s => "send" in s || "charge" in s || "suspend" in s), false);
 });
 

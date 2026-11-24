@@ -57,10 +57,20 @@ const milestones: Record<InvoiceReminderCategory, readonly ReminderMilestone[]> 
   maintenance: [
     { dayPastDue: 10, audience: "homeowner", requiredFacts: [] },
     { dayPastDue: 15, audience: "homeowner", requiredFacts: ["three_percent_fee_applied"] },
-    { dayPastDue: 20, audience: "homeowner", requiredFacts: ["recurring_late_fee_policy"] },
+    // Days 20, 25 and 30 require no facts. Their copy only WARNS - fees "may be
+    // added", services "may be" suspended, the invoice "may be" sent to
+    // collections - which quotes the written policy and states nothing about
+    // this invoice. Cleared 2026-11-24 on the owner's instruction. The guard is
+    // not gone: `ladderCopyClaims` still reads the words that will actually be
+    // sent, so copy that ASSERTS a fee, a suspension or a referral claims it and
+    // must still prove it. In particular DAY30_SMS_BODY_SUSPENDED asserts a
+    // suspension and says collections "will" happen, so it continues to need
+    // evidence; DAY30_SMS_BODY_UNVERIFIED, the one sent when nothing records a
+    // suspension, claims neither.
+    { dayPastDue: 20, audience: "homeowner", requiredFacts: [] },
     { dayPastDue: 21, audience: "internal", requiredFacts: [] },
-    { dayPastDue: 25, audience: "homeowner", requiredFacts: ["recurring_late_fee_policy"] },
-    { dayPastDue: 30, audience: "homeowner", requiredFacts: ["service_suspended", "collections_after_day_35_policy"] },
+    { dayPastDue: 25, audience: "homeowner", requiredFacts: [] },
+    { dayPastDue: 30, audience: "homeowner", requiredFacts: [] },
     // Day 35 is INTERNAL: the policy says an unpaid invoice goes to collections
     // at 35 days, and that is a decision a person takes. Added 2026-11-18 on the
     // owner's instruction to task Angie with it. Nothing here refers anything to

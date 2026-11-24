@@ -107,6 +107,42 @@ export function bodyAssertsCollectionsAlreadyHappened(body: unknown): boolean {
   return typeof body === "string" && COLLECTIONS_ASSERTED.test(body);
 }
 
+/**
+ * Wording that ASSERTS late fees are already on THIS invoice.
+ *
+ * The recurring-fee rule is in the written policy, so "additional late fees may
+ * be added every 15 days" claims nothing about the account: it repeats a rule
+ * that exists on paper whether or not this invoice has ever been charged one.
+ * Saying fees HAVE been added, or WILL continue to accrue, is a statement about
+ * this invoice, and that still needs Jobber to prove it.
+ *
+ * Matched on the assertion, not the words "late fee", for the same reason
+ * SUSPENSION_ASSERTED is: the old detector fired on the warning itself, which
+ * is how Day 20 and Day 25 came to demand proof of something they never said.
+ */
+const FEE_ASSERTED =
+  /\blate\s+fees?\b[^.!?]{0,40}\b(?:has|have)\s+been\s+(?:added|applied|assessed|charged)\b/i.source
+  + "|" + /\b(?:has|have)\s+been\s+(?:added|applied|assessed|charged)\b[^.!?]{0,40}\blate\s+fees?\b/i.source
+  + "|" + /\bwill\s+continue\s+to\s+incur\b/i.source
+  + "|" + /\blate\s+fees?\b[^.!?]{0,20}\b(?:is|are)\s+(?:now\s+)?(?:accruing|being\s+added)\b/i.source;
+const FEE_ASSERTED_RE = new RegExp(FEE_ASSERTED, "i");
+
+/**
+ * Collections stated as a CERTAIN outcome ("the invoice will be sent to
+ * collections"), as against the policy's warning that it may be. A certainty is
+ * a claim about this invoice; a warning is a quotation of the policy.
+ */
+const COLLECTIONS_CERTAIN =
+  /\b(?:will|shall)\s+be\s+(?:sent|referred|passed|turned)\s+(?:over\s+)?to\s+collections\b/i;
+
+export function bodyAssertsLateFeesApplied(body: unknown): boolean {
+  return typeof body === "string" && FEE_ASSERTED_RE.test(body);
+}
+
+export function bodyStatesCollectionsAsCertain(body: unknown): boolean {
+  return typeof body === "string" && COLLECTIONS_CERTAIN.test(body);
+}
+
 const MAX_BYTES = 4000;
 
 function shapeIsUsable(body: unknown): body is string {
@@ -121,15 +157,22 @@ function shapeIsUsable(body: unknown): body is string {
  * Which claims a body actually makes. The gate proves these; it does not take
  * a caller's word for what the words say.
  *
+ * A WARNING IS NOT A CLAIM. "Late fees may be added", "services may be
+ * suspended" and "may be sent to collections" each quote the written policy and
+ * assert nothing about this invoice, so they require no per-customer evidence.
+ * Only the asserted forms do. Changed 2026-11-24 on the owner's instruction,
+ * because the fee and collections detectors matched the bare words and so held
+ * Days 20, 25 and 30 on facts their copy never stated.
+ *
  * Note it never returns `collections_after_day_35_policy` for a body that says
  * collections ALREADY happened — that is a different and unprovable claim, and
  * such a body is rejected outright by the validators below.
  */
 export function ladderCopyClaims(body: string): readonly LadderClaim[] {
   const claims: LadderClaim[] = [];
-  if (/\blate fees?\b/i.test(body)) claims.push("recurring_late_fee_policy");
+  if (bodyAssertsLateFeesApplied(body)) claims.push("recurring_late_fee_policy");
   if (bodyAssertsASuspension(body)) claims.push("service_suspended");
-  if (/\bcollections\b/i.test(body)) claims.push("collections_after_day_35_policy");
+  if (bodyStatesCollectionsAsCertain(body)) claims.push("collections_after_day_35_policy");
   return Object.freeze(claims);
 }
 

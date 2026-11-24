@@ -52,7 +52,7 @@ function held(request, reason, now = NOW) {
 
 test("copied clock retains exact supplied provenance SHA256", () => {
   assert.equal(createHash("sha256").update(readFileSync(new URL("../lib/invoice-reminder-clock.ts", import.meta.url))).digest("hex"),
-    "24de51250a21d208e3a51cdbccc25939412afbaa16aea7fe4ce215f2c15585e7");
+    "9abda26e32393b8101bd26034bcea4b8eb7acc14f22f4b135b118cd125714271");
 });
 test("valid phone-only Day10 can plan with unresolved category; capability stays false", () => {
   const result = plan(fixture()); assert.equal(result.designStatus, "eligible_in_proposal");
