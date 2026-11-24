@@ -67,7 +67,8 @@ const context = (channel: "sms" | "email", over: Record<string, unknown> = {}) =
 });
 
 function fakeLedger(opts: { refuseOn?: string; pendingFails?: boolean } = {}) {
-  const reserved: { invoiceId: string; dayPastDue: number; channel: string; body: string }[] = [];
+  const reserved: { invoiceId: string; dayPastDue: number; channel: string; body: string;
+    covers?: readonly string[]; coversBalanceMinor?: number }[] = [];
   const outcomes: string[] = [];
   let pending = 0;
   const ledger = {
@@ -76,7 +77,8 @@ function fakeLedger(opts: { refuseOn?: string; pendingFails?: boolean } = {}) {
         return { state: "held" as const, reason: "already_claimed" as const };
       }
       reserved.push({ invoiceId: input.event.invoiceId, dayPastDue: input.event.dayPastDue,
-        channel: input.channel, body: input.body });
+        channel: input.channel, body: input.body,
+        covers: input.event.coversInvoiceNumbers, coversBalanceMinor: input.event.coversBalanceMinor });
       return { state: "reserved" as const, reservation: { id: `r${reserved.length}`, token: "t",
         eventHash: "e", bodyHash: "b", destinationHash: "d" } };
     },
@@ -140,14 +142,22 @@ test("TWO INVOICES: BOTH ROWS ARE TAKEN BEFORE THE ONE MESSAGE GOES OUT", async 
         dayPastDue: id === "inv-7272" ? 7 : 5 }),
       attemptSend: async () => { sends += 1; return OK as never; } }));
   assert.equal(result.state, "sent", JSON.stringify(result));
-  assert.equal(led.reserved.length, 2, "one row per invoice");
-  assert.equal(sends, 1, "but only ONE text");
-  assert.deepEqual(led.outcomes, ["accepted", "accepted"], "both rows get the outcome");
-  assert.deepEqual(led.reserved.map(r => r.dayPastDue), [7, 5], "each at its own real day");
+  // ONE message, ONE row. The ledger's per-contact index allows one row per
+  // contact per day per channel, so a row each would refuse the second and
+  // strand the first - which is how a two-invoice customer used to be
+  // unsendable. The row instead NAMES both invoices.
+  assert.equal(led.reserved.length, 1, "one row for the one message");
+  assert.equal(sends, 1, "and still only ONE text");
+  assert.deepEqual(led.outcomes, ["accepted"]);
+  assert.equal(led.reserved[0].invoiceId, "inv-7272", "identity comes from the first covered invoice");
+  assert.equal(led.reserved[0].dayPastDue, 7, "at that invoice's own real day");
+  assert.deepEqual([...(led.reserved[0].covers ?? [])], ["7272", "7286"],
+    "but the row records every invoice the words mention");
+  assert.equal(led.reserved[0].coversBalanceMinor, 18000, "and the total those words state");
 });
 
-test("IF THE SECOND ROW CANNOT BE TAKEN, NOTHING IS SENT", async () => {
-  const led = fakeLedger({ refuseOn: "inv-7286" });
+test("IF THE ROW CANNOT BE TAKEN, NOTHING IS SENT", async () => {
+  const led = fakeLedger({ refuseOn: "inv-7272" });
   let sends = 0;
   const action = planned({
     invoices: [invoice(), invoice({ invoiceId: "inv-7286", invoiceNumber: "7286", dueOn: "2026-11-19" })],
@@ -160,8 +170,10 @@ test("IF THE SECOND ROW CANNOT BE TAKEN, NOTHING IS SENT", async () => {
   assert.equal(sends, 0, "a customer must never get a message we failed to record");
   assert.equal(result.state, "incomplete");
   if (result.state !== "incomplete") return;
-  // And the row that WAS taken is reported, because it can never be released.
-  assert.deepEqual([...result.strandedInvoiceNumbers], ["7272"]);
+  // Nothing was taken, so nothing is stranded. One claim per message means a
+  // refusal costs no row at all - the whole point of the change.
+  assert.deepEqual([...result.strandedInvoiceNumbers], []);
+  assert.equal(led.reserved.length, 0);
   assert.ok(result.reasons.some(r => r.includes("already_claimed")), result.reasons.join(","));
 });
 
@@ -395,12 +407,12 @@ test("AGAINST THE REAL LEDGER: the claim is asserted, marked pending, and sent o
   assert.deepEqual(order, ["reserve", "assert", "pending", "outcome"], order.join(" -> "));
 });
 
-test("AGAINST THE REAL LEDGER: one contact cannot take two rows for the same day and channel", async () => {
+test("AGAINST THE REAL LEDGER: a two-invoice customer sends, on one row naming both", async () => {
   // The per-contact unique index is one message per contact, per day, per
-  // channel. A customer whose message covers TWO invoices needs two rows, and
-  // the second is refused - so an aggregated message cannot be recorded
-  // invoice by invoice. Documented here because it decides how multi-invoice
-  // customers must be handled, and it is not a bug in the index.
+  // channel, so a row per invoice is impossible: the second is refused and the
+  // first cannot be released. One row per MESSAGE fits the index exactly, and
+  // the row names both invoices. Run against the real ledger, because this is
+  // precisely the case a permissive fake said was fine and production did not.
   const { createNotificationLedger } = await import("../lib/notification-ledger");
   const db = memoryLedgerDatabase();
   const ledger = createNotificationLedger(db.database as never);
@@ -428,8 +440,15 @@ test("AGAINST THE REAL LEDGER: one contact cannot take two rows for the same day
       confirmStillDue: (async (id: string) => live[id]) as never,
       attemptSend: async (d: never) => { sent.push(d); return OK as never; } }));
 
-  assert.equal(result.state, "incomplete", JSON.stringify(result));
-  assert.equal(sent.length, 0, "nothing may be sent when the claim cannot be fully recorded");
-  assert.ok(result.reasons.some(r => r.startsWith("reservation_already_claimed_for_")), result.reasons.join(","));
-  assert.equal(db.rows.length, 1, "the first invoice's row is taken and cannot be released");
+  assert.equal(result.state, "sent", JSON.stringify(result));
+  assert.equal(sent.length, 1, "exactly one text for the two invoices");
+  assert.equal(db.rows.length, 1, "recorded on exactly one row");
+  assert.equal(db.rows[0].state, "accepted", "and that row reaches a terminal state");
+  assert.equal(db.rows[0].invoiceId, "inv-a", "identity from the first covered invoice");
+
+  // The row must say what the message really covered, or a later reader would
+  // believe only #9001 was ever mentioned to this customer.
+  const payload = JSON.parse(String(db.rows[0].eventPayload));
+  assert.deepEqual(payload.coversInvoiceNumbers, ["9001", "9002"]);
+  assert.equal(payload.coversBalanceMinor, 11000);
 });

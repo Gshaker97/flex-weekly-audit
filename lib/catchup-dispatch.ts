@@ -218,28 +218,50 @@ export async function dispatchCatchupSend(
     if (live.balanceMinor !== row.balanceMinor) return refuse("balance_changed_since_planning");
   }
 
-  // 3. Reserve EVERY row before anything is sent.
+  // 3. ONE claim for the message, not one per invoice.
+  //
+  // The ledger's per-contact unique index is one message per contact, per day,
+  // per channel. A message covering several invoices therefore cannot take a
+  // row each: the second is refused, and the first cannot be handed back
+  // because there is no release. Before this, a two-invoice customer could
+  // never be sent to at all, and every attempt stranded a row.
+  //
+  // So the ledger records MESSAGES. One message takes one row, and the row
+  // names every invoice the words actually mention. The identity columns come
+  // from the first covered invoice, so the per-invoice index still protects
+  // that one; the rest are recorded in the payload, which the event hash
+  // covers, so this claim can never be mistaken for a message about a
+  // different set of invoices.
+  //
+  // The live look above still checks EVERY invoice. Recording one row does not
+  // mean verifying one balance.
+  const primary = send.reservations[0];
+  if (!primary) return refuse("nothing_to_reserve");
+  const covers = send.reservations.map(row => row.invoiceNumber);
   const taken: { handle: NotificationReservation; invoiceNumber: string }[] = [];
-  for (const row of send.reservations) {
-    const result = await io.ledger.reserve({
-      event: {
-        accountId: context.accountId, invoiceId: row.invoiceId, contactId: action.contactId,
-        dayPastDue: row.dayPastDue, audience: "homeowner", channel,
-        destination: send.destination, bodyDigest: bodyHash,
-        dueDate: row.dueOn,
-      } as never,
-      body: action.body, destination: send.destination, channel,
-      contactId: action.contactId, scheduledOn: context.scheduledOn,
+  const reservation = await io.ledger.reserve({
+    event: {
+      accountId: context.accountId, invoiceId: primary.invoiceId, contactId: action.contactId,
+      dayPastDue: primary.dayPastDue, audience: "homeowner", channel,
+      destination: send.destination, bodyDigest: bodyHash,
+      dueDate: primary.dueOn,
+      // What the message really covers, so a later reader is not misled into
+      // thinking only the primary invoice was mentioned.
+      coversInvoiceNumbers: covers,
+      coversBalanceMinor: send.reservations.reduce((total, row) => total + row.balanceMinor, 0),
+    } as never,
+    body: action.body, destination: send.destination, channel,
+    contactId: action.contactId, scheduledOn: context.scheduledOn,
+  });
+  if (reservation.state !== "reserved") {
+    return Object.freeze({
+      state: "incomplete", channel,
+      reasons: sorted([`reservation_${reservation.reason}_for_${primary.invoiceNumber}`, "nothing_was_sent"]),
+      // Nothing was taken, so nothing is stranded.
+      strandedInvoiceNumbers: Object.freeze([] as string[]),
     });
-    if (result.state !== "reserved") {
-      return Object.freeze({
-        state: "incomplete", channel,
-        reasons: sorted([`reservation_${result.reason}_for_${row.invoiceNumber}`, "nothing_was_sent"]),
-        strandedInvoiceNumbers: Object.freeze(taken.map(t => t.invoiceNumber)),
-      });
-    }
-    taken.push({ handle: result.reservation, invoiceNumber: row.invoiceNumber });
   }
+  taken.push({ handle: reservation.reservation, invoiceNumber: primary.invoiceNumber });
 
   // 4. Assert every claim before any of them is advanced.
   //
