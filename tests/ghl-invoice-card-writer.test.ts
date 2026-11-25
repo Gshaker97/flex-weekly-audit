@@ -6,7 +6,7 @@ import {
   DEFAULT_WRITE_BUDGET, MAX_WRITE_BUDGET, legacySendingFromEnv,
   type InvoiceCardWriteIo, type InvoiceCardWriteReport, type StageIds, type WriteAllowances,
 } from "../lib/ghl-invoice-card-writer";
-import { cardNameHash, creationPlaceholderId, invoiceSourceFingerprint,
+import { cardNameHash, creationPlaceholderId, invoiceCardCreationClaimed, invoiceSourceFingerprint,
   type CycleJournalEntry, type GhlWriteIntent } from "../lib/sync-writer-control";
 import type { InvoiceCardAction, InvoiceCardPlan } from "../lib/ghl-invoice-card-plan";
 import type { PhoneInvoiceEvidence } from "../lib/ghl-phone-state";
@@ -266,6 +266,7 @@ async function run(p: InvoiceCardPlan, h: Harness, over: Record<string, any> = {
     prepare: async (intent: GhlWriteIntent) => { prepared.push(structuredClone(intent)); return fixture.writer.prepare(intent); },
     assertPending: fixture.writer.assertPending.bind(fixture.writer),
     confirm: fixture.writer.confirm.bind(fixture.writer),
+    abandon: fixture.writer.abandon.bind(fixture.writer),
     block: fixture.writer.block.bind(fixture.writer),
     readCycleHistory: fixture.writer.readCycleHistory.bind(fixture.writer),
   };
@@ -278,7 +279,8 @@ async function run(p: InvoiceCardPlan, h: Harness, over: Record<string, any> = {
       allow: { overdueMoves: false, paidExits: true, ...(over.allow ?? {}) }, ...(over.gate ?? {}) },
     source: over.source ?? [invoice()], observedAt: "2026-11-20T09:00:00.000Z",
     preflight, spend: over.spend ?? { remaining: 60 }, claimedInvoiceIds: over.claimedInvoiceIds ?? new Set<string>(),
-    writer: over.writer ?? writer, report: entry => reports.push(entry), io: h.io,
+    writer: over.writer ?? writer, report: entry => reports.push(entry), io: over.io ?? h.io,
+    ...(over.deadlines ? { deadlines: over.deadlines } : {}),
   });
   return { result, reports, prepared, fixture };
 }
@@ -433,17 +435,36 @@ test("a failed read holds one card without halting the run", async () => {
   assert.match(reports[0].reason, /^fresh_card_read_failed/);
 });
 
-test("an unconfirmed write halts everything and blocks the run", async () => {
+test("a failed PUT that provably changed nothing no longer halts the run", async () => {
+  // This test used to assert the opposite, and that assertion was the defect.
+  // A failed PUT left its claim pending and the run blocked, which stopped
+  // every later sync via `admitSyncRun` until someone intervened by hand. Now
+  // the writer reads the card back: it is untouched, so the claim is released,
+  // that one card is held, and the rest of the run proceeds.
   const h = harness([openCard({ pipelineStageId: STAGES.paid, monetaryValue: 0 })]);
   h.putFails = true;
-  const { result, reports, fixture } = await run(plan(adopt({ changes: ["stage", "value"] }), create()), h);
-  assert.equal(result.applied, 0);
-  assert.equal(result.halted, true);
-  assert.equal(reports.length, 1, "the second action is never attempted");
-  assert.equal(reports[0].action, "failed");
-  assert.match(reports[0].reason, /remaining card writes halted/);
-  assert.equal(fixture.rows[0].status, "blocked");
-  assert.deepEqual(h.posts, []);
+  const other = { id: "invoice-2", invoiceNumber: "7227" };
+  const { result, reports, fixture } = await run(
+    plan(adopt({ changes: ["stage", "value"] }),
+      create({ invoiceId: other.id, invoiceNumber: other.invoiceNumber, name: `Invoice #${other.invoiceNumber} — Someone` })),
+    h, { source: [invoice(), invoice(other)] });
+
+  assert.equal(result.halted, false);
+  assert.equal(reports[0].action, "hold");
+  assert.match(reports[0].reason, /claim was released/);
+  assert.match(reports[0].reason, /Synthetic PUT failure/);
+  assert.equal(fixture.rows[0].status, "running", "the run is not blocked");
+
+  // The second action really is attempted now, where before it was abandoned
+  // along with every sync for the rest of the day.
+  assert.equal(reports.length, 2);
+  assert.equal(reports[1].action, "applied");
+  assert.equal(result.applied, 1);
+  assert.equal(h.posts.length, 1);
+
+  // Two entries: the released move, then the confirmed creation.
+  const entries = await fixture.writer.readCycleHistory();
+  assert.deepEqual(entries.map(e => e.state), ["abandoned", "confirmed"]);
 });
 
 test("a readback that disagrees with what we asked for is a halt, not a success", async () => {
@@ -566,4 +587,225 @@ test("the journal refuses a second claim for an invoice it already claimed", asy
   const first = await fixture.writer.prepare(intent());
   await fixture.writer.confirm(first);
   await assert.rejects(() => fixture.writer.prepare(intent()));
+});
+
+// ---------------------------------------------------------------------------
+// THE HANG. On 2026-11-25 a claimed card creation errored between the POST and
+// the read-back. The writer blocked itself, which left the claim pending and
+// the run in "blocked" - and because `admitSyncRun` refuses while any run is
+// blocked, EVERY hourly sync after it died with "busy" for thirteen hours. The
+// claim never resolved because nothing ever went and looked.
+//
+// These tests pin the three possible answers, and that only the genuinely
+// unknown one still halts.
+// ---------------------------------------------------------------------------
+
+/**
+ * `listContactOpportunities` is called TWICE in a creation: once as the
+ * pre-flight duplicate check, and again as the verification that establishes
+ * what happened. These helpers let the first call behave normally and only the
+ * second one hang, fail, or lie.
+ */
+const onSecondList = (h: Harness, second: () => Promise<GhlOpportunity[]>): InvoiceCardWriteIo => {
+  let calls = 0;
+  return { ...h.io, listContactOpportunities: async (c, p) => (++calls === 1 ? h.io.listContactOpportunities(c, p) : second()) };
+};
+const onSecondRead = (h: Harness, second: () => Promise<GhlOpportunity>): InvoiceCardWriteIo => {
+  let calls = 0;
+  return { ...h.io, readOpportunity: async (id) => (++calls === 1 ? h.io.readOpportunity(id) : second()) };
+};
+
+const FAST = { attemptMs: 25, verifyMs: 25 };
+const never = () => new Promise<never>(() => {});
+
+test("a creation POST that never answers releases its claim, so the run is not wedged", async () => {
+  process.env.GHL_WRITE_APPROVAL_ID = "reviewed-plan-1";
+  const h = harness([], []);
+  const io: InvoiceCardWriteIo = { ...h.io, createOpportunity: never as any };
+  const { result, reports, fixture } = await run(plan(create()), h, { io, deadlines: FAST });
+
+  // The run carries on. This is the whole point: one card is held, not every
+  // sync for the next thirteen hours.
+  assert.equal(result.halted, false);
+  assert.equal(result.applied, 0);
+  assert.equal(reports[0].action, "hold");
+  assert.match(reports[0].reason, /claim was released/);
+  assert.match(reports[0].reason, /card_create_timed_out_after_25ms/);
+  assert.equal(fixture.rows[0].status, "running", "the run is NOT blocked");
+
+  // The claim is recorded as abandoned, WITH the observation that released it.
+  const entries = await fixture.writer.readCycleHistory();
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].state, "abandoned");
+  assert.equal(entries[0].abandonment!.reason, "creation_post_did_not_create_a_card");
+  assert.match(entries[0].abandonment!.evidence, /shows no card naming invoice 7226/);
+
+  // And a later run may try again, because the card provably is not there.
+  assert.equal(invoiceCardCreationClaimed(entries, { locationId: LOCATION, pipelineId: PIPELINE, invoiceId: INVOICE }), null);
+  assert.equal(claimedInvoiceIdsFromHistory(entries, { locationId: LOCATION, pipelineId: PIPELINE }).size, 0);
+});
+
+test("a creation that actually landed before the error is confirmed, not retried", async () => {
+  process.env.GHL_WRITE_APPROVAL_ID = "reviewed-plan-1";
+  const h = harness([], []);
+  // The POST lands; the read-back fails. The card exists and is correct.
+  // (A creation's only `readOpportunity` call IS the read-back; the pre-flight
+  // duplicate check uses `listContactOpportunities`.)
+  const post = h.io.createOpportunity;
+  const io: InvoiceCardWriteIo = { ...h.io,
+    // The harness keeps `live` separate from `cards`, so make the creation
+    // visible to the verification list exactly as GHL would.
+    createOpportunity: async opts => { const made = await post(opts); h.live.push(made); return made; },
+    readOpportunity: async () => { throw new Error("Synthetic read-back failure"); } };
+  const { result, reports, fixture } = await run(plan(create()), h, { io, deadlines: FAST });
+
+  assert.equal(result.halted, false);
+  assert.equal(result.applied, 1);
+  assert.equal(reports[0].action, "applied");
+  assert.equal(reports[0].cardId, "card-new");
+  assert.match(reports[0].reason, /had landed before the error/);
+  assert.equal(fixture.rows[0].status, "running");
+
+  const entries = await fixture.writer.readCycleHistory();
+  assert.equal(entries[0].state, "confirmed");
+  // Still claimed, so no second card is ever created for this invoice.
+  assert.ok(invoiceCardCreationClaimed(entries, { locationId: LOCATION, pipelineId: PIPELINE, invoiceId: INVOICE }));
+});
+
+test("when the outcome cannot be established the writer still blocks", async () => {
+  process.env.GHL_WRITE_APPROVAL_ID = "reviewed-plan-1";
+  const h = harness([], []);
+  // The POST fails AND the verification read fails: we do not know. Fail closed.
+  const io = onSecondList(h, async () => { throw new Error("Synthetic verification failure"); });
+  io.createOpportunity = async () => { throw new Error("Synthetic POST failure"); };
+  const { result, reports, fixture } = await run(plan(create()), h, { io, deadlines: FAST });
+
+  assert.equal(result.halted, true);
+  assert.equal(reports[0].action, "failed");
+  assert.match(reports[0].reason, /could not be established/);
+  assert.equal(fixture.rows[0].status, "blocked");
+
+  // The claim stays pending: an unknown outcome is still a barrier.
+  const entries = await fixture.writer.readCycleHistory();
+  assert.equal(entries[0].state, "pending");
+  assert.ok(invoiceCardCreationClaimed(entries, { locationId: LOCATION, pipelineId: PIPELINE, invoiceId: INVOICE }));
+});
+
+test("a verification read that itself hangs is unknown, never treated as absent", async () => {
+  process.env.GHL_WRITE_APPROVAL_ID = "reviewed-plan-1";
+  const h = harness([], []);
+  const io = onSecondList(h, never as any);
+  io.createOpportunity = async () => { throw new Error("Synthetic POST failure"); };
+  const { result, reports, fixture } = await run(plan(create()), h, { io, deadlines: FAST });
+  assert.equal(result.halted, true);
+  assert.match(reports[0].reason, /write_verification_read_timed_out_after_25ms/);
+  assert.equal(fixture.rows[0].status, "blocked");
+  const entries = await fixture.writer.readCycleHistory();
+  assert.equal(entries[0].state, "pending");
+});
+
+test("a card created under the wrong name blocks instead of releasing its claim", async () => {
+  process.env.GHL_WRITE_APPROVAL_ID = "reviewed-plan-1";
+  const h = harness([], []);
+  // The POST lands but GHL stores a different name, so a name search would
+  // find nothing. Releasing the claim here would let a later run make a second
+  // card; the id the POST returned is what prevents that.
+  const post = h.io.createOpportunity;
+  const io: InvoiceCardWriteIo = { ...h.io, createOpportunity: async opts => {
+    const made = await post(opts);
+    h.cards.get(made.id)!.name = "Something else entirely";
+    return made;
+  } };
+  const { result, reports, fixture } = await run(plan(create()), h, { io, deadlines: FAST });
+  assert.equal(result.halted, true);
+  assert.equal(result.applied, 0);
+  assert.match(reports[0].reason, /neither the old nor the new state/);
+  assert.equal(fixture.rows[0].status, "blocked");
+  const entries = await fixture.writer.readCycleHistory();
+  assert.equal(entries[0].state, "pending", "an unexplained card keeps the invoice claimed");
+});
+
+test("a duplicate card found during verification blocks rather than resolving itself", async () => {
+  process.env.GHL_WRITE_APPROVAL_ID = "reviewed-plan-1";
+  const h = harness([], []);
+  const twins: GhlOpportunity[] = [
+    openCard({ id: "card-a", monetaryValue: 137.5 }),
+    openCard({ id: "card-b", monetaryValue: 137.5 }),
+  ];
+  // The POST errors with no id, and the verification finds two cards already
+  // naming this invoice. That is never resolved automatically.
+  const io = onSecondList(h, async () => twins);
+  io.createOpportunity = async () => { throw new Error("Synthetic POST failure"); };
+  const { result, reports, fixture } = await run(plan(create()), h, { io, deadlines: FAST });
+  assert.equal(result.halted, true);
+  assert.match(reports[0].reason, /2 cards already name invoice 7226/);
+  assert.equal(fixture.rows[0].status, "blocked");
+});
+
+test("a stage move that never answers and provably did not happen releases its claim", async () => {
+  process.env.GHL_WRITE_APPROVAL_ID = "reviewed-plan-1";
+  const h = harness([openCard({ monetaryValue: 99 })], []);
+  const io: InvoiceCardWriteIo = { ...h.io, moveOpportunityToStage: never as any };
+  const { result, reports, fixture } = await run(plan(adopt()), h, { io, deadlines: FAST });
+
+  assert.equal(result.halted, false);
+  assert.equal(result.applied, 0);
+  assert.equal(reports[0].action, "hold");
+  assert.match(reports[0].reason, /claim was released/);
+  assert.equal(fixture.rows[0].status, "running");
+
+  const entries = await fixture.writer.readCycleHistory();
+  assert.equal(entries[0].state, "abandoned");
+  assert.equal(entries[0].abandonment!.reason, "card_move_did_not_take_effect");
+  // The card really was left alone.
+  assert.equal(h.cards.get("card-1")!.monetaryValue, 99);
+});
+
+test("a stage move left in neither the old nor the new state blocks", async () => {
+  process.env.GHL_WRITE_APPROVAL_ID = "reviewed-plan-1";
+  const h = harness([openCard({ monetaryValue: 99 })], []);
+  // The pre-flight read is honest; the PUT fails; the verification shows a
+  // third state that is neither what we asked for nor what was there.
+  const io = onSecondRead(h, async () => openCard({ monetaryValue: 42 }));
+  io.moveOpportunityToStage = async () => { throw new Error("Synthetic PUT failure"); };
+  const { result, reports, fixture } = await run(plan(adopt()), h, { io, deadlines: FAST });
+  assert.equal(result.halted, true);
+  assert.match(reports[0].reason, /neither the old nor the new state/);
+  assert.equal(fixture.rows[0].status, "blocked");
+  const entries = await fixture.writer.readCycleHistory();
+  assert.equal(entries[0].state, "pending");
+});
+
+test("a pre-flight read that hangs holds one card and never claims anything", async () => {
+  process.env.GHL_WRITE_APPROVAL_ID = "reviewed-plan-1";
+  const h = harness([openCard({ monetaryValue: 99 })], []);
+  const io: InvoiceCardWriteIo = { ...h.io, readOpportunity: never as any };
+  const { result, reports, fixture } = await run(plan(adopt()), h, { io, deadlines: FAST });
+  assert.equal(result.halted, false);
+  assert.equal(reports[0].action, "hold");
+  assert.match(reports[0].reason, /card_preflight_read_timed_out_after_25ms/);
+  assert.equal(fixture.rows[0].status, "running");
+  assert.deepEqual(await fixture.writer.readCycleHistory(), [], "nothing was claimed");
+});
+
+test("an abandoned claim must carry the observation that released it", async () => {
+  process.env.GHL_WRITE_APPROVAL_ID = "reviewed-plan-1";
+  const h = harness([], []);
+  const { prepared } = await run(plan(create()), h);
+  const intent = prepared[0];
+
+  // An empty reason or evidence is refused outright.
+  const fixture = writerFixture();
+  const id = await fixture.writer.prepare(intent);
+  await assert.rejects(() => fixture.writer.abandon(id, { reason: "", evidence: "x", observedAt: new Date().toISOString() }));
+
+  // And a hand-edited journal that claims "abandoned" with no evidence makes
+  // the whole journal unreadable, rather than quietly passing.
+  const fresh = writerFixture();
+  await fresh.writer.prepare(intent);
+  const row = fresh.rows[0];
+  const parsed = JSON.parse(row.errorMessage.slice("FLEX_GHL_WRITE_JOURNAL_V1:".length));
+  parsed.writes[0].state = "abandoned";
+  row.errorMessage = "FLEX_GHL_WRITE_JOURNAL_V1:" + JSON.stringify(parsed);
+  await assert.rejects(() => fresh.writer.readCycleHistory());
 });

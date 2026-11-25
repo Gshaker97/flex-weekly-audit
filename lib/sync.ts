@@ -693,7 +693,7 @@ export interface InvoiceCardPlanReport {
 export async function syncGhlInvoicePipeline(opts: {
   mode?: GhlInvoiceWriteMode;
   report?: (entry: GhlInvoiceReview) => void;
-  writer?: Pick<SyncRunWriter, "prepare" | "assertPending" | "confirm" | "block"> & Partial<Pick<SyncRunWriter, "readCycleHistory">>;
+  writer?: Pick<SyncRunWriter, "prepare" | "assertPending" | "confirm" | "abandon" | "block"> & Partial<Pick<SyncRunWriter, "readCycleHistory">>;
   /**
    * Ask for the ONE CARD PER INVOICE plan, chosen by the owner 2026-11-20.
    *
@@ -881,7 +881,8 @@ export async function syncGhlInvoicePipeline(opts: {
             preflight: new Map(existingCards.map(card => [card.id, card])),
             spend: cardSpend, claimedInvoiceIds: cardClaims,
             writer: { prepare: opts.writer!.prepare.bind(opts.writer), assertPending: opts.writer!.assertPending.bind(opts.writer),
-              confirm: opts.writer!.confirm.bind(opts.writer), block: opts.writer!.block.bind(opts.writer),
+              confirm: opts.writer!.confirm.bind(opts.writer), abandon: opts.writer!.abandon.bind(opts.writer),
+              block: opts.writer!.block.bind(opts.writer),
               readCycleHistory: opts.writer!.readCycleHistory!.bind(opts.writer) },
             report: entry => {
               log(`[ghl-card] ${JSON.stringify(entry)}`);

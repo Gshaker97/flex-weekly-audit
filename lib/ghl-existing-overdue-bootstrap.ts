@@ -34,7 +34,11 @@ export type BootstrapEvidence = {
 };
 export type BootstrapHistory = { complete: boolean; observedAt: string; entries: Array<{
   scope: BootstrapScope; phase: 'bootstrap' | 'enroll' | 'other';
-  state: 'pending' | 'confirmed' | 'unknown';
+  // 'abandoned' is a released card-write claim (see sync-writer-control). The
+  // guard below holds on anything that is not 'confirmed', so a released claim
+  // still blocks enrollment here. That is deliberate: this path is the one that
+  // makes the legacy workflow send to a customer, and it stays fail-closed.
+  state: 'pending' | 'confirmed' | 'unknown' | 'abandoned';
 }> };
 const hash = (v: unknown) => createHash('sha256').update(JSON.stringify(v)).digest('hex');
 /** Scope-based key deliberately excludes mutable source date/fingerprint: an edit

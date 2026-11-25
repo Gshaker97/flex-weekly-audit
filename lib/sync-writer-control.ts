@@ -143,7 +143,16 @@ export interface GhlWriteIntent {
   dateField?: { locationId: string; fieldId: string; key: "opportunity.due_date";
     invoiceId: string; expectedValue: string | null; targetValue: string; sourceFingerprint: string };
 }
-export interface JournalEntry { id: string; state: "pending" | "confirmed"; preparedAt: string; confirmedAt?: string; fingerprint: string; intent: GhlWriteIntent; paidDateReadback?: PaidDateReadback; removalAcknowledgment?: WorkflowRemovalAcknowledgment }
+/**
+ * Why a claim was released without the write having landed.
+ *
+ * `evidence` is the provider observation that PROVED nothing landed - not a
+ * guess, not a timeout, not "the request failed". A claim may only be abandoned
+ * when the provider has been read back successfully and plainly does not show
+ * the write. Anything else is still unknown, and unknown still blocks.
+ */
+export type WriteAbandonment = { version: 1; reason: string; evidence: string; observedAt: string };
+export interface JournalEntry { id: string; state: "pending" | "confirmed" | "abandoned"; preparedAt: string; confirmedAt?: string; abandonedAt?: string; abandonment?: WriteAbandonment; fingerprint: string; intent: GhlWriteIntent; paidDateReadback?: PaidDateReadback; removalAcknowledgment?: WorkflowRemovalAcknowledgment }
 interface Journal { version: 1; runId: string; warnings: string | null; writes: JournalEntry[] }
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 export const cardNameHash = (name: string | null | undefined) => hash(JSON.stringify(name ?? null));
@@ -283,9 +292,18 @@ function journal(message: string | null, runId: string): Journal | null {
     if (value.version !== 1 || value.runId !== runId || !(value.warnings === null || typeof value.warnings === "string") || !Array.isArray(value.writes)) throw new Error();
     const ids = new Set<string>();
     for (const entry of value.writes) {
-      if (!identity(entry.id) || ids.has(entry.id) || !["pending", "confirmed"].includes(entry.state)
+      if (!identity(entry.id) || ids.has(entry.id) || !["pending", "confirmed", "abandoned"].includes(entry.state)
           || typeof entry.preparedAt !== "string" || !date(entry.preparedAt)
           || (entry.state === "confirmed" && (typeof entry.confirmedAt !== "string" || !date(entry.confirmedAt)))) throw new Error();
+      // An abandoned claim must carry the observation that released it, and a
+      // claim in any other state must carry none. Without that, "abandoned"
+      // would be a way to make an unexplained write disappear.
+      if (entry.state === "abandoned") {
+        const a = entry.abandonment;
+        if (typeof entry.abandonedAt !== "string" || !date(entry.abandonedAt) || !a || a.version !== 1
+            || !identity(a.reason) || !identity(a.evidence) || !date(a.observedAt)
+            || Date.parse(a.observedAt) < Date.parse(entry.preparedAt)) throw new Error();
+      } else if (entry.abandonedAt !== undefined || entry.abandonment !== undefined) throw new Error();
       validateIntent(entry.intent);
       if (entry.removalAcknowledgment) validateRemovalAcknowledgment(entry.intent, entry.removalAcknowledgment);
       if (entry.intent.workflowRemoval && (entry.state === "confirmed") !== !!entry.removalAcknowledgment) throw new Error();
@@ -318,10 +336,18 @@ async function cycleHistory(db: Pick<Prisma.TransactionClient, "syncRun">): Prom
  * A pending claim counts as loudly as a confirmed one. Pending means a POST was
  * started and never answered, so the card may well exist; treating that as "no
  * card yet" is exactly how a customer ends up with two.
+ *
+ * An ABANDONED claim is the one exception, and the only reason that state
+ * exists. It is not "a POST we gave up on": it is a POST that a successful
+ * read-back of the provider proved did not land, recorded with that
+ * observation. The card provably does not exist, so the invoice is unclaimed
+ * and the next run may create it. Nothing else in this module treats an
+ * abandoned entry as either pending or confirmed, which is deliberate - it
+ * neither blocks a later run nor authorizes anything.
  */
 export function invoiceCardCreationClaimed(history: CycleJournalEntry[],
   scope: { locationId: string; pipelineId: string; invoiceId: string }): CycleJournalEntry | null {
-  return history.find(w => w.intent.creation
+  return history.find(w => w.state !== "abandoned" && w.intent.creation
     && w.intent.creation.locationId === scope.locationId
     && w.intent.creation.pipelineId === scope.pipelineId
     && w.intent.creation.invoiceId === scope.invoiceId) ?? null;
@@ -502,6 +528,39 @@ export class SyncRunWriter {
           entry.paidDateReadback = structuredClone(paidDateReadback);
         }
         entry.state = "confirmed"; entry.confirmedAt = new Date().toISOString();
+        const result = await tx.syncRun.updateMany({ where: { id: run.id, status: "running", errorMessage: run.errorMessage }, data: { errorMessage: serialize(next) } });
+        if (result.count !== 1) throw new SyncWriterBlockedError();
+      });
+    } catch { await this.block(); throw new SyncWriterBlockedError(); }
+  }
+  /**
+   * Release a claim whose write provably did not land, so neither this run nor
+   * any later one is wedged by it.
+   *
+   * The caller must have READ THE PROVIDER BACK SUCCESSFULLY and seen that the
+   * write is absent; `abandonment.evidence` records that observation. A failed
+   * read, a timeout, or any other "we do not know" must still go to `block`.
+   * This method cannot tell the difference, so it is the caller's duty - which
+   * is why it is used in exactly two places, both immediately after a
+   * successful verification read.
+   *
+   * The invariants are otherwise identical to `confirm`: the run must still be
+   * running, the entry must be the last one, and it must still be pending. On
+   * any failure the writer blocks, exactly as before.
+   */
+  async abandon(id: string, abandonment: Omit<WriteAbandonment, "version">): Promise<void> {
+    try {
+      if (this.halted) throw new SyncWriterBlockedError();
+      await durable(this.db, async tx => {
+        const run = await tx.syncRun.findUniqueOrThrow({ where: { id: this.runId } });
+        const next = journal(run.errorMessage, this.runId);
+        const entry = next?.writes.at(-1);
+        if (run.status !== "running" || !next || entry?.id !== id || entry.state !== "pending") throw new SyncWriterBlockedError();
+        const record: WriteAbandonment = { version: 1, reason: abandonment.reason,
+          evidence: abandonment.evidence, observedAt: abandonment.observedAt };
+        if (!identity(record.reason) || !identity(record.evidence) || !date(record.observedAt)
+            || Date.parse(record.observedAt) < Date.parse(entry.preparedAt)) throw new SyncWriterBlockedError();
+        entry.state = "abandoned"; entry.abandonedAt = new Date().toISOString(); entry.abandonment = record;
         const result = await tx.syncRun.updateMany({ where: { id: run.id, status: "running", errorMessage: run.errorMessage }, data: { errorMessage: serialize(next) } });
         if (result.count !== 1) throw new SyncWriterBlockedError();
       });

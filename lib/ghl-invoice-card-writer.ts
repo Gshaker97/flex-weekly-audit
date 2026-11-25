@@ -69,15 +69,55 @@ export const DEFAULT_WRITE_BUDGET = 60;
 
 export type StageIds = Readonly<{ sent: string; overdue: string; paid: string }>;
 
-/** Every invoice any past run has already claimed a card for, in this pipeline. */
+/**
+ * Every invoice any past run has already claimed a card for, in this pipeline.
+ *
+ * An abandoned claim is skipped, for the same reason `invoiceCardCreationClaimed`
+ * skips it: the provider was read back and the card provably is not there, so
+ * the invoice still needs one. This is only the fast pre-check; the binding
+ * version of the same rule lives in `assertCreationHistory`.
+ */
 export function claimedInvoiceIdsFromHistory(history: readonly CycleJournalEntry[],
   scope: { locationId: string; pipelineId: string }): Set<string> {
   const out = new Set<string>();
   for (const entry of history) {
+    if (entry.state === "abandoned") continue;
     const c = entry.intent.creation;
     if (c && c.locationId === scope.locationId && c.pipelineId === scope.pipelineId) out.add(c.invoiceId);
   }
   return out;
+}
+
+/**
+ * A hard ceiling on how long one claimed write may wait for GoHighLevel.
+ *
+ * `ghlFetch` already aborts a single stalled request after 10s, but a write is
+ * a CHAIN of requests (the mutation, then the read-back), and a GET inside that
+ * chain may legitimately sleep through three 429 backoffs. This bounds the
+ * whole claimed window instead of each hop, so the gap between "claim recorded"
+ * and "outcome known" can never grow without limit.
+ */
+export const WRITE_ATTEMPT_TIMEOUT_MS = 20_000;
+/** The same, for the read that establishes what actually happened. */
+export const WRITE_VERIFY_TIMEOUT_MS = 20_000;
+
+/**
+ * Bound a provider call. Rejecting the race does not cancel the underlying
+ * request - `ghlFetch`'s own AbortController does that - it stops the WRITER
+ * waiting on it, which is the thing that used to hang a run.
+ */
+export async function withDeadline<T>(work: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label}_timed_out_after_${ms}ms`)), ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 export type WriteDecision =
@@ -232,7 +272,7 @@ export interface InvoiceCardWriteReport {
   to?: { stageId: string; monetaryValue: number; name?: string };
 }
 
-type Writer = Pick<SyncRunWriter, "prepare" | "assertPending" | "confirm" | "block"> &
+type Writer = Pick<SyncRunWriter, "prepare" | "assertPending" | "confirm" | "abandon" | "block"> &
   { readCycleHistory: SyncRunWriter["readCycleHistory"] };
 
 export interface InvoiceCardWriteIo {
@@ -270,6 +310,12 @@ export interface ApplyInvoiceCardPlanInput {
   writer: Writer;
   report: (entry: InvoiceCardWriteReport) => void;
   io?: InvoiceCardWriteIo;
+  /**
+   * How long a claimed write, and the read that establishes its outcome, may
+   * take. Defaults to the module constants; present so a test can drive a
+   * genuine hang without waiting 20 seconds for it.
+   */
+  deadlines?: Readonly<{ attemptMs: number; verifyMs: number }>;
 }
 
 /**
@@ -330,7 +376,9 @@ async function adoptCard(
 
   let current: GhlOpportunity;
   try {
-    current = await io.readOpportunity(decision.cardId);
+    // Bounded like every other provider call: a stalled pre-flight read is
+    // one card held, and must never be a stalled run.
+    current = await withDeadline(io.readOpportunity(decision.cardId), attemptMs(input), "card_preflight_read");
   } catch (err: any) {
     // Nothing has been claimed or sent, so this is one card held, not a halt.
     return held(`fresh_card_read_failed_${err?.message ?? err}`);
@@ -373,19 +421,35 @@ async function adoptCard(
     return { state: "failed", cardId: decision.cardId, to, claimed: true,
       reason: `Durable write claim refused; remaining card writes halted. ${err?.message ?? err}` };
   }
+  const landed = (card: GhlOpportunity) => card.id === decision.cardId && card.pipelineId === current.pipelineId
+    && card.contactId === current.contactId && card.status === "open"
+    && card.pipelineStageId === decision.stageId && card.monetaryValue === decision.monetaryValue
+    && (card.name ?? null) === (current.name ?? null);
+  // Still exactly as the plan found it: the PUT did not take effect.
+  const untouched = (card: GhlOpportunity) => card.id === decision.cardId && card.pipelineId === current.pipelineId
+    && card.contactId === current.contactId && card.status === current.status
+    && card.pipelineStageId === current.pipelineStageId && card.monetaryValue === current.monetaryValue
+    && (card.name ?? null) === (current.name ?? null);
+
   try {
     await input.writer.assertPending(intentId);
-    await io.moveOpportunityToStage(decision.cardId, decision.stageId, decision.monetaryValue);
-    const accepted = await io.readOpportunity(decision.cardId);
-    if (accepted.id !== decision.cardId || accepted.pipelineId !== current.pipelineId
-        || accepted.contactId !== current.contactId || accepted.status !== "open"
-        || accepted.pipelineStageId !== decision.stageId || accepted.monetaryValue !== decision.monetaryValue
-        || (accepted.name ?? null) !== (current.name ?? null)) throw new Error("Post-write card state not confirmed");
+    await withDeadline(io.moveOpportunityToStage(decision.cardId, decision.stageId, decision.monetaryValue),
+      attemptMs(input), "card_move");
+    const accepted = await withDeadline(io.readOpportunity(decision.cardId), attemptMs(input), "card_readback");
+    if (!landed(accepted)) throw new Error("Post-write card state not confirmed");
     await input.writer.confirm(intentId);
   } catch (err: any) {
-    await input.writer.block();
-    return { state: "failed", cardId: decision.cardId, to, claimed: true,
-      reason: `Write outcome unconfirmed; remaining card writes halted. ${err?.message ?? err}` };
+    return await resolveUnlandedWrite(input, io, {
+      intentId, to, cardId: decision.cardId, failure: err?.message ?? String(err),
+      look: () => io.readOpportunity(decision.cardId),
+      // An adopt always has a card id, so a null here means the card itself has
+      // gone - which is not "the write did not land", it is unknown.
+      verdict: card => card === null ? "unknown" : landed(card) ? "landed" : untouched(card) ? "absent" : "unknown",
+      absentReason: "card_move_did_not_take_effect",
+      absentEvidence: `fresh read of ${decision.cardId} still shows stage ${current.pipelineStageId}`
+        + ` and amount ${current.monetaryValue}, exactly as before the write`,
+      appliedReason: "Stage and amount were already correct on re-read; the write had landed before the error",
+    });
   }
   return { state: "applied", cardId: decision.cardId, to, claimed: true,
     reason: decision.role === "paid" ? "Moved to Paid against verified Jobber settlement; card carries a zero balance"
@@ -411,7 +475,8 @@ async function createCard(
   // that a customer can actually see.
   let live: GhlOpportunity[];
   try {
-    live = await io.listContactOpportunities(input.contactId, input.pipelineId);
+    live = await withDeadline(io.listContactOpportunities(input.contactId, input.pipelineId),
+      attemptMs(input), "contact_cards_preflight_read");
   } catch (err: any) {
     // Without a complete answer we cannot rule out a duplicate, and a duplicate
     // card is the one mistake a customer sees. Hold, do not create.
@@ -455,24 +520,146 @@ async function createCard(
       reason: `Durable creation claim refused; remaining card writes halted. ${err?.message ?? err}` };
   }
   let created: GhlOpportunity | undefined;
+  const landed = (card: GhlOpportunity) => card.pipelineId === input.pipelineId
+    && card.contactId === input.contactId && card.status === "open"
+    && card.pipelineStageId === decision.stageId && card.monetaryValue === decision.monetaryValue
+    && card.name === decision.name;
   try {
     await input.writer.assertPending(intentId);
-    created = await io.createOpportunity({ pipelineId: input.pipelineId, pipelineStageId: decision.stageId,
-      contactId: input.contactId, name: decision.name, monetaryValue: decision.monetaryValue });
+    created = await withDeadline(io.createOpportunity({ pipelineId: input.pipelineId, pipelineStageId: decision.stageId,
+      contactId: input.contactId, name: decision.name, monetaryValue: decision.monetaryValue }),
+      attemptMs(input), "card_create");
     if (!created?.id) throw new Error("GHL did not return the created card");
-    const accepted = await io.readOpportunity(created.id);
-    if (accepted.id !== created.id || accepted.pipelineId !== input.pipelineId
-        || accepted.contactId !== input.contactId || accepted.status !== "open"
-        || accepted.pipelineStageId !== decision.stageId || accepted.monetaryValue !== decision.monetaryValue
-        || accepted.name !== decision.name) throw new Error("Created card state not confirmed");
+    const accepted = await withDeadline(io.readOpportunity(created.id), attemptMs(input), "card_readback");
+    if (accepted.id !== created.id || !landed(accepted)) throw new Error("Created card state not confirmed");
     await input.writer.confirm(intentId);
   } catch (err: any) {
-    await input.writer.block();
-    return { state: "failed", cardId: created?.id ?? null, to, claimed: true,
-      reason: `Creation outcome unconfirmed; remaining card writes halted. ${err?.message ?? err}` };
+    // The card has no id to look up - that is the whole reason a creation is
+    // claimed against the invoice - so the question "did it land?" is answered
+    // by re-listing this contact's cards and looking for this invoice's number.
+    return await resolveUnlandedWrite(input, io, {
+      intentId, to, cardId: created?.id ?? null, failure: err?.message ?? String(err),
+      look: async () => {
+        const cards = await io.listContactOpportunities(input.contactId, input.pipelineId);
+        // If the POST answered with an id, THAT card is the only thing worth
+        // looking at. A card created with the wrong name would not be found by
+        // a name search, and releasing the claim then would let a later run
+        // create a second one - which is the single mistake a customer sees.
+        if (created?.id) {
+          return cards.find(c => c.id === created!.id) ?? null;
+        }
+        const named = cards.filter(c => invoiceNumbersInCardName(c.name).includes(decision.invoiceNumber));
+        // Two cards for one invoice is the duplicate this writer exists to
+        // prevent. Never resolve that automatically.
+        if (named.length > 1) throw new Error(`${named.length} cards already name invoice ${decision.invoiceNumber}`);
+        return named[0] ?? null;
+      },
+      // With an id in hand, "not in the list" means the POST answered about a
+      // card that is not there: that is unknown, not absent. Without an id, no
+      // card naming this invoice is genuine evidence that nothing was created.
+      //
+      // The residual risk is a POST that created the card but errored, and a
+      // list that has not yet caught up. The next run's own pre-flight list
+      // holds if a card for this invoice exists, so a duplicate would need the
+      // card to be invisible on two reads an hour apart.
+      verdict: card => card === null
+        ? (created?.id ? "unknown" : "absent")
+        : landed(card) && (!created?.id || card.id === created.id) ? "landed" : "unknown",
+      absentReason: "creation_post_did_not_create_a_card",
+      absentEvidence: `fresh complete read of contact ${input.contactId} in pipeline ${input.pipelineId}`
+        + ` shows no card naming invoice ${decision.invoiceNumber}`,
+      appliedReason: "Card was found already created and correct on re-read; the POST had landed before the error",
+    });
   }
   return { state: "applied", cardId: created.id, to, claimed: true,
     reason: "Card created in Invoice Sent against verified Jobber source; no Overdue move and no enrollment claimed" };
 }
 
 const stageOf = (input: ApplyInvoiceCardPlanInput, role: keyof StageIds) => input.stageIds[role];
+const attemptMs = (i: ApplyInvoiceCardPlanInput) => i.deadlines?.attemptMs ?? WRITE_ATTEMPT_TIMEOUT_MS;
+const verifyMs = (i: ApplyInvoiceCardPlanInput) => i.deadlines?.verifyMs ?? WRITE_VERIFY_TIMEOUT_MS;
+
+/**
+ * ESTABLISH WHAT ACTUALLY HAPPENED TO A CLAIMED WRITE THAT ERRORED.
+ *
+ * This is the recovery that was missing. Before it, any error between "claim
+ * recorded" and "outcome read back" left the claim pending and the run blocked
+ * forever: no later sync could start (`admitSyncRun` refuses while a run is
+ * blocked) and no card could be written (a pending entry blocks the writer).
+ * One unanswered request on 2026-11-25 stopped every sync for thirteen hours.
+ *
+ * So instead of assuming the worst, go and look. There are exactly three
+ * answers, and only one of them is still a halt:
+ *
+ *   landed  - the provider shows the write, complete and correct. Confirm the
+ *             claim and count the write. This is the case where the mutation
+ *             succeeded and only the read-back or the confirm failed.
+ *   absent  - the provider was read successfully and plainly does not show the
+ *             write. Abandon the claim, recording that observation, and hold
+ *             this one card. The run carries on and a later run may retry.
+ *   unknown - the read failed, or showed something that is neither the old nor
+ *             the new state, or showed a duplicate. Block, exactly as before.
+ *             Fail-closed is preserved for the only case that needs it.
+ *
+ * The verification read is itself bounded, so this can never be the thing that
+ * hangs. If it times out the answer is `unknown`, which blocks - a timeout is
+ * not evidence of absence and is never treated as such.
+ */
+async function resolveUnlandedWrite(
+  input: ApplyInvoiceCardPlanInput, io: InvoiceCardWriteIo,
+  spec: {
+    intentId: string;
+    to: { stageId: string; monetaryValue: number; name?: string };
+    cardId: string | null;
+    failure: string;
+    look: () => Promise<GhlOpportunity | null>;
+    verdict: (card: GhlOpportunity | null) => "landed" | "absent" | "unknown";
+    absentReason: string;
+    absentEvidence: string;
+    appliedReason: string;
+  },
+): Promise<Outcome> {
+  const halt = (reason: string): Outcome =>
+    ({ state: "failed", cardId: spec.cardId, to: spec.to, claimed: true, reason });
+
+  let found: GhlOpportunity | null;
+  try {
+    found = await withDeadline(spec.look(), verifyMs(input), "write_verification_read");
+  } catch (err: any) {
+    await input.writer.block();
+    return halt(`Write outcome unconfirmed and could not be established; remaining card writes halted.`
+      + ` Original failure: ${spec.failure}. Verification failed: ${err?.message ?? err}`);
+  }
+
+  const verdict = spec.verdict(found);
+  if (verdict === "unknown") {
+    await input.writer.block();
+    return halt(`Write outcome unconfirmed and the card is in neither the old nor the new state;`
+      + ` remaining card writes halted. Original failure: ${spec.failure}`);
+  }
+
+  // Both remaining paths settle the claim. If settling it throws, the writer
+  // has already blocked itself and this stays a halt - an outcome we could not
+  // record durably is not an outcome we may act on.
+  if (verdict === "landed") {
+    try {
+      await input.writer.confirm(spec.intentId);
+    } catch (err: any) {
+      return halt(`Write landed but the claim could not be confirmed; remaining card writes halted.`
+        + ` Original failure: ${spec.failure}. Confirm failed: ${err?.message ?? err}`);
+    }
+    return { state: "applied", cardId: found?.id ?? spec.cardId, to: spec.to, claimed: true,
+      reason: `${spec.appliedReason}. Original failure: ${spec.failure}` };
+  }
+
+  try {
+    await input.writer.abandon(spec.intentId, { reason: spec.absentReason,
+      evidence: spec.absentEvidence, observedAt: new Date().toISOString() });
+  } catch (err: any) {
+    return halt(`Write did not land but the claim could not be released; remaining card writes halted.`
+      + ` Original failure: ${spec.failure}. Release failed: ${err?.message ?? err}`);
+  }
+  return { state: "hold", cardId: spec.cardId, to: spec.to, claimed: false,
+    reason: `Write did not land and its claim was released, so a later run may retry;`
+      + ` this card is unchanged. ${spec.absentEvidence}. Original failure: ${spec.failure}` };
+}
