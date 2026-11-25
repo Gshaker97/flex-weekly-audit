@@ -60,8 +60,19 @@ import { invoiceNumbersInCardName, legacySendingIsOff, STAGE_OVERDUE, STAGE_PAID
   type LegacySendingEvidence } from "./ghl-invoice-card-plan";
 
 /** What a caller may do beyond the safe default. Every field defaults to NO. */
-export type WriteAllowances = Readonly<{ overdueMoves: boolean; paidExits: boolean }>;
-const NOTHING_EXTRA: WriteAllowances = Object.freeze({ overdueMoves: false, paidExits: false });
+export type WriteAllowances = Readonly<{
+  overdueMoves: boolean;
+  paidExits: boolean;
+  /**
+   * Retire a COMBINED card whose every named invoice is settled, to Paid at a
+   * zero balance. Separate from `paidExits` on purpose: that one also starts
+   * moving each single invoice's card as it is paid, which is a much larger
+   * change to the board and not what was asked for on 2026-11-25.
+   */
+  combinedPaidExits: boolean;
+}>;
+const NOTHING_EXTRA: WriteAllowances = Object.freeze({
+  overdueMoves: false, paidExits: false, combinedPaidExits: false });
 
 /** A sane ceiling on how much one run may change, whatever the environment says. */
 export const MAX_WRITE_BUDGET = 120;
@@ -125,7 +136,7 @@ export type WriteDecision =
       stageId: string; monetaryValue: number; invoiceId: string; invoiceNumber: string }>
   | Readonly<{ state: "write"; kind: "create"; role: "sent"; stageId: string; name: string;
       monetaryValue: number; invoiceId: string; invoiceNumber: string }>
-  | Readonly<{ state: "write"; kind: "combine"; role: "sent" | "overdue"; cardId: string;
+  | Readonly<{ state: "write"; kind: "combine"; role: "sent" | "overdue" | "paid"; cardId: string;
       stageId: string; monetaryValue: number;
       invoiceIds: readonly string[]; invoiceNumbers: readonly string[] }>
   | Readonly<{ state: "nothing"; reason: string }>
@@ -153,7 +164,13 @@ export function decideInvoiceCardWrite(
   }
   // Phase one ignores settled invoices entirely, by the owner's instruction on
   // 2026-11-20: get the picture of what is OWED right first.
-  if (action.stage === STAGE_PAID && !allow.paidExits) {
+  // Retiring a combined card whose every named invoice is settled is its OWN
+  // allowance, asked for on 2026-11-25. It is deliberately not folded into
+  // `paidExits`: that switch would also start moving every single invoice's
+  // card out of Sent as it is paid, which is a far larger change to the board
+  // than the one that was asked for, and is still the owner's to make.
+  if (action.stage === STAGE_PAID && !allow.paidExits
+      && !(action.state === "combine" && allow.combinedPaidExits)) {
     return Object.freeze({ state: "refuse", reason: "paid_invoices_are_out_of_scope_for_now" });
   }
   const role = action.stage === STAGE_PAID ? "paid" as const
@@ -174,12 +191,18 @@ export function decideInvoiceCardWrite(
   }
 
   if (action.state === "combine") {
-    // A combined card carries several invoices' money, so it can never be the
-    // zero-balance Paid card this writer understands: "everything this card
-    // stands for is settled" is not something a name that does not enumerate
-    // them can establish. Retiring a paid combined card is a separate decision.
-    if (role === "paid") return Object.freeze({ state: "refuse", reason: "a_combined_card_is_never_moved_to_paid" });
-    if (amount <= 0) return Object.freeze({ state: "refuse", reason: "a_combined_card_must_carry_what_is_still_owed" });
+    // A combined card MAY be retired to Paid, but only as a retirement: a zero
+    // balance (enforced above) and - checked in `combineCard` against its own
+    // fresh read - a name that enumerates exactly the invoices being written,
+    // which is the only thing that can establish that nothing else is owed on
+    // it. A card naming no invoice can never pass that check, so the amount on
+    // a card standing for "whatever this customer owes" is never zeroed.
+    if (role === "paid" && !allow.combinedPaidExits) {
+      return Object.freeze({ state: "refuse", reason: "retiring_a_paid_combined_card_is_not_switched_on" });
+    }
+    if (role !== "paid" && amount <= 0) {
+      return Object.freeze({ state: "refuse", reason: "a_combined_card_must_carry_what_is_still_owed" });
+    }
     if (!action.invoiceIds.length || action.invoiceIds.length !== action.invoiceNumbers.length) {
       return Object.freeze({ state: "refuse", reason: "combined_card_invoice_set_unusable" });
     }
@@ -278,13 +301,19 @@ export function invoiceCardWriteGate(
     budget = Number(raw);
     if (budget < 1 || budget > MAX_WRITE_BUDGET) return Object.freeze({ open: false, reason: "write_budget_out_of_range" });
   }
-  // Both allowances are OFF unless something explicitly says otherwise. Paid is
+  // Every allowance is OFF unless something explicitly says otherwise. Paid is
   // opt-in because phase one deliberately ignores settled invoices; Overdue is
-  // opt-in because it is the stage change the legacy workflow sends on.
+  // opt-in because it is the stage change the legacy workflow sends on; and
+  // retiring a settled combined card is its own switch so that it can be turned
+  // on - as it was on 2026-11-25 - without turning on the other.
   return Object.freeze({ open: true, approvalId, budget, allow: Object.freeze({
     overdueMoves: legacySendingIsOff(
       legacySendingFromEnv(env, now), env.GHL_LEGACY_INVOICE_WORKFLOW_ID?.trim() ?? "", now),
     paidExits: env.GHL_PER_INVOICE_PAID_EXITS_ENABLED === "true",
+    // `paidExits` implies it: a caller allowed to move any paid invoice's card
+    // is certainly allowed to retire a card whose invoices are all paid.
+    combinedPaidExits: env.GHL_PER_INVOICE_PAID_EXITS_ENABLED === "true"
+      || env.GHL_PER_INVOICE_COMBINED_PAID_EXITS_ENABLED === "true",
   }) });
 }
 
@@ -520,8 +549,11 @@ async function adoptCard(
  *      payment landing between plan and write changes the total, and a total
  *      that no longer matches is held rather than written.
  *
- * It still NEVER renames a card, never writes a status, never reopens a closed
- * card and never moves one into Paid.
+ * It still NEVER renames a card, never writes a status and never reopens a
+ * closed card. It MAY move one into Paid, but only as a retirement: a zero
+ * balance, a name that enumerates exactly the invoices being written, and a
+ * verified source saying every one of them is settled. A card standing for
+ * "whatever this customer owes" names no invoice, so it can never pass that.
  */
 async function combineCard(
   input: ApplyInvoiceCardPlanInput, io: InvoiceCardWriteIo,
@@ -546,6 +578,14 @@ async function combineCard(
   const covered = new Set(decision.invoiceNumbers);
   const named = invoiceNumbersInCardName(current.name);
   if (named.some(n => !covered.has(n))) return held("card_names_an_invoice_this_write_does_not_cover");
+  // RETIRING one is stricter in the one way that matters. Zeroing a card says
+  // "nothing this card stands for is still owed", and only a name that lists
+  // every one of them can establish that. So here the two sets must match
+  // exactly - checked against this fresh read, not against the plan's older
+  // view of the name - and a card naming nothing can never be retired.
+  if (decision.role === "paid" && (named.length < 2 || named.length !== covered.size)) {
+    return held("only_a_card_that_names_every_invoice_it_covers_can_be_retired");
+  }
 
   const seen = input.preflight.get(decision.cardId);
   if (!seen) return held("card_was_not_in_the_preflight_snapshot");
@@ -566,6 +606,12 @@ async function combineCard(
   for (const id of decision.invoiceIds) {
     const row = invoices.find(i => i.id === id);
     if (!row) return held("source_evidence_unavailable");
+    if (decision.role === "paid") {
+      // Retiring the card asserts every one of these is settled, so the source
+      // has to say so about every one of them, by status AND by balance.
+      if (row.invoiceStatus !== "paid" || row.balanceCents !== 0) return held("one_of_these_invoices_is_not_settled");
+      continue;
+    }
     if (row.invoiceStatus === "paid" || row.balanceCents <= 0) return held("one_of_these_invoices_is_no_longer_unpaid");
     owed += row.balanceCents;
   }
@@ -613,12 +659,16 @@ async function combineCard(
       appliedReason: "Stage and amount were already correct on re-read; the write had landed before the error",
     });
   }
+  const which = `${decision.invoiceIds.length} invoice${decision.invoiceIds.length === 1 ? "" : "s"}`
+    + ` (${decision.invoiceNumbers.map(n => `#${n}`).join(", ")})`;
   return { state: "applied", cardId: decision.cardId, to, claimed: true,
-    reason: `One card adopted for ${decision.invoiceIds.length} invoice${decision.invoiceIds.length === 1 ? "" : "s"}`
-      + ` (${decision.invoiceNumbers.map(n => `#${n}`).join(", ")}) against verified Jobber source;`
-      + (decision.role === "overdue"
-        ? " moved to Overdue with recorded proof the legacy workflow cannot send; name and status untouched"
-        : " name and status untouched") };
+    reason: decision.role === "paid"
+      ? `One card retired to Paid at a zero balance; it named only ${which}, and the verified`
+        + " Jobber source shows every one of them settled; name and status untouched"
+      : `One card adopted for ${which} against verified Jobber source;`
+        + (decision.role === "overdue"
+          ? " moved to Overdue with recorded proof the legacy workflow cannot send; name and status untouched"
+          : " name and status untouched") };
 }
 
 /** Create the card an invoice has never had. Always "Invoice Sent". */

@@ -39,8 +39,10 @@ const plan = (...actions: InvoiceCardAction[]): InvoiceCardPlan => ({
     combine: actions.filter(a => a.state === "combine").length, hold: 0, skip: 0, untouched: 0 },
 });
 
-const ALLOW_OVERDUE: WriteAllowances = { overdueMoves: true, paidExits: false };
-const ALLOW_PAID: WriteAllowances = { overdueMoves: false, paidExits: true };
+const ALLOW_OVERDUE: WriteAllowances = { overdueMoves: true, paidExits: false, combinedPaidExits: false };
+const ALLOW_PAID: WriteAllowances = { overdueMoves: false, paidExits: true, combinedPaidExits: true };
+/** Retiring a settled combined card, without the wider single-invoice Paid exit. */
+const ALLOW_RETIRE: WriteAllowances = { overdueMoves: false, paidExits: false, combinedPaidExits: true };
 
 // --- the two gates --------------------------------------------------------
 
@@ -165,7 +167,7 @@ test("the gate needs an approval token and a location", () => {
 
 test("a fully configured gate opens with a bounded budget and no extra allowances", () => {
   assert.deepEqual(invoiceCardWriteGate(baseEnv), { open: true, approvalId: "reviewed-plan-1",
-    budget: DEFAULT_WRITE_BUDGET, allow: { overdueMoves: false, paidExits: false } });
+    budget: DEFAULT_WRITE_BUDGET, allow: { overdueMoves: false, paidExits: false, combinedPaidExits: false } });
 });
 
 test("the gate turns Overdue on only from recorded proof about the SAME workflow", () => {
@@ -859,11 +861,17 @@ test("a combined card is moved to the summed amount, keeping its name and status
   assert.equal(prepared[0].creation, undefined, "a combine creates nothing");
 });
 
-test("a combined card is never moved to Paid", () => {
-  const decision = decideInvoiceCardWrite(
-    combine({ stage: "Invoice Paid", desiredStage: "Invoice Paid", monetaryValue: 0 }),
-    STAGES, { overdueMoves: true, paidExits: true });
-  assert.equal(decision.state === "refuse" && decision.reason, "a_combined_card_is_never_moved_to_paid");
+test("a combined card is not moved to Paid unless retiring one is switched on", () => {
+  // The allowance exists so that retiring a settled combined card can be turned
+  // on WITHOUT turning on the single-invoice Paid exit, which would move a far
+  // larger part of the board. Owner's decision, 2026-11-25.
+  const action = combine({ stage: "Invoice Paid", desiredStage: "Invoice Paid", monetaryValue: 0 });
+  const off = decideInvoiceCardWrite(action, STAGES, { overdueMoves: true, paidExits: false, combinedPaidExits: false });
+  assert.equal(off.state === "refuse" && off.reason, "paid_invoices_are_out_of_scope_for_now");
+  const on = decideInvoiceCardWrite(action, STAGES, ALLOW_RETIRE);
+  assert.equal(on.state, "write");
+  assert.equal(on.state === "write" && on.role, "paid");
+  assert.equal(on.state === "write" && on.monetaryValue, 0);
 });
 
 test("a combined card must carry what is still owed, never nothing", () => {
@@ -979,6 +987,164 @@ test("one combined write costs one unit of the run's budget, not one per invoice
   const spend = { remaining: 1 };
   const { result } = await run(plan(combine()), h,
     { allow: { overdueMoves: true, paidExits: false }, source: both(), spend });
+  assert.equal(result.applied, 1);
+  assert.equal(spend.remaining, 0);
+});
+
+// ---- RETIRING A SETTLED COMBINED CARD -------------------------------------
+//
+// Asked for on 2026-11-25. Zeroing a card asserts that nothing it stands for is
+// still owed, so the write is allowed only when the card's name enumerates
+// exactly the invoices being written AND the verified source says every one of
+// them is settled. Both are re-checked here, against this writer's own fresh
+// read, never against the plan's older view.
+
+/** Both invoices settled in the verified source. */
+const bothSettled = () => [
+  invoice({ id: INVOICE, invoiceNumber: NUMBER, invoiceStatus: "paid", amounts: { total: 300, invoiceBalance: 0 } }),
+  invoice({ id: INV_B, invoiceNumber: NUM_B, invoiceStatus: "paid", amounts: { total: 350, invoiceBalance: 0 } }),
+];
+/** The plan's retirement: Paid, zero, covering both. */
+const retire = (over: Partial<Extract<InvoiceCardAction, { state: "combine" }>> = {}) =>
+  combine({ desiredStage: "Invoice Paid", stage: "Invoice Paid", monetaryValue: 0, ...over });
+/** A card whose name enumerates exactly the two invoices being written. */
+const NAMES_BOTH = `Elizabeth Brungs — 2 invoices · #${NUMBER} · #${NUM_B}`;
+
+test("a settled combined card is moved to Paid at zero, keeping its name and status", async () => {
+  process.env.GHL_WRITE_APPROVAL_ID = "reviewed-plan-1";
+  const h = harness([openCard({ name: NAMES_BOTH, monetaryValue: 487.5, pipelineStageId: STAGES.sent })]);
+  const { result, reports, prepared } = await run(plan(retire()), h,
+    { allow: { overdueMoves: false, paidExits: false, combinedPaidExits: true }, source: bothSettled() });
+  assert.equal(result.applied, 1);
+  assert.equal(result.halted, false);
+  assert.deepEqual(h.puts, [{ id: "card-1", stageId: STAGES.paid, monetaryValue: 0, name: undefined }],
+    "zeroed, moved to Paid, and no name in the PUT");
+  assert.equal(h.cards.get("card-1")!.status, "open", "status untouched");
+  assert.equal(h.cards.get("card-1")!.name, NAMES_BOTH, "name untouched");
+  // The claim records every invoice the card stood for, and renames nothing.
+  assert.equal(prepared.length, 1);
+  assert.deepEqual([...prepared[0].source.storedInvoiceIds].sort(), [INVOICE, INV_B].sort());
+  assert.equal(prepared[0].target.updateName, false);
+  assert.equal(prepared[0].target.amountCents, 0);
+  // One write, one line per invoice it covered.
+  assert.equal(reports.length, 2);
+  for (const r of reports) {
+    assert.equal(r.action, "applied");
+    assert.equal(r.kind, "combine");
+    assert.equal(r.cardId, "card-1");
+    assert.deepEqual([...(r.coveredInvoiceNumbers ?? [])], [NUMBER, NUM_B]);
+    assert.match(String(r.reason), /retired to Paid/);
+  }
+});
+
+test("retiring a combined card needs its own allowance, not the wider Paid exit", async () => {
+  process.env.GHL_WRITE_APPROVAL_ID = "reviewed-plan-1";
+  for (const allow of [
+    { overdueMoves: false, paidExits: false, combinedPaidExits: false },
+    { overdueMoves: true, paidExits: false, combinedPaidExits: false },
+  ]) {
+    const h = harness([openCard({ name: NAMES_BOTH, monetaryValue: 487.5, pipelineStageId: STAGES.sent })]);
+    const { result, reports } = await run(plan(retire()), h, { allow, source: bothSettled() });
+    assert.equal(result.applied, 0);
+    assert.deepEqual(h.puts, [], "nothing written");
+    assert.ok(reports.every(r => r.reason === "paid_invoices_are_out_of_scope_for_now"), String(reports[0]?.reason));
+  }
+});
+
+test("a card that does not name every invoice it covers is never retired", async () => {
+  process.env.GHL_WRITE_APPROVAL_ID = "reviewed-plan-1";
+  // The hazard this guard exists for: a card standing for "whatever this
+  // customer owes" names nothing, so nothing establishes that all of it is
+  // settled - and zeroing it would wipe a figure that may still be real.
+  for (const name of [
+    "Elizabeth Brungs — 2 unpaid invoices",          // names none of them
+    `Elizabeth Brungs — #${NUMBER} only`,            // names one of two
+    null,                                            // no name at all
+  ]) {
+    const h = harness([openCard({ name, monetaryValue: 487.5, pipelineStageId: STAGES.sent })]);
+    const { result, reports } = await run(plan(retire()), h,
+      { allow: { overdueMoves: false, paidExits: false, combinedPaidExits: true }, source: bothSettled() });
+    assert.equal(result.applied, 0, String(name));
+    assert.deepEqual(h.puts, [], String(name));
+    assert.ok(reports.every(r => r.reason === "only_a_card_that_names_every_invoice_it_covers_can_be_retired"),
+      `${name}: ${reports[0]?.reason}`);
+  }
+});
+
+test("a retirement is refused unless the source says every invoice is settled", async () => {
+  process.env.GHL_WRITE_APPROVAL_ID = "reviewed-plan-1";
+  const sources: Record<string, ReturnType<typeof bothSettled>> = {
+    "one still past due": [
+      invoice({ id: INVOICE, invoiceNumber: NUMBER, invoiceStatus: "paid", amounts: { total: 300, invoiceBalance: 0 } }),
+      invoice({ id: INV_B, invoiceNumber: NUM_B, invoiceStatus: "past_due", amounts: { total: 350, invoiceBalance: 350 } }),
+    ],
+    "paid but still carrying a balance": [
+      invoice({ id: INVOICE, invoiceNumber: NUMBER, invoiceStatus: "paid", amounts: { total: 300, invoiceBalance: 0 } }),
+      invoice({ id: INV_B, invoiceNumber: NUM_B, invoiceStatus: "paid", amounts: { total: 350, invoiceBalance: 10 } }),
+    ],
+  };
+  for (const [label, source] of Object.entries(sources)) {
+    const h = harness([openCard({ name: NAMES_BOTH, monetaryValue: 487.5, pipelineStageId: STAGES.sent })]);
+    const { result, reports } = await run(plan(retire()), h,
+      { allow: { overdueMoves: false, paidExits: false, combinedPaidExits: true }, source });
+    assert.equal(result.applied, 0, label);
+    assert.deepEqual(h.puts, [], label);
+    assert.ok(reports.every(r => r.reason === "one_of_these_invoices_is_not_settled"), `${label}: ${reports[0]?.reason}`);
+  }
+});
+
+test("a retirement is refused when an invoice has vanished from the source", async () => {
+  process.env.GHL_WRITE_APPROVAL_ID = "reviewed-plan-1";
+  const h = harness([openCard({ name: NAMES_BOTH, monetaryValue: 487.5, pipelineStageId: STAGES.sent })]);
+  const { result, reports } = await run(plan(retire()), h, {
+    allow: { overdueMoves: false, paidExits: false, combinedPaidExits: true },
+    source: [bothSettled()[0]],
+  });
+  assert.equal(result.applied, 0);
+  assert.deepEqual(h.puts, []);
+  assert.ok(reports.every(r => r.reason === "source_evidence_unavailable"), String(reports[0]?.reason));
+});
+
+test("a retirement must carry a zero balance", () => {
+  // A non-zero Paid card is refused before anything about combining is read:
+  // the zero balance is what keeps a Paid card out of the legacy ladder.
+  const decision = decideInvoiceCardWrite(retire({ monetaryValue: 10 }), STAGES, ALLOW_RETIRE);
+  assert.equal(decision.state === "refuse" && decision.reason, "paid_card_must_carry_a_zero_balance");
+});
+
+test("a card already retired is left alone with nothing written", async () => {
+  process.env.GHL_WRITE_APPROVAL_ID = "reviewed-plan-1";
+  const h = harness([openCard({ name: NAMES_BOTH, monetaryValue: 0, pipelineStageId: STAGES.paid })]);
+  const { result, reports } = await run(plan(retire({ changes: [] })), h,
+    { allow: { overdueMoves: false, paidExits: false, combinedPaidExits: true }, source: bothSettled() });
+  assert.equal(result.applied, 0);
+  assert.deepEqual(h.puts, []);
+  assert.ok(reports.every(r => r.reason === "card_already_matches_these_invoices"), String(reports[0]?.reason));
+});
+
+test("a retirement that never takes effect releases its claim", async () => {
+  process.env.GHL_WRITE_APPROVAL_ID = "reviewed-plan-1";
+  const h = harness([openCard({ name: NAMES_BOTH, monetaryValue: 487.5, pipelineStageId: STAGES.sent })]);
+  h.putFails = true;
+  const { result, reports, fixture } = await run(plan(retire()), h,
+    { allow: { overdueMoves: false, paidExits: false, combinedPaidExits: true }, source: bothSettled() });
+  assert.equal(result.applied, 0);
+  assert.equal(result.halted, false, "a released claim must not halt the run");
+  assert.equal(h.cards.get("card-1")!.pipelineStageId, STAGES.sent, "still where it was");
+  assert.equal(h.cards.get("card-1")!.monetaryValue, 487.5, "and still carries what it carried");
+  assert.ok(reports.every(r => r.action === "hold" && /claim was released/.test(r.reason)), reports[0]?.reason);
+  const history = await fixture.writer.readCycleHistory();
+  assert.equal(history.length, 1);
+  assert.equal(history[0].state, "abandoned");
+  assert.equal(history[0].abandonment?.reason, "combined_card_move_did_not_take_effect");
+});
+
+test("one retirement costs one unit of the write budget, not one per invoice", async () => {
+  process.env.GHL_WRITE_APPROVAL_ID = "reviewed-plan-1";
+  const h = harness([openCard({ name: NAMES_BOTH, monetaryValue: 487.5, pipelineStageId: STAGES.sent })]);
+  const spend = { remaining: 1 };
+  const { result } = await run(plan(retire()), h,
+    { allow: { overdueMoves: false, paidExits: false, combinedPaidExits: true }, source: bothSettled(), spend });
   assert.equal(result.applied, 1);
   assert.equal(spend.remaining, 0);
 });

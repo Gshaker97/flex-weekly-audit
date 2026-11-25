@@ -446,7 +446,7 @@ test("a settled invoice on a combined card is accounted for, not added to the to
   assert.equal(combined.monetaryValue, 350, "only what is still owed");
   assert.deepEqual([...combined.invoiceNumbers], ["7304"]);
   assert.ok(p.actions.some(a => a.state === "skip" && a.invoiceNumber === "7286"
-    && a.reasons.includes("paid_invoice_is_covered_by_a_shared_card_and_needs_no_move")));
+    && a.reasons.includes("paid_invoice_is_covered_by_a_shared_card")));
 });
 
 test("a combined card naming an invoice this plan cannot see is left alone", () => {
@@ -570,4 +570,129 @@ test("a customer the hold does not name is moved normally", () => {
   const brungs = two().actions[0];
   assert.equal(brungs.state, "combine");
   assert.equal(brungs.state === "combine" ? brungs.stage : null, STAGE_OVERDUE);
+});
+
+// ---- RETIRING A COMBINED CARD WHOSE INVOICES ARE ALL SETTLED --------------
+//
+// Phase one left such a card where it was. The owner asked on 2026-11-25 for a
+// card that NAMES every invoice it covers to be retired once all of them are
+// paid: the name is the boundary of what the card stands for, so if every
+// number on it is settled, the card stands for nothing still owed.
+
+/** Both of Brungs's invoices paid, which is how they read from 2026-11-25. */
+const bothPaid = (over: Partial<InvoiceCardInput> = {}) => two({
+  invoices: [
+    invoice({ invoiceId: "i-7286", invoiceNumber: "7286", status: "paid", totalDollars: 137, balanceDollars: 0 }),
+    invoice({ invoiceId: "i-7304", invoiceNumber: "7304", status: "paid", totalDollars: 350, balanceDollars: 0 }),
+  ],
+  ...over,
+});
+
+test("a card naming only settled invoices is retired to Paid at zero", () => {
+  const p = bothPaid();
+  const a = p.actions.find(x => x.state === "combine");
+  assert.ok(a && a.state === "combine", "the card itself is acted on");
+  if (!a || a.state !== "combine") return;
+  assert.equal(a.cardId, "brungs");
+  assert.equal(a.stage, STAGE_PAID);
+  assert.equal(a.desiredStage, STAGE_PAID, "nothing withholds a retirement");
+  assert.equal(a.monetaryValue, 0, "a retired card carries nothing");
+  assert.deepEqual([...a.invoiceNumbers], ["7286", "7304"], "every invoice it named");
+  assert.deepEqual([...a.invoiceIds], ["i-7286", "i-7304"]);
+  assert.deepEqual([...a.changes].sort(), ["stage", "value"]);
+  assert.ok(a.reasons.includes("card_names_only_settled_invoices_so_it_is_retired_to_paid"));
+  assert.ok(!("name" in a), "a retirement must carry no name");
+  assert.deepEqual([...p.untouched], [], "it is not also reported untouched");
+  // The invoices themselves still need no card of their own.
+  for (const n of ["7286", "7304"]) {
+    assert.ok(p.actions.some(x => x.state === "skip" && x.invoiceNumber === n
+      && x.reasons.includes("paid_invoice_is_covered_by_a_shared_card")), n);
+  }
+});
+
+test("a card already in Paid at zero is reported with nothing to change", () => {
+  const p = bothPaid({ cards: [card({ id: "brungs", name: BRUNGS, stageName: STAGE_PAID, monetaryValue: 0 })] });
+  const a = p.actions.find(x => x.state === "combine");
+  assert.ok(a && a.state === "combine");
+  if (!a || a.state !== "combine") return;
+  assert.deepEqual([...a.changes], [], "the writer turns an empty change list into no write at all");
+});
+
+test("one unpaid invoice on the card means it is revalued, never retired", () => {
+  // The whole hazard: zeroing a card that still stands for money owed.
+  const p = bothPaid({ invoices: [
+    invoice({ invoiceId: "i-7286", invoiceNumber: "7286", status: "paid", totalDollars: 137, balanceDollars: 0 }),
+    invoice({ invoiceId: "i-7304", invoiceNumber: "7304", status: "past_due", totalDollars: 350, balanceDollars: 350 }),
+  ] });
+  const combined = p.actions.filter(x => x.state === "combine");
+  assert.equal(combined.length, 1, "one action for the card, not one per pass");
+  const a = combined[0];
+  if (a.state !== "combine") return;
+  assert.equal(a.stage, STAGE_OVERDUE);
+  assert.equal(a.monetaryValue, 350, "what is still owed");
+  assert.deepEqual([...a.invoiceNumbers], ["7304"]);
+});
+
+test("a card naming a settled invoice AND one it cannot see is left alone", () => {
+  // #9999 is not in this run at all, so nothing here can say it is settled -
+  // and a card carrying that unknown must not be declared paid off.
+  const p = bothPaid({ cards: [card({ id: "brungs", name: "Brungs — #7286, #7304, #9999", monetaryValue: 487 })] });
+  assert.ok(!p.actions.some(a => a.state === "combine"), "the card is not written");
+  const holds = p.actions.filter(a => a.state === "hold");
+  assert.equal(holds.length, 2, "one per settled invoice on that card");
+  for (const h of holds) assert.ok(h.reasons.includes("shared_card_names_an_invoice_this_plan_cannot_account_for"));
+});
+
+test("a settled invoice whose partner could not be read retires nothing", () => {
+  // #7304 has no readable number, so it cannot be matched to the card by name
+  // and the card's own #7304 is therefore unaccounted for.
+  const p = bothPaid({ invoices: [
+    invoice({ invoiceId: "i-7286", invoiceNumber: "7286", status: "paid", totalDollars: 137, balanceDollars: 0 }),
+    invoice({ invoiceId: "i-7304", invoiceNumber: "", status: "paid", totalDollars: 350, balanceDollars: 0 }),
+  ] });
+  assert.ok(!p.actions.some(a => a.state === "combine"));
+  assert.ok(p.actions.some(a => a.state === "hold" && a.reasons.includes("invoice_number_missing")));
+  assert.ok(p.actions.some(a => a.state === "hold" && a.invoiceNumber === "7286"
+    && a.reasons.includes("shared_card_names_an_invoice_this_plan_cannot_account_for")));
+});
+
+test("a card standing for whatever the customer owes is never retired", () => {
+  // It names no invoice, so "all of them are paid" is not something its name
+  // can establish. Nothing is written, and nothing is held either: a paid
+  // invoice with no card of its own simply needs none.
+  const p = bothPaid({ cards: [card({ id: "agg", name: "Elizabeth Brungs — 2 unpaid invoices", monetaryValue: 487 })] });
+  assert.ok(!p.actions.some(a => a.state === "combine"), "the unnamed card is left as it is");
+  assert.ok(!p.actions.some(a => a.state === "hold"));
+  for (const n of ["7286", "7304"]) {
+    assert.ok(p.actions.some(a => a.state === "skip" && a.invoiceNumber === n
+      && a.reasons.includes("paid_invoice_needs_no_card")), n);
+  }
+  assert.deepEqual(p.untouched.map(u => u.cardId), ["agg"]);
+});
+
+test("a settled card in a protected stage or closed is never retired", () => {
+  for (const stage of PROTECTED_STAGES) {
+    const p = bothPaid({ cards: [card({ id: "brungs", name: BRUNGS, stageName: stage })] });
+    assert.ok(!p.actions.some(a => a.state === "combine"), stage);
+    assert.ok(p.actions.some(a => a.state === "hold" && a.reasons.includes("shared_card_is_in_a_protected_stage")), stage);
+  }
+  for (const status of ["won", "lost", "", null]) {
+    const p = bothPaid({ cards: [card({ id: "brungs", name: BRUNGS, status })] });
+    assert.ok(!p.actions.some(a => a.state === "combine"), String(status));
+    assert.ok(p.actions.some(a => a.state === "hold"
+      && a.reasons.includes("shared_card_is_not_open_and_is_never_reopened")), String(status));
+  }
+});
+
+test("two combined cards cannot account for each other's settled invoices", () => {
+  // #7286 is on one card and #7304 on another. Each card names an invoice the
+  // other one's pass settled, and neither may borrow that to retire itself.
+  const p = bothPaid({ cards: [
+    card({ id: "a", name: "Brungs — #7286, #7304", monetaryValue: 487 }),
+    card({ id: "b", name: "Brungs — #7286, #7304 (duplicate)", monetaryValue: 487 }),
+  ] });
+  // Both cards name both invoices, so each invoice matches two cards.
+  assert.ok(!p.actions.some(a => a.state === "combine"));
+  assert.ok(p.actions.every(a => a.state === "hold"));
+  for (const a of p.actions) assert.ok(a.reasons.includes("multiple_cards_name_this_invoice"));
 });

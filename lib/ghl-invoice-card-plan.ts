@@ -188,6 +188,11 @@ export type InvoiceCardAction =
        * action moves that one card to the stage and amount the whole set adds
        * up to. It never renames it, so the set it may cover is bounded by what
        * the name already says; see `planInvoiceCards`.
+       *
+       * It is also how a combined card is RETIRED: when every invoice its name
+       * enumerates is settled, the target is Paid at a zero balance. That is
+       * only ever emitted for a card that names its invoices, because the name
+       * is what establishes that nothing else is still owed on it.
        */
       state: "combine"; cardId: string;
       /** Every invoice this one card is being made to stand for. At least one. */
@@ -353,6 +358,14 @@ export function planInvoiceCards(input: InvoiceCardInput): InvoiceCardPlan {
   type Pending = Readonly<{ invoiceId: string; invoiceNumber: string; balance: number; overdue: boolean }>;
   /** Invoices whose only match is a card naming several invoices, by card id. */
   const shared = new Map<string, Pending[]>();
+  /**
+   * The same, for invoices that are already SETTLED. A paid invoice needs no
+   * card of its own, but the combined card it shares may now stand for nothing
+   * but settled invoices - and that card is retired to Paid at zero. Kept per
+   * card, not as one flat set, so one customer's two combined cards cannot
+   * account for each other's invoices.
+   */
+  const settledShared = new Map<string, Pending[]>();
   /** Invoices with no card naming them at all. */
   const orphans: Pending[] = [];
   /** Cards this plan has given to a single invoice; never also combined. */
@@ -405,12 +418,16 @@ export function planInvoiceCards(input: InvoiceCardInput): InvoiceCardPlan {
       // Its only match names other invoices too, so the card is not this
       // invoice's - it is theirs together. Decided below, once every invoice
       // sharing that card has been seen.
+      const card = matches[0];
       if (want.stage === STAGE_PAID) {
+        // This invoice itself needs no card of its own. The card it shares may
+        // still need retiring, but only once every invoice named on it has been
+        // seen - so it is recorded here and decided after the loop.
         actions.push(Object.freeze({ state: "skip", invoiceId: invoice.invoiceId, invoiceNumber: number,
-          reasons: sorted(["paid_invoice_is_covered_by_a_shared_card_and_needs_no_move"]) }));
+          reasons: sorted(["paid_invoice_is_covered_by_a_shared_card"]) }));
+        settledShared.set(card.id, [...(settledShared.get(card.id) ?? []), pending]);
         continue;
       }
-      const card = matches[0];
       shared.set(card.id, [...(shared.get(card.id) ?? []), pending]);
       continue;
     }
@@ -525,6 +542,40 @@ export function planInvoiceCards(input: InvoiceCardInput): InvoiceCardPlan {
     }));
   };
 
+  /**
+   * Emit the one `combine` that moves a card to Paid: a combined card whose
+   * every named invoice is settled, retired at a zero balance.
+   *
+   * Deliberately NOT routed through `combine` above. That function's whole job
+   * is to work out a stage and a total from what is still owed, and every one
+   * of those steps - the Overdue decision, the owner hold, the positive-sum
+   * check - is wrong here. Sharing the code would mean a flag threaded through
+   * all of it; a card being retired has one target and it is fixed.
+   */
+  const retire = (cardId: string, group: readonly Pending[]): void => {
+    const card = input.cards.find(c => c.id === cardId);
+    if (!card) { holdGroup(group, cardId, "shared_card_vanished_from_this_contacts_cards"); return; }
+    const stageNow = card.stageName ?? null;
+    if (stageNow && PROTECTED_STAGES.some(s => s.toLowerCase() === stageNow.toLowerCase())) {
+      holdGroup(group, cardId, "shared_card_is_in_a_protected_stage"); return;
+    }
+    if ((card.status ?? "").toLowerCase() !== "open") {
+      holdGroup(group, cardId, "shared_card_is_not_open_and_is_never_reopened"); return;
+    }
+    const changes: ("stage" | "value")[] = [];
+    if (stageNow !== STAGE_PAID) changes.push("stage");
+    if (card.monetaryValue !== 0) changes.push("value");
+    claimed.add(cardId);
+    actions.push(Object.freeze({
+      state: "combine", cardId,
+      invoiceIds: Object.freeze([...group].map(p => p.invoiceId).sort()),
+      invoiceNumbers: Object.freeze([...group].map(p => p.invoiceNumber).sort()),
+      desiredStage: STAGE_PAID, stage: STAGE_PAID, monetaryValue: 0,
+      changes: Object.freeze(changes),
+      reasons: sorted(["card_names_only_settled_invoices_so_it_is_retired_to_paid"]),
+    }));
+  };
+
   // A card that enumerates its invoices covers exactly those, so every number
   // it names must be one this plan could read and act on. If it names an
   // invoice we cannot see - out of the window, missing from the snapshot - the
@@ -533,19 +584,48 @@ export function planInvoiceCards(input: InvoiceCardInput): InvoiceCardPlan {
     const card = input.cards.find(c => c.id === cardId);
     const named = invoiceNumbersInCardName(card?.name);
     const covered = new Set(group.map(p => p.invoiceNumber));
-    // Numbers on the card that are settled: already paid, so they are rightly
+    // Numbers on THIS card that are settled: already paid, so they are rightly
     // absent from the total but are still accounted for.
-    const settled = new Set<string>();
-    for (const a of actions) {
-      if (a.state === "skip" && a.invoiceNumber
-          && a.reasons.includes("paid_invoice_is_covered_by_a_shared_card_and_needs_no_move")) settled.add(a.invoiceNumber);
-    }
+    const settled = new Set((settledShared.get(cardId) ?? []).map(p => p.invoiceNumber));
     const unaccounted = named.filter(n => !covered.has(n) && !settled.has(n));
     if (unaccounted.length) {
       holdGroup(group, cardId, "shared_card_names_an_invoice_this_plan_cannot_account_for"); continue;
     }
     if (unreadableInvoice) { holdGroup(group, cardId, "another_invoice_for_this_customer_could_not_be_read"); continue; }
     combine(cardId, group, ["card_names_these_invoices_together_so_it_is_adopted_for_all_of_them"]);
+  }
+
+  // ---- RETIRING A COMBINED CARD WHOSE EVERY NAMED INVOICE IS SETTLED. ------
+  //
+  // Phase one left a paid combined card where it was, because "everything this
+  // card stands for is settled" is not something a name that does not enumerate
+  // its invoices can establish. A card that DOES enumerate them can establish
+  // it: the name is the boundary of what the card covers, so if every number on
+  // it is an invoice this run read as fully paid, the card stands for nothing
+  // that is still owed and belongs in Paid at zero. The account owner asked for
+  // this on 2026-11-25.
+  //
+  // Everything that makes the refusal safe is kept:
+  //   - a card naming an invoice this run could NOT read is still left alone,
+  //     because that one invoice might still be owed;
+  //   - a card with any unpaid invoice on it goes to the pass above instead;
+  //   - the name itself is never changed, the status is never written, and a
+  //     closed or protected card is never touched.
+  // The writer checks the same enumeration again against its own fresh read of
+  // the card and against the verified Jobber source, so a stale plan cannot
+  // retire a card that has come to name something else.
+  for (const [cardId, group] of settledShared) {
+    // Anything still owed on this card is the other pass's business.
+    if (shared.has(cardId) || directlyOwned.has(cardId)) continue;
+    const card = input.cards.find(c => c.id === cardId);
+    const named = invoiceNumbersInCardName(card?.name);
+    const covered = new Set(group.map(p => p.invoiceNumber));
+    // Only a card that enumerates several invoices can be retired this way.
+    if (named.length < 2) continue;
+    if (named.some(n => !covered.has(n))) {
+      holdGroup(group, cardId, "shared_card_names_an_invoice_this_plan_cannot_account_for"); continue;
+    }
+    retire(cardId, group);
   }
 
   // An invoice with no card of its own gets a new card only if the customer has
