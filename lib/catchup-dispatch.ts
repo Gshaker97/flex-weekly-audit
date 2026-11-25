@@ -8,8 +8,8 @@
  * deliberately identical so the two cannot drift:
  *
  *   1. check the plan still describes the message about to be sent;
- *   2. TAKE A LAST LIVE LOOK at every invoice - still open, still owing, still
- *      on the same day past due;
+ *   2. TAKE A LAST LIVE LOOK at every invoice - still open, STILL NOT PAID,
+ *      still owing the same figure, still on the same day past due;
  *   3. RESERVE EVERY LEDGER ROW for this channel;
  *   4. mark them pending, so a crash mid-send cannot read as "never attempted";
  *   5. make exactly ONE attempt;
@@ -55,11 +55,29 @@ import {
   type NotificationLedger, type NotificationReservation,
 } from "./notification-ledger";
 
+/**
+ * The statuses an invoice may carry and still be chased. Jobber's own set is
+ * wider - `paid`, `draft`, `void` and `bad_debt` are all real - and none of
+ * those is a thing to send a customer a past-due notice about.
+ */
+export const SENDABLE_INVOICE_STATUSES = Object.freeze(["awaiting_payment", "past_due"] as const);
+
 /** The last live look at one invoice, read at send time. */
 export type CatchupDueConfirmation = Readonly<{
   stillOpen: boolean;
   balanceMinor: number | null;
   dayPastDue: number | null;
+  /**
+   * The status the SOURCE gives this invoice, at send time. Required, and null
+   * only when it could not be read - which refuses the send, because an
+   * unreadable status is not evidence that anything is owed.
+   *
+   * It is kept separate from `stillOpen` on purpose. An adapter computes
+   * `stillOpen` and can compute it wrongly; the status is a fact read straight
+   * off the source, and checking it here means no adapter can accidentally
+   * decide for itself that a paid invoice is still chaseable.
+   */
+  invoiceStatus: string | null;
 }>;
 
 export type CatchupDispatchIO = Readonly<{
@@ -210,6 +228,18 @@ export async function dispatchCatchupSend(
       return refuse("live_invoice_read_failed");
     }
     if (!live || live.stillOpen !== true) return refuse("invoice_no_longer_open");
+    // THE STATUS IS CHECKED HERE, not just the balance.
+    //
+    // A balance is not a status. Jobber will report an invoice as `paid` while
+    // a balance is still sitting on it - the status refresh treats exactly that
+    // combination as a conflict needing review - and it reports `void`, `draft`
+    // and `bad_debt` invoices that may carry a balance too. Any of those would
+    // pass a balance-only look and go out as a past-due notice.
+    const status = typeof live.invoiceStatus === "string" ? live.invoiceStatus.trim().toLowerCase() : null;
+    if (status === "paid") return refuse("invoice_is_paid_at_send_time");
+    if (!status || !SENDABLE_INVOICE_STATUSES.some(s => s === status)) {
+      return refuse("invoice_status_is_not_sendable_at_send_time");
+    }
     if (typeof live.balanceMinor !== "number" || live.balanceMinor <= 0) return refuse("invoice_no_longer_owes");
     if (live.dayPastDue !== row.dayPastDue) return refuse("day_past_due_changed_since_planning");
     // The message states a dollar figure. "Still owes something" is not the same
