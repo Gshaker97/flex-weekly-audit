@@ -36,7 +36,7 @@ const create = (over: Partial<Extract<InvoiceCardAction, { state: "create" }>> =
 const plan = (...actions: InvoiceCardAction[]): InvoiceCardPlan => ({
   actions, untouched: [],
   summary: { adopt: actions.filter(a => a.state === "adopt").length, create: actions.filter(a => a.state === "create").length,
-    hold: 0, skip: 0, untouched: 0 },
+    combine: actions.filter(a => a.state === "combine").length, hold: 0, skip: 0, untouched: 0 },
 });
 
 const ALLOW_OVERDUE: WriteAllowances = { overdueMoves: true, paidExits: false };
@@ -808,4 +808,177 @@ test("an abandoned claim must carry the observation that released it", async () 
   parsed.writes[0].state = "abandoned";
   row.errorMessage = "FLEX_GHL_WRITE_JOURNAL_V1:" + JSON.stringify(parsed);
   await assert.rejects(() => fresh.writer.readCycleHistory());
+});
+
+// --- taking over a combined card -----------------------------------------
+//
+// Added 2026-11-25. One card standing for several invoices, moved to the stage
+// and amount the whole set adds up to, with the name and status untouched.
+
+const INV_B = "invoice-2", NUM_B = "7304";
+const BRUNGS_NAME = "Elizabeth Brungs — 2 unpaid invoices, $487.00 · #7226 $137.50 · #7304 $350.00";
+const both = () => [
+  invoice({ id: INVOICE, invoiceNumber: NUMBER, amounts: { total: 300, invoiceBalance: 137.5 } }),
+  invoice({ id: INV_B, invoiceNumber: NUM_B, amounts: { total: 350, invoiceBalance: 350 } }),
+];
+const combine = (over: Partial<Extract<InvoiceCardAction, { state: "combine" }>> = {}) => ({
+  state: "combine" as const, cardId: "card-1",
+  invoiceIds: [INVOICE, INV_B] as readonly string[], invoiceNumbers: [NUMBER, NUM_B] as readonly string[],
+  desiredStage: "Invoice Overdue", stage: "Invoice Overdue", monetaryValue: 487.5,
+  changes: ["stage", "value"] as ("stage" | "value")[], reasons: [] as string[], ...over,
+});
+
+test("a combined card is moved to the summed amount, keeping its name and status", async () => {
+  process.env.GHL_WRITE_APPROVAL_ID = "reviewed-plan-1";
+  const h = harness([openCard({ name: BRUNGS_NAME, monetaryValue: 487.5, pipelineStageId: STAGES.sent })]);
+  const { result, reports, prepared } = await run(plan(combine()), h,
+    { allow: { overdueMoves: true, paidExits: false }, source: both() });
+  assert.equal(result.applied, 1, "one card, one write, however many invoices");
+  assert.equal(result.halted, false);
+  assert.deepEqual(h.puts, [{ id: "card-1", stageId: STAGES.overdue, monetaryValue: 487.5, name: undefined }],
+    "no name in the PUT: a combined card is never renamed");
+  assert.equal(h.cards.get("card-1")!.status, "open", "status untouched");
+  assert.equal(h.cards.get("card-1")!.name, BRUNGS_NAME, "name untouched");
+
+  // One write, but the log still reads one line per invoice.
+  assert.equal(reports.length, 2);
+  assert.deepEqual(reports.map(r => r.invoiceNumber), [NUMBER, NUM_B]);
+  for (const r of reports) {
+    assert.equal(r.action, "applied");
+    assert.equal(r.kind, "combine");
+    assert.equal(r.cardId, "card-1");
+    assert.deepEqual([...(r.coveredInvoiceNumbers ?? [])], [NUMBER, NUM_B]);
+  }
+
+  // The durable claim names every invoice the money on the card is for.
+  assert.equal(prepared.length, 1);
+  assert.deepEqual(prepared[0].source.storedInvoiceIds, [INVOICE, INV_B].sort());
+  assert.equal(prepared[0].target.updateName, false, "the claim must say it does not rename");
+  assert.equal(prepared[0].target.nameHash, cardNameHash(BRUNGS_NAME));
+  assert.equal(prepared[0].target.amountCents, 48750);
+  assert.equal(prepared[0].creation, undefined, "a combine creates nothing");
+});
+
+test("a combined card is never moved to Paid", () => {
+  const decision = decideInvoiceCardWrite(
+    combine({ stage: "Invoice Paid", desiredStage: "Invoice Paid", monetaryValue: 0 }),
+    STAGES, { overdueMoves: true, paidExits: true });
+  assert.equal(decision.state === "refuse" && decision.reason, "a_combined_card_is_never_moved_to_paid");
+});
+
+test("a combined card must carry what is still owed, never nothing", () => {
+  for (const monetaryValue of [0, -1]) {
+    const decision = decideInvoiceCardWrite(combine({ stage: "Invoice Sent", desiredStage: "Invoice Sent", monetaryValue }),
+      STAGES, ALLOW_OVERDUE);
+    assert.equal(decision.state, "refuse", String(monetaryValue));
+  }
+});
+
+test("an unusable invoice set is refused rather than written", () => {
+  for (const over of [
+    { invoiceIds: [] as readonly string[], invoiceNumbers: [] as readonly string[] },
+    { invoiceIds: [INVOICE], invoiceNumbers: [NUMBER, NUM_B] as readonly string[] },
+    { invoiceIds: [INVOICE, INVOICE] as readonly string[], invoiceNumbers: [NUMBER, NUM_B] as readonly string[] },
+    { invoiceIds: [INVOICE, " "] as readonly string[], invoiceNumbers: [NUMBER, NUM_B] as readonly string[] },
+  ]) {
+    const decision = decideInvoiceCardWrite(combine(over), STAGES, ALLOW_OVERDUE);
+    assert.equal(decision.state, "refuse", JSON.stringify(over));
+  }
+});
+
+test("a combined card that has come to name an invoice outside the set is held", async () => {
+  process.env.GHL_WRITE_APPROVAL_ID = "reviewed-plan-1";
+  // Someone renamed the card between the plan and the write, and it now claims
+  // an invoice this write knows nothing about.
+  const renamed = "Elizabeth Brungs — #7226, #7304, #9999";
+  const h = harness([openCard({ name: renamed, monetaryValue: 487.5 })]);
+  const { result, reports } = await run(plan(combine()), h,
+    { allow: { overdueMoves: true, paidExits: false }, source: both(),
+      preflightCards: [openCard({ name: renamed, monetaryValue: 487.5 })] });
+  assert.equal(result.applied, 0);
+  assert.equal(result.halted, false, "one card held is not a halted run");
+  assert.deepEqual(h.puts, []);
+  assert.ok(reports.every(r => r.action === "hold"
+    && r.reason === "card_names_an_invoice_this_write_does_not_cover"));
+});
+
+test("a card naming only SOME of the invoices it covers is still written", async () => {
+  process.env.GHL_WRITE_APPROVAL_ID = "reviewed-plan-1";
+  // The real per-customer shape: the name mentions no invoice number at all.
+  const h = harness([openCard({ name: "Elizabeth Brungs — 2 unpaid invoices", monetaryValue: 0 })]);
+  const { result } = await run(plan(combine()), h,
+    { allow: { overdueMoves: true, paidExits: false }, source: both() });
+  assert.equal(result.applied, 1);
+  assert.deepEqual(h.puts, [{ id: "card-1", stageId: STAGES.overdue, monetaryValue: 487.5, name: undefined }]);
+});
+
+test("a payment landing between plan and write holds the combined card", async () => {
+  process.env.GHL_WRITE_APPROVAL_ID = "reviewed-plan-1";
+  const h = harness([openCard({ name: BRUNGS_NAME, monetaryValue: 487.5 })]);
+  // #7304 was paid in the meantime, so 487.50 is no longer what is owed.
+  const { result, reports } = await run(plan(combine()), h, {
+    allow: { overdueMoves: true, paidExits: false },
+    source: [invoice({ id: INVOICE, invoiceNumber: NUMBER, amounts: { total: 300, invoiceBalance: 137.5 } }),
+      invoice({ id: INV_B, invoiceNumber: NUM_B, invoiceStatus: "paid", amounts: { total: 350, invoiceBalance: 0 } })],
+  });
+  assert.equal(result.applied, 0);
+  assert.equal(result.halted, false);
+  assert.deepEqual(h.puts, []);
+  assert.ok(reports.every(r => r.action === "hold"
+    && r.reason === "one_of_these_invoices_is_no_longer_unpaid"), reports[0]?.reason);
+});
+
+test("a balance that moved without being settled also holds the combined card", async () => {
+  process.env.GHL_WRITE_APPROVAL_ID = "reviewed-plan-1";
+  const h = harness([openCard({ name: BRUNGS_NAME, monetaryValue: 487.5 })]);
+  const { result, reports } = await run(plan(combine()), h, {
+    allow: { overdueMoves: true, paidExits: false },
+    source: [invoice({ id: INVOICE, invoiceNumber: NUMBER, amounts: { total: 300, invoiceBalance: 137.5 } }),
+      invoice({ id: INV_B, invoiceNumber: NUM_B, amounts: { total: 350, invoiceBalance: 200 } })],
+  });
+  assert.equal(result.applied, 0);
+  assert.deepEqual(h.puts, []);
+  assert.ok(reports.every(r => r.reason === "these_invoices_no_longer_add_up_to_the_amount_planned"));
+});
+
+test("a combined write that never answers releases its claim for every invoice", async () => {
+  process.env.GHL_WRITE_APPROVAL_ID = "reviewed-plan-1";
+  const h = harness([openCard({ name: BRUNGS_NAME, monetaryValue: 487.5 })]);
+  const { result, reports, fixture } = await run(plan(combine()), h, {
+    allow: { overdueMoves: true, paidExits: false }, source: both(), deadlines: FAST,
+    io: { ...h.io, moveOpportunityToStage: never },
+  });
+  assert.equal(result.applied, 0);
+  assert.equal(result.halted, false, "a released claim must not halt the run");
+  assert.ok(reports.every(r => r.action === "hold" && /claim was released/.test(r.reason)), reports[0]?.reason);
+  const history = await fixture.writer.readCycleHistory();
+  assert.equal(history.length, 1);
+  assert.equal(history[0].state, "abandoned");
+  assert.equal(history[0].abandonment?.reason, "combined_card_move_did_not_take_effect");
+});
+
+test("a combined card already in the right place is left alone", async () => {
+  process.env.GHL_WRITE_APPROVAL_ID = "reviewed-plan-1";
+  const h = harness([openCard({ name: BRUNGS_NAME, monetaryValue: 487.5, pipelineStageId: STAGES.overdue })]);
+  const { result, reports } = await run(plan(combine()), h,
+    { allow: { overdueMoves: true, paidExits: false }, source: both() });
+  assert.equal(result.applied, 0);
+  assert.deepEqual(h.puts, []);
+  assert.ok(reports.every(r => r.action === "unchanged"));
+});
+
+test("a combined card waiting on the Overdue gate is held, not moved", () => {
+  const decision = decideInvoiceCardWrite(combine(), STAGES);
+  assert.equal(decision.state === "refuse" && decision.reason,
+    "overdue_move_needs_recorded_proof_the_legacy_workflow_is_off");
+});
+
+test("one combined write costs one unit of the run's budget, not one per invoice", async () => {
+  process.env.GHL_WRITE_APPROVAL_ID = "reviewed-plan-1";
+  const h = harness([openCard({ name: BRUNGS_NAME, monetaryValue: 487.5 })]);
+  const spend = { remaining: 1 };
+  const { result } = await run(plan(combine()), h,
+    { allow: { overdueMoves: true, paidExits: false }, source: both(), spend });
+  assert.equal(result.applied, 1);
+  assert.equal(spend.remaining, 0);
 });

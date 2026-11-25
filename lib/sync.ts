@@ -833,6 +833,8 @@ export async function syncGhlInvoicePipeline(opts: {
     const identityHold = strictGhlIdentityHold(customer, customers, contacts, contactId);
     if (identityHold) { holdCards(identityHold, candidateIds, customer); return; }
     const matchingCards = cards.filter(card => card.contactId === contactId);
+    /** Cards the per-invoice plan has taken over for several invoices at once. */
+    const perInvoiceCombined = new Set<string>();
 
     // ONE CARD PER INVOICE.
     if (perInvoiceActive) {
@@ -869,8 +871,13 @@ export async function syncGhlInvoicePipeline(opts: {
         // The writer. Nothing below can move a card into "Invoice Overdue":
         // `decideInvoiceCardWrite` refuses that target outright, independently
         // of the plan's own legacy-sending gate.
+        // Any card this plan takes over for several invoices at once is now the
+        // per-invoice writer's, whether or not the write happens this run. The
+        // per-customer aggregate below reads this to stay off it.
+        for (const a of plan.actions) if (a.state === "combine") perInvoiceCombined.add(a.cardId);
+
         if (cardWritesEligible && cardGate.open && !writesHalted && !cardWritesHalted
-            && plan.actions.some(a => a.state === "adopt" || a.state === "create")) {
+            && plan.actions.some(a => a.state === "adopt" || a.state === "create" || a.state === "combine")) {
           cardClaims ??= claimedInvoiceIdsFromHistory(await opts.writer!.readCycleHistory!(),
             { locationId: process.env.GHL_LOCATION_ID ?? "", pipelineId: refs.pipelineId });
           const result = await applyInvoiceCardPlan({
@@ -915,11 +922,20 @@ export async function syncGhlInvoicePipeline(opts: {
     // them revalued to $0 the moment it was allowed to write. Two writers with
     // different ideas of what a card means is worse than either alone.
     if (cardGate.open) {
-      const ownedPerInvoice = matchingCards.filter(card => invoiceNumbersInCardName(card.name).length > 0);
+      // A card belongs to the per-invoice writer if it names an invoice, OR if
+      // that writer has just taken it over for several invoices at once. The
+      // second case is why this list is no longer about the name alone: a card
+      // named `Sherrie Woods — 4 overdue invoices` names no invoice but is now
+      // that customer's card there, and the aggregate path would rename and
+      // revalue it on the same run.
+      const ownedPerInvoice = matchingCards.filter(card =>
+        invoiceNumbersInCardName(card.name).length > 0 || perInvoiceCombined.has(card.id));
       for (const card of ownedPerInvoice) {
         reviewedCards.add(card.id);
         report({ customerId: customer.id, jobberClientId: customer.jobberClientId, ...cardInfo(card), contactId,
-          action: "hold", reason: "Card names an invoice and belongs to the per-invoice writer; the per-customer aggregate leaves it alone" });
+          action: "hold", reason: perInvoiceCombined.has(card.id) && !invoiceNumbersInCardName(card.name).length
+            ? "Card has been adopted by the per-invoice writer for this customer's invoices; the per-customer aggregate leaves it alone"
+            : "Card names an invoice and belongs to the per-invoice writer; the per-customer aggregate leaves it alone" });
       }
       if (ownedPerInvoice.length) return;
     }
