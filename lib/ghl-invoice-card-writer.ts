@@ -125,6 +125,9 @@ export type WriteDecision =
       stageId: string; monetaryValue: number; invoiceId: string; invoiceNumber: string }>
   | Readonly<{ state: "write"; kind: "create"; role: "sent"; stageId: string; name: string;
       monetaryValue: number; invoiceId: string; invoiceNumber: string }>
+  | Readonly<{ state: "write"; kind: "combine"; role: "sent" | "overdue"; cardId: string;
+      stageId: string; monetaryValue: number;
+      invoiceIds: readonly string[]; invoiceNumbers: readonly string[] }>
   | Readonly<{ state: "nothing"; reason: string }>
   | Readonly<{ state: "refuse"; reason: string }>;
 
@@ -135,7 +138,7 @@ export type WriteDecision =
 export function decideInvoiceCardWrite(
   action: InvoiceCardAction, stageIds: StageIds, allow: WriteAllowances = NOTHING_EXTRA
 ): WriteDecision {
-  if (!action || (action.state !== "adopt" && action.state !== "create")) {
+  if (!action || (action.state !== "adopt" && action.state !== "create" && action.state !== "combine")) {
     return Object.freeze({ state: "nothing", reason: "action_is_not_a_write" });
   }
   const amount = moneyCents(action.monetaryValue);
@@ -168,6 +171,29 @@ export function decideInvoiceCardWrite(
   // the reason a Paid write cannot reach the legacy ladder's first branch.
   if (role === "paid" && amount !== 0) {
     return Object.freeze({ state: "refuse", reason: "paid_card_must_carry_a_zero_balance" });
+  }
+
+  if (action.state === "combine") {
+    // A combined card carries several invoices' money, so it can never be the
+    // zero-balance Paid card this writer understands: "everything this card
+    // stands for is settled" is not something a name that does not enumerate
+    // them can establish. Retiring a paid combined card is a separate decision.
+    if (role === "paid") return Object.freeze({ state: "refuse", reason: "a_combined_card_is_never_moved_to_paid" });
+    if (amount <= 0) return Object.freeze({ state: "refuse", reason: "a_combined_card_must_carry_what_is_still_owed" });
+    if (!action.invoiceIds.length || action.invoiceIds.length !== action.invoiceNumbers.length) {
+      return Object.freeze({ state: "refuse", reason: "combined_card_invoice_set_unusable" });
+    }
+    if (new Set(action.invoiceIds).size !== action.invoiceIds.length
+        || new Set(action.invoiceNumbers).size !== action.invoiceNumbers.length
+        || !action.invoiceIds.every(id => typeof id === "string" && id.trim())
+        || !action.invoiceNumbers.every(n => typeof n === "string" && n.trim())) {
+      return Object.freeze({ state: "refuse", reason: "combined_card_invoice_set_unusable" });
+    }
+    if (!action.changes.length) return Object.freeze({ state: "nothing", reason: "card_already_matches_these_invoices" });
+    if (!action.cardId?.trim()) return Object.freeze({ state: "refuse", reason: "card_id_missing" });
+    return Object.freeze({ state: "write", kind: "combine", role, cardId: action.cardId, stageId,
+      monetaryValue: action.monetaryValue,
+      invoiceIds: Object.freeze([...action.invoiceIds]), invoiceNumbers: Object.freeze([...action.invoiceNumbers]) });
   }
 
   if (action.state === "create") {
@@ -266,10 +292,16 @@ export interface InvoiceCardWriteReport {
   invoiceId: string;
   invoiceNumber: string | null;
   cardId: string | null;
-  kind: "adopt" | "create";
+  kind: "adopt" | "create" | "combine";
   action: "applied" | "unchanged" | "hold" | "failed";
   reason: string;
   to?: { stageId: string; monetaryValue: number; name?: string };
+  /**
+   * On a `combine`, every invoice the one card now stands for. Present so the
+   * log still reads one line per invoice while recording that the line is a
+   * share of a card, not a card of its own.
+   */
+  coveredInvoiceNumbers?: readonly string[];
 }
 
 type Writer = Pick<SyncRunWriter, "prepare" | "assertPending" | "confirm" | "abandon" | "block"> &
@@ -331,23 +363,34 @@ export async function applyInvoiceCardPlan(input: ApplyInvoiceCardPlanInput): Pr
     kind: "adopt" | "create" }, reason: string) => input.report({ ...d, action: "hold", reason });
 
   for (const action of input.plan.actions) {
-    if (action.state !== "adopt" && action.state !== "create") continue;
+    if (action.state !== "adopt" && action.state !== "create" && action.state !== "combine") continue;
     const kind = action.state;
     const decision = decideInvoiceCardWrite(action, stageIds, input.gate.allow);
-    const base = { invoiceId: action.invoiceId, invoiceNumber: action.invoiceNumber,
-      cardId: action.state === "adopt" ? action.cardId : null, kind } as const;
+    // One `combine` is ONE write covering several invoices, so every report it
+    // produces is the same outcome repeated per invoice. `report` is what the
+    // morning log and the dashboard read, and both are per invoice.
+    const rows: readonly { invoiceId: string; invoiceNumber: string | null }[] = action.state === "combine"
+      ? action.invoiceIds.map((invoiceId, i) => ({ invoiceId, invoiceNumber: action.invoiceNumbers[i] ?? null }))
+      : [{ invoiceId: action.invoiceId, invoiceNumber: action.invoiceNumber }];
+    const cardOf = action.state === "create" ? null : action.cardId;
+    const covered = action.state === "combine" ? { coveredInvoiceNumbers: action.invoiceNumbers } : {};
+    const say = (entry: Omit<InvoiceCardWriteReport, "invoiceId" | "invoiceNumber" | "kind" | "cardId">,
+      cardId: string | null = cardOf) => {
+      for (const row of rows) input.report({ ...row, cardId, kind, ...covered, ...entry });
+    };
+    const base = { invoiceId: rows[0].invoiceId, invoiceNumber: rows[0].invoiceNumber, cardId: cardOf, kind } as const;
 
-    if (decision.state === "nothing") { input.report({ ...base, action: "unchanged", reason: decision.reason }); continue; }
-    if (decision.state === "refuse") { hold(base, decision.reason); continue; }
-    if (input.spend.remaining <= 0) { hold(base, "run_write_budget_exhausted"); continue; }
+    if (decision.state === "nothing") { say({ action: "unchanged", reason: decision.reason }); continue; }
+    if (decision.state === "refuse") { say({ action: "hold", reason: decision.reason }); continue; }
+    if (input.spend.remaining <= 0) { say({ action: "hold", reason: "run_write_budget_exhausted" }); continue; }
 
     try {
-      const outcome = decision.kind === "create"
-        ? await createCard(input, io, decision)
+      const outcome = decision.kind === "create" ? await createCard(input, io, decision)
+        : decision.kind === "combine" ? await combineCard(input, io, decision)
         : await adoptCard(input, io, decision);
       if (outcome.state === "applied") { applied += 1; input.spend.remaining -= 1; }
-      input.report({ ...base, cardId: outcome.cardId ?? base.cardId, action: outcome.state,
-        reason: outcome.reason, ...(outcome.to ? { to: outcome.to } : {}) });
+      say({ action: outcome.state, reason: outcome.reason, ...(outcome.to ? { to: outcome.to } : {}) },
+        outcome.cardId ?? cardOf);
       if (outcome.state === "failed") return { applied, halted: true };
     } catch (err: any) {
       // Everything a card write can be expected to get wrong is handled inside
@@ -355,7 +398,7 @@ export async function applyInvoiceCardPlan(input: ApplyInvoiceCardPlanInput): Pr
       // therefore unexplained, and an unexplained failure in a writer whose
       // claim may already be durable is a halt, not a skipped card.
       await input.writer.block();
-      input.report({ ...base, action: "failed",
+      say({ action: "failed",
         reason: `Unexpected card write failure; remaining card writes halted. ${err?.message ?? err}` });
       return { applied, halted: true };
     }
@@ -455,6 +498,127 @@ async function adoptCard(
     reason: decision.role === "paid" ? "Moved to Paid against verified Jobber settlement; card carries a zero balance"
       : decision.role === "overdue" ? "Moved to Overdue against verified Jobber source, with recorded proof the legacy workflow cannot send"
       : "Stage and amount corrected from verified Jobber source" };
+}
+
+/**
+ * TAKE OVER ONE CARD FOR SEVERAL INVOICES.
+ *
+ * Same shape as `adoptCard` - fresh read, pre-flight comparison, durable claim,
+ * read-back, the shared unlanded-write recovery - and differs in exactly three
+ * ways, each of which is the point of it:
+ *
+ *   1. The name check is a SUBSET check, not an equality check. A card that
+ *      names #7286 and #7304 is allowed to be written for both of them; a card
+ *      that names no invoice is allowed to be written for whatever the customer
+ *      owes. What is still refused is a card whose name has come to mention an
+ *      invoice this write does not cover - the amount would then be for a
+ *      different set of invoices than the name claims.
+ *   2. The durable claim records EVERY invoice the card now stands for, so the
+ *      journal says what the money on it is for.
+ *   3. Every covered invoice is re-checked against the verified source and the
+ *      balances must still add up to exactly the amount being written. A
+ *      payment landing between plan and write changes the total, and a total
+ *      that no longer matches is held rather than written.
+ *
+ * It still NEVER renames a card, never writes a status, never reopens a closed
+ * card and never moves one into Paid.
+ */
+async function combineCard(
+  input: ApplyInvoiceCardPlanInput, io: InvoiceCardWriteIo,
+  decision: Extract<WriteDecision, { kind: "combine" }>
+): Promise<Outcome> {
+  const to = { stageId: decision.stageId, monetaryValue: decision.monetaryValue };
+  const held = (reason: string): Outcome => ({ state: "hold", reason, cardId: decision.cardId, to, claimed: false });
+
+  let current: GhlOpportunity;
+  try {
+    current = await withDeadline(io.readOpportunity(decision.cardId), attemptMs(input), "card_preflight_read");
+  } catch (err: any) {
+    return held(`fresh_card_read_failed_${err?.message ?? err}`);
+  }
+  if (current.id !== decision.cardId || current.pipelineId !== input.pipelineId
+      || current.contactId !== input.contactId || current.status !== "open") return held("card_ownership_or_status_changed_before_write");
+  if (![stageOf(input, "sent"), stageOf(input, "overdue"), stageOf(input, "paid")].includes(current.pipelineStageId ?? "")) {
+    return held("card_is_in_a_protected_or_unknown_stage");
+  }
+  // The name may say nothing about invoices, or may name some or all of the
+  // ones being written - but never one that is not in this set.
+  const covered = new Set(decision.invoiceNumbers);
+  const named = invoiceNumbersInCardName(current.name);
+  if (named.some(n => !covered.has(n))) return held("card_names_an_invoice_this_write_does_not_cover");
+
+  const seen = input.preflight.get(decision.cardId);
+  if (!seen) return held("card_was_not_in_the_preflight_snapshot");
+  if ((current.monetaryValue ?? null) !== seen.monetaryValue || (current.name ?? null) !== seen.name
+      || (current.status ?? null) !== seen.status) return held("card_changed_since_the_plan_was_made");
+
+  if (current.pipelineStageId === decision.stageId && current.monetaryValue === decision.monetaryValue) {
+    return { state: "unchanged", reason: "fresh_read_already_matches_the_target", cardId: decision.cardId, to, claimed: false };
+  }
+
+  // Re-check the whole set against the verified source. The amount on a
+  // combined card is only meaningful as the sum of what it covers, so a stale
+  // sum is refused outright rather than written and corrected later.
+  const invoices = buildInvoiceSourceEvidence(input.source, input.jobberClientId);
+  const target = moneyCents(decision.monetaryValue);
+  if (!invoices || target === null) return held("source_evidence_unavailable");
+  let owed = 0;
+  for (const id of decision.invoiceIds) {
+    const row = invoices.find(i => i.id === id);
+    if (!row) return held("source_evidence_unavailable");
+    if (row.invoiceStatus === "paid" || row.balanceCents <= 0) return held("one_of_these_invoices_is_no_longer_unpaid");
+    owed += row.balanceCents;
+  }
+  if (owed !== target) return held("these_invoices_no_longer_add_up_to_the_amount_planned");
+
+  const intent = buildGhlWriteIntent({ current, to, jobberClientId: input.jobberClientId,
+    source: input.source, storedInvoiceIds: [...decision.invoiceIds], observedAt: input.observedAt });
+  // `to` carries no `name`, so the durable record says updateName: false.
+  if (!intent || intent.target.updateName || intent.target.nameHash !== cardNameHash(current.name)) {
+    return held("card_or_source_evidence_unavailable_or_would_rename");
+  }
+  if (intent.approvalId !== input.gate.approvalId) return held("write_approval_changed_before_write");
+
+  let intentId: string;
+  try {
+    intentId = await input.writer.prepare(intent);
+  } catch (err: any) {
+    return { state: "failed", cardId: decision.cardId, to, claimed: true,
+      reason: `Durable write claim refused; remaining card writes halted. ${err?.message ?? err}` };
+  }
+  const landed = (card: GhlOpportunity) => card.id === decision.cardId && card.pipelineId === current.pipelineId
+    && card.contactId === current.contactId && card.status === "open"
+    && card.pipelineStageId === decision.stageId && card.monetaryValue === decision.monetaryValue
+    && (card.name ?? null) === (current.name ?? null);
+  const untouched = (card: GhlOpportunity) => card.id === decision.cardId && card.pipelineId === current.pipelineId
+    && card.contactId === current.contactId && card.status === current.status
+    && card.pipelineStageId === current.pipelineStageId && card.monetaryValue === current.monetaryValue
+    && (card.name ?? null) === (current.name ?? null);
+
+  try {
+    await input.writer.assertPending(intentId);
+    await withDeadline(io.moveOpportunityToStage(decision.cardId, decision.stageId, decision.monetaryValue),
+      attemptMs(input), "card_move");
+    const accepted = await withDeadline(io.readOpportunity(decision.cardId), attemptMs(input), "card_readback");
+    if (!landed(accepted)) throw new Error("Post-write card state not confirmed");
+    await input.writer.confirm(intentId);
+  } catch (err: any) {
+    return await resolveUnlandedWrite(input, io, {
+      intentId, to, cardId: decision.cardId, failure: err?.message ?? String(err),
+      look: () => io.readOpportunity(decision.cardId),
+      verdict: card => card === null ? "unknown" : landed(card) ? "landed" : untouched(card) ? "absent" : "unknown",
+      absentReason: "combined_card_move_did_not_take_effect",
+      absentEvidence: `fresh read of ${decision.cardId} still shows stage ${current.pipelineStageId}`
+        + ` and amount ${current.monetaryValue}, exactly as before the write`,
+      appliedReason: "Stage and amount were already correct on re-read; the write had landed before the error",
+    });
+  }
+  return { state: "applied", cardId: decision.cardId, to, claimed: true,
+    reason: `One card adopted for ${decision.invoiceIds.length} invoice${decision.invoiceIds.length === 1 ? "" : "s"}`
+      + ` (${decision.invoiceNumbers.map(n => `#${n}`).join(", ")}) against verified Jobber source;`
+      + (decision.role === "overdue"
+        ? " moved to Overdue with recorded proof the legacy workflow cannot send; name and status untouched"
+        : " name and status untouched") };
 }
 
 /** Create the card an invoice has never had. Always "Invoice Sent". */

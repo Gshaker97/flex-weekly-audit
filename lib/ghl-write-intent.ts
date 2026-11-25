@@ -29,6 +29,14 @@ export function buildInvoiceSourceEvidence(
   for (const inv of source.filter(i => i.client?.id === jobberClientId)) {
     const totalCents = moneyCents(inv.amounts?.total), balanceCents = moneyCents(inv.amounts?.invoiceBalance);
     if (totalCents === null || balanceCents === null || !inv.invoiceStatus) return null;
+    // A status the journal cannot record is a null answer HERE, so the caller
+    // holds one card. Left to `validateIntent` it would instead throw inside
+    // `prepare`, which halts the whole writer for the rest of the run - and
+    // the Jobber read this evidence comes from carries every status there is,
+    // void and draft included, so one void invoice on one customer would stop
+    // every other customer's card from being written. Measured on the live
+    // account 2026-11-25: 9 invoices in scope are void.
+    if (!["paid", "past_due", "awaiting_payment"].includes(inv.invoiceStatus.toLowerCase())) return null;
     if ([inv.issuedDate, inv.createdAt, inv.dueDate].some(v => v !== null && (typeof v !== "string" || v.length > 64 || !Number.isFinite(new Date(v).getTime())))) return null;
     invoices.push({ id: inv.id, jobberClientId, invoiceStatus: inv.invoiceStatus.toLowerCase(),
       totalCents, balanceCents, issuedDate: inv.issuedDate, createdAt: inv.createdAt, dueDate: inv.dueDate });
