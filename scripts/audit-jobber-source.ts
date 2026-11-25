@@ -15,18 +15,48 @@ function output(value: unknown) {
   if (Buffer.byteLength(text) > LIMITS.outputBytes) throw new AuditFailure('OUTPUT_BYTE_LIMIT');
   console.log(text);
 }
+/**
+ * THIS AUDIT IS A REPORT, NOT A DEPLOYMENT GATE.
+ *
+ * It runs as the web service's Railway pre-deploy command, and a non-zero exit
+ * there fails the whole deployment. Only one class of problem actually says
+ * anything about the deployment: the pre-deploy command being wrong - run in
+ * the wrong service or environment, or without the flag that makes it
+ * deliberate. Those are decided in milliseconds, before anything is read, and
+ * the next deployment would be wrong in exactly the same way.
+ *
+ * Everything else is a finding about Jobber or about this account's data, and
+ * none of it is evidence about the code being shipped. Letting those fail a
+ * deployment is what stopped the web service from shipping any commit at all
+ * on 2026-11-25: three deployments in a row failed, first because an expired
+ * Jobber token could not cover the run, then because an invoice changed while
+ * the audit was paging through 241 requests over three minutes. Neither had
+ * anything to do with the code being deployed.
+ *
+ * So an audit that could not be completed now says so and exits 0. The report
+ * still records it, and `deploymentBlocked` says which kind it was.
+ */
+const DEPLOYMENT_BLOCKING_CODES: ReadonlySet<string> = new Set([
+  'EXPLICIT_DEPLOYMENT_FLAG_REQUIRED',
+  'EXISTING_RAILWAY_DEPLOYMENT_REQUIRED',
+  'WRONG_RAILWAY_SERVICE_OR_ENVIRONMENT',
+]);
 function failure(error: unknown, exitCode = 2) {
   if (finished) return;
   finished = true;
   const safe = error instanceof AuditFailure ? error : new AuditFailure('UNEXPECTED_AUDIT_ERROR');
+  const blocking = DEPLOYMENT_BLOCKING_CODES.has(safe.code);
   // Only codes controlled by this script and numeric/boolean facts reach logs.
   output({ audit: 'jobber-source-v1', outcome: 'incomplete', stage, code: safe.code, facts: safe.facts,
+    deploymentBlocked: blocking,
     elapsedSeconds: Math.floor((Date.now() - budget.startedAt) / 1000), requests: budget.requests, bytes: budget.bytes });
-  process.exitCode = exitCode;
+  process.exitCode = blocking ? exitCode : 0;
 }
-const watchdog = setTimeout(() => { failure(new AuditFailure('HARD_RUNTIME_LIMIT'), 3); process.exit(3); }, LIMITS.hardStopMs);
-process.once('SIGTERM', () => { failure(new AuditFailure('TERMINATED'), 3); process.exit(3); });
-process.once('SIGINT', () => { failure(new AuditFailure('INTERRUPTED'), 3); process.exit(3); });
+/** The exit code `failure` settled on, so a hard stop cannot fail a deploy either. */
+const exitNow = () => process.exit(typeof process.exitCode === 'number' ? process.exitCode : 0);
+const watchdog = setTimeout(() => { failure(new AuditFailure('HARD_RUNTIME_LIMIT'), 3); exitNow(); }, LIMITS.hardStopMs);
+process.once('SIGTERM', () => { failure(new AuditFailure('TERMINATED'), 3); exitNow(); });
+process.once('SIGINT', () => { failure(new AuditFailure('INTERRUPTED'), 3); exitNow(); });
 
 const invoiceSelect = {
   jobberInvoiceId: true, invoiceNumber: true, invoiceStatus: true,
@@ -64,16 +94,39 @@ async function main() {
     requireTokenRunCoverage(before.auth.expiresAt);
     const initialExpiryMinutes = expiryMinutes(before.auth.expiresAt);
     const reader = new JobberReader(before.auth.accessToken, before.auth.expiresAt, budget);
-    stage = 'jobber-invoice-pagination';
     const sourceStartedAt = new Date().toISOString();
-    const result = await paginate(after => reader.page(after), { pause: () => budget.pause(LIMITS.pageDelayMs) });
-    stage = 'jobber-first-page-recheck';
-    const firstAgain = await reader.page(null);
-    if (digest(result.firstPage) !== digest(firstAgain)) throw new AuditFailure('SOURCE_FIRST_PAGE_CHANGED_DURING_AUDIT');
+    // THE SOURCE MOVES WHILE WE READ IT, AND THAT IS ORDINARY. Reading every
+    // invoice takes about three minutes and 240 requests, so on any working day
+    // something somewhere is likely to change in the middle of it. Re-reading
+    // the first page afterwards is how this audit SAYS whether that happened;
+    // it was never evidence about the code being deployed, and Jobber's
+    // pagination is not an atomic snapshot in any case - the limitations below
+    // have always said so.
+    //
+    // So: read it again while there is runtime budget for a whole further
+    // attempt, and if the source is still moving, record that and carry on.
+    // The comparison is still worth having, flagged as taken over a source
+    // that moved.
+    let result!: Awaited<ReturnType<typeof paginate>>;
+    let firstPageUnchangedOnRecheck = false;
+    let sourceReadAttempts = 0;
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      sourceReadAttempts = attempt;
+      stage = 'jobber-invoice-pagination';
+      result = await paginate(after => reader.page(after), { pause: () => budget.pause(LIMITS.pageDelayMs) });
+      stage = 'jobber-first-page-recheck';
+      const firstAgain = await reader.page(null);
+      firstPageUnchangedOnRecheck = digest(result.firstPage) === digest(firstAgain);
+      if (firstPageUnchangedOnRecheck || attempt === 2) break;
+      // Only try again if another read of the same size can finish in budget.
+      const elapsed = Date.now() - budget.startedAt;
+      if (elapsed + (elapsed / attempt) * 1.25 > LIMITS.runMs) break;
+    }
     const sourceFinishedAt = new Date().toISOString();
     stage = 'cache-snapshot-after';
     const after = await snapshot(prisma, false);
-    if (digest(before.rows) !== digest(after.rows)) throw new AuditFailure('CACHE_CHANGED_DURING_AUDIT');
+    // The cache moves too: the hourly sync writes it. Same reasoning.
+    const cacheUnchangedDuringAudit = digest(before.rows) === digest(after.rows);
     stage = 'comparison';
     const report = compare(result.records, after.rows, deriveTargets(after.rows));
     stage = 'optional-capability-probe';
@@ -85,17 +138,27 @@ async function main() {
       enabled: process.argv.includes('--with-ghl-preview'), apiKey: process.env.GHL_API_KEY, locationId: process.env.GHL_LOCATION_ID,
     });
     budget.check();
+    // "Complete" keeps its old strict meaning: every page read, and neither the
+    // source nor the cache seen to move underneath it. When one of them did
+    // move, the report is produced anyway and labelled for what it is.
+    const movement = [
+      ...(firstPageUnchangedOnRecheck ? [] : ['SOURCE_FIRST_PAGE_CHANGED_DURING_AUDIT']),
+      ...(cacheUnchangedDuringAudit ? [] : ['CACHE_CHANGED_DURING_AUDIT']),
+    ];
     const final = {
-      audit: 'jobber-source-v1', outcome: 'complete', completedAt: new Date().toISOString(),
-      runtime: { elapsedSeconds: Math.floor((Date.now() - budget.startedAt) / 1000), requests: budget.requests, retries: budget.retries, responseBytes: budget.bytes,
+      audit: 'jobber-source-v1',
+      outcome: movement.length ? 'complete_over_a_moving_source' : 'complete',
+      movedDuringAudit: movement, deploymentBlocked: false,
+      completedAt: new Date().toISOString(),
+      runtime: { elapsedSeconds: Math.floor((Date.now() - budget.startedAt) / 1000), requests: budget.requests, retries: budget.retries, responseBytes: budget.bytes, sourceReadAttempts,
         existingTokenExpiryRemainingMinutesAtStart: initialExpiryMinutes, existingTokenExpiryRemainingMinutesAtEnd: expiryMinutes(before.auth.expiresAt) },
       sourceRead: { startedAt: sourceStartedAt, finishedAt: sourceFinishedAt, filters: null, queryIsUnfiltered: true, apiDefaultStatusScopeVerified: false, pages: result.pages, uniqueIds: result.uniqueIds, uniqueCursors: result.uniqueCursors, terminalPageObserved: true,
-        firstPageUnchangedOnRecheck: true, sourceIsAtomicSnapshot: false, totalCountFieldAvailableInExistingQuery: false },
-      cacheRead: { before: before.capturedAt, after: after.capturedAt, unchangedDuringAudit: true, databaseEnforcedReadOnly: true },
+        firstPageUnchangedOnRecheck, sourceIsAtomicSnapshot: false, totalCountFieldAvailableInExistingQuery: false },
+      cacheRead: { before: before.capturedAt, after: after.capturedAt, unchangedDuringAudit: cacheUnchangedDuringAudit, databaseEnforcedReadOnly: true },
       ...report, capabilities, invoiceEvidence, ghlPreview,
       limitations: [
         'Complete means every page returned by the query with no explicit filters was consumed with unique IDs/cursors and a terminal page. API default status filtering is unverified; it does not mean every account status is included, the records agree, or every field is known.',
-        'Jobber pagination is not an atomic snapshot. The first page was checked again, but changes elsewhere during the read cannot be excluded. Cache/source snapshots are not transactional across systems; verify each differing invoice afresh before any later correction.',
+        'Jobber pagination is not an atomic snapshot. The first page was checked again, and movedDuringAudit says whether it or the cache moved while this ran; a report over a moving source is still produced, and is not a reason to fail a deployment. Changes elsewhere during the read cannot be excluded. Cache/source snapshots are not transactional across systems; verify each differing invoice afresh before any later correction.',
         'All monetary numbers are integer cents of the source account currency. The existing invoice query does not expose currency.',
         'Positive balances and negative credits are separate. Credits do not offset paid-positive conflicts.',
         'A cache-only invoice is not proof of deletion, payment or void status. No business state was changed.',
@@ -118,7 +181,7 @@ async function main() {
     stage = 'output';
     const lines = reportLines(final);
     for (const line of lines) console.log(line);
-    output({ audit: 'jobber-source-v1', event: 'summary', outcome: 'complete', sourceCount: report.source.count, cacheCount: report.cache.count,
+    output({ audit: 'jobber-source-v1', event: 'summary', outcome: final.outcome, movedDuringAudit: movement, sourceCount: report.source.count, cacheCount: report.cache.count,
       sourceTotalCents: report.source.totalCents, cacheTotalCents: report.cache.totalCents,
       sourcePositiveBalanceCents: report.source.positiveBalanceCents, sourcePaidPositiveCount: report.source.paidPositiveCount,
       sourcePaidPositiveBalanceCents: report.source.paidPositiveBalanceCents, sourceNegativeBalanceCents: report.source.negativeBalanceCents,
