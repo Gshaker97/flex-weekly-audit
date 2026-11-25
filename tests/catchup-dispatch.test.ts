@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { dispatchCatchupSend, type CatchupDispatchIO } from "../lib/catchup-dispatch";
+import { dispatchCatchupSend, SENDABLE_INVOICE_STATUSES, type CatchupDispatchIO } from "../lib/catchup-dispatch";
 import { planCatchupRecipient, type CatchupRecipientInput } from "../lib/catchup-plan";
 import { CATCHUP_PAY_LINK_HOST } from "../lib/catchup-copy";
 import { parseGhlRecipient } from "../lib/notification-ghl-contract";
@@ -92,7 +92,7 @@ function fakeLedger(opts: { refuseOn?: string; pendingFails?: boolean } = {}) {
 const io = (over: Partial<CatchupDispatchIO> & { ledger?: unknown } = {}): CatchupDispatchIO => ({
   ledger: (over.ledger ?? fakeLedger().ledger) as never,
   confirmStillDue: over.confirmStillDue
-    ?? (async () => ({ stillOpen: true, balanceMinor: 9000, dayPastDue: 7 })),
+    ?? (async () => ({ stillOpen: true, balanceMinor: 9000, dayPastDue: 7, invoiceStatus: "past_due" })),
   attemptSend: over.attemptSend
     ?? (async () => (OK as never)),
 });
@@ -139,7 +139,7 @@ test("TWO INVOICES: BOTH ROWS ARE TAKEN BEFORE THE ONE MESSAGE GOES OUT", async 
   const result = await dispatchCatchupSend(action, action.sends[0], context("sms") as never,
     io({ ledger: led.ledger,
       confirmStillDue: async (id: string) => ({ stillOpen: true, balanceMinor: 9000,
-        dayPastDue: id === "inv-7272" ? 7 : 5 }),
+        dayPastDue: id === "inv-7272" ? 7 : 5, invoiceStatus: "past_due" }),
       attemptSend: async () => { sends += 1; return OK as never; } }));
   assert.equal(result.state, "sent", JSON.stringify(result));
   // ONE message, ONE row. The ledger's per-contact index allows one row per
@@ -165,7 +165,7 @@ test("IF THE ROW CANNOT BE TAKEN, NOTHING IS SENT", async () => {
   const result = await dispatchCatchupSend(action, action.sends[0], context("sms") as never,
     io({ ledger: led.ledger,
       confirmStillDue: async (id: string) => ({ stillOpen: true, balanceMinor: 9000,
-        dayPastDue: id === "inv-7272" ? 7 : 5 }),
+        dayPastDue: id === "inv-7272" ? 7 : 5, invoiceStatus: "past_due" }),
       attemptSend: async () => { sends += 1; return OK as never; } }));
   assert.equal(sends, 0, "a customer must never get a message we failed to record");
   assert.equal(result.state, "incomplete");
@@ -192,10 +192,10 @@ test("a ledger that will not mark pending sends nothing", async () => {
 
 test("A PAYMENT THAT LANDED SINCE PLANNING STOPS THE SEND, AT NO LEDGER COST", async () => {
   for (const [live, reason] of [
-    [{ stillOpen: false, balanceMinor: 9000, dayPastDue: 7 }, "invoice_no_longer_open"],
-    [{ stillOpen: true, balanceMinor: 0, dayPastDue: 7 }, "invoice_no_longer_owes"],
-    [{ stillOpen: true, balanceMinor: null, dayPastDue: 7 }, "invoice_no_longer_owes"],
-    [{ stillOpen: true, balanceMinor: 9000, dayPastDue: 8 }, "day_past_due_changed_since_planning"],
+    [{ stillOpen: false, balanceMinor: 9000, dayPastDue: 7, invoiceStatus: "past_due" }, "invoice_no_longer_open"],
+    [{ stillOpen: true, balanceMinor: 0, dayPastDue: 7, invoiceStatus: "past_due" }, "invoice_no_longer_owes"],
+    [{ stillOpen: true, balanceMinor: null, dayPastDue: 7, invoiceStatus: "past_due" }, "invoice_no_longer_owes"],
+    [{ stillOpen: true, balanceMinor: 9000, dayPastDue: 8, invoiceStatus: "past_due" }, "day_past_due_changed_since_planning"],
   ] as const) {
     const led = fakeLedger();
     let sends = 0;
@@ -228,7 +228,7 @@ test("the live look happens once per invoice, in order", async () => {
   await dispatchCatchupSend(action, action.sends[0], context("sms") as never, io({
     confirmStillDue: async (id: string) => {
       seen.push(id);
-      return { stillOpen: true, balanceMinor: 9000, dayPastDue: id === "inv-7272" ? 7 : 5 };
+      return { stillOpen: true, balanceMinor: 9000, dayPastDue: id === "inv-7272" ? 7 : 5, invoiceStatus: "past_due" };
     },
   }));
   assert.deepEqual(seen, ["inv-7272", "inv-7286"]);
@@ -431,9 +431,9 @@ test("AGAINST THE REAL LEDGER: a two-invoice customer sends, on one row naming b
   if (action.state !== "send") return;
 
   const sent: unknown[] = [];
-  const live: Record<string, { stillOpen: boolean; balanceMinor: number; dayPastDue: number }> = {
-    "inv-a": { stillOpen: true, balanceMinor: 5000, dayPastDue: 7 },
-    "inv-b": { stillOpen: true, balanceMinor: 6000, dayPastDue: 8 },
+  const live: Record<string, { stillOpen: boolean; balanceMinor: number; dayPastDue: number; invoiceStatus: string }> = {
+    "inv-a": { stillOpen: true, balanceMinor: 5000, dayPastDue: 7, invoiceStatus: "past_due" },
+    "inv-b": { stillOpen: true, balanceMinor: 6000, dayPastDue: 8, invoiceStatus: "past_due" },
   };
   const result = await dispatchCatchupSend(action, action.sends[0], context("sms") as never,
     io({ ledger: ledger as never,
@@ -451,4 +451,100 @@ test("AGAINST THE REAL LEDGER: a two-invoice customer sends, on one row naming b
   const payload = JSON.parse(String(db.rows[0].eventPayload));
   assert.deepEqual(payload.coversInvoiceNumbers, ["9001", "9002"]);
   assert.equal(payload.coversBalanceMinor, 11000);
+});
+
+// ---- THE SEND-TIME STATUS CHECK ------------------------------------------
+//
+// Added 2026-11-25, after an audit of the Nov 24 catch-up asked whether a paid
+// customer could be texted. The last live look already read every invoice's
+// status from the source and then looked only at its balance. A balance is not
+// a status: Jobber reports `paid` invoices that still carry one - the status
+// refresh treats exactly that pair as a conflict needing review - and reports
+// `void`, `draft` and `bad_debt` invoices that may carry one too.
+
+test("AN INVOICE THE SOURCE CALLS PAID IS NEVER SENT ON, WHATEVER ITS BALANCE", async () => {
+  for (const invoiceStatus of ["paid", "PAID", " Paid "]) {
+    const led = fakeLedger();
+    let sends = 0;
+    const action = planned();
+    // Everything else agrees with the plan: open, owing the planned figure, on
+    // the planned day. Only the status says this invoice is settled.
+    const result = await dispatchCatchupSend(action, action.sends[0], context("sms") as never,
+      io({ ledger: led.ledger,
+        confirmStillDue: async () => ({ stillOpen: true, balanceMinor: 9000, dayPastDue: 7, invoiceStatus }),
+        attemptSend: async () => { sends += 1; return OK as never; } }));
+    assert.equal(result.state, "refused", invoiceStatus);
+    if (result.state !== "refused") continue;
+    assert.ok(result.reasons.includes("invoice_is_paid_at_send_time"),
+      `${invoiceStatus}: ${result.reasons.join(",")}`);
+    assert.equal(sends, 0, "nothing sent");
+    assert.equal(led.reserved.length, 0, "and it costs no reservation");
+  }
+});
+
+test("a status the source does not call open stops the send too", async () => {
+  // Not just paid. None of these is a thing to send a past-due notice about,
+  // and an unreadable status is not evidence that anything is owed.
+  for (const invoiceStatus of ["void", "draft", "bad_debt", "", "   ", null, "something_new"]) {
+    const led = fakeLedger();
+    let sends = 0;
+    const action = planned();
+    const result = await dispatchCatchupSend(action, action.sends[0], context("sms") as never,
+      io({ ledger: led.ledger,
+        confirmStillDue: async () => ({ stillOpen: true, balanceMinor: 9000, dayPastDue: 7, invoiceStatus }),
+        attemptSend: async () => { sends += 1; return OK as never; } }));
+    assert.equal(result.state, "refused", String(invoiceStatus));
+    if (result.state !== "refused") continue;
+    assert.ok(result.reasons.includes("invoice_status_is_not_sendable_at_send_time"),
+      `${invoiceStatus}: ${result.reasons.join(",")}`);
+    assert.equal(sends, 0, String(invoiceStatus));
+    assert.equal(led.reserved.length, 0, String(invoiceStatus));
+  }
+});
+
+test("the status check does not depend on the adapter's own stillOpen", async () => {
+  // The point of reading the status here rather than trusting `stillOpen`: an
+  // adapter that computes it from the balance alone - which is exactly what
+  // this repo's own adapter did until today - cannot smuggle a paid invoice
+  // past this step by answering true.
+  const led = fakeLedger();
+  let sends = 0;
+  const action = planned();
+  const result = await dispatchCatchupSend(action, action.sends[0], context("sms") as never,
+    io({ ledger: led.ledger,
+      confirmStillDue: async () => ({ stillOpen: true, balanceMinor: 9000, dayPastDue: 7, invoiceStatus: "paid" }),
+      attemptSend: async () => { sends += 1; return OK as never; } }));
+  assert.equal(result.state, "refused");
+  assert.equal(sends, 0);
+});
+
+test("the two open statuses still send", async () => {
+  for (const invoiceStatus of SENDABLE_INVOICE_STATUSES) {
+    const action = planned();
+    const result = await dispatchCatchupSend(action, action.sends[0], context("sms") as never,
+      io({ confirmStillDue: async () => ({ stillOpen: true, balanceMinor: 9000, dayPastDue: 7, invoiceStatus }) }));
+    assert.equal(result.state, "sent", `${invoiceStatus}: ${JSON.stringify(result)}`);
+  }
+});
+
+test("one paid invoice in a two-invoice message stops the whole message", async () => {
+  // The message names both, so sending it with one of them settled would put a
+  // wrong figure in a customer's hand. Both halves are refused, and neither
+  // costs a reservation.
+  const led = fakeLedger();
+  let sends = 0;
+  const action = planned({
+    invoices: [invoice(), invoice({ invoiceId: "inv-7286", invoiceNumber: "7286", dueOn: "2026-11-19" })],
+  });
+  const result = await dispatchCatchupSend(action, action.sends[0], context("sms") as never,
+    io({ ledger: led.ledger,
+      confirmStillDue: async (id: string) => ({ stillOpen: true, balanceMinor: 9000,
+        dayPastDue: id === "inv-7272" ? 7 : 5,
+        invoiceStatus: id === "inv-7286" ? "paid" : "past_due" }),
+      attemptSend: async () => { sends += 1; return OK as never; } }));
+  assert.equal(result.state, "refused", JSON.stringify(result));
+  if (result.state !== "refused") return;
+  assert.ok(result.reasons.includes("invoice_is_paid_at_send_time"), result.reasons.join(","));
+  assert.equal(sends, 0);
+  assert.equal(led.reserved.length, 0);
 });

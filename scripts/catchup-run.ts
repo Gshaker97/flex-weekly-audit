@@ -43,7 +43,7 @@ import { catchupRunnerReadiness, planCatchupRun, runCatchup } from "../lib/catch
 import { CATCHUP_EMAIL_SENDER, CATCHUP_SMS_SENDER } from "../lib/catchup-sender-policy";
 import type { CatchupRecipientInput } from "../lib/catchup-plan";
 import { readFileSync, writeFileSync } from "node:fs";
-import { constructCatchupRequest } from "../lib/catchup-dispatch";
+import { constructCatchupRequest, SENDABLE_INVOICE_STATUSES } from "../lib/catchup-dispatch";
 import { assembleCatchupSenders, catchupPreparationSenders } from "../lib/catchup-senders";
 import {
   approveCatchupManifest, buildCatchupManifest, catchupRequestSha256, parseCatchupManifest,
@@ -355,10 +355,18 @@ async function main(): Promise<void> {
             const balanceMinor = typeof invoice?.amounts?.invoiceBalance === "number"
               ? Math.round(invoice.amounts.invoiceBalance * 100) : null;
             const dueOn = invoice?.dueDate ? invoiceCalendarDate(new Date(invoice.dueDate)) : null;
+            // The status this query has always fetched is now carried through
+            // and acted on. A positive balance on its own does not mean an
+            // invoice is still chaseable: Jobber reports `paid` invoices that
+            // still carry one, and `void`, `draft` and `bad_debt` ones too.
+            const invoiceStatus = typeof invoice?.invoiceStatus === "string" ? invoice.invoiceStatus : null;
+            const sendable = !!invoiceStatus
+              && SENDABLE_INVOICE_STATUSES.some(s => s === invoiceStatus.trim().toLowerCase());
             return {
-              stillOpen: Boolean(invoice) && (balanceMinor ?? 0) > 0,
+              stillOpen: Boolean(invoice) && sendable && (balanceMinor ?? 0) > 0,
               balanceMinor,
               dayPastDue: dueOn ? dayNumber(sendDate) - dayNumber(dueOn) : null,
+              invoiceStatus,
             };
           },
           attemptSend: transport.attemptSend,
