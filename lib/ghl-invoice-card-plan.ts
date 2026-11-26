@@ -276,6 +276,22 @@ export function desiredStageForInvoice(
   if (balance > total) return { stage: null, reason: "balance_exceeds_total" };
   const status = invoice.status?.toLowerCase() ?? null;
   if (status === "paid" && balance === 0) return { stage: STAGE_PAID, balance: 0 };
+  // Jobber sometimes labels an invoice paid while still showing a balance on
+  // it. Holding is the right answer either way - this code will not chase money
+  // Jobber calls settled, nor zero a card that still shows one owing - but the
+  // fact is a CONTRADICTION IN THE SOURCE, not an unreadable status, and saying
+  // so is the difference between someone checking Jobber and someone hunting
+  // for a bug here. Observed live on an invoice reading paid with its full
+  // balance outstanding.
+  if (status === "paid" && balance > 0) {
+    return { stage: null, reason: "paid_label_contradicts_the_outstanding_balance" };
+  }
+  // A draft has not been issued, so it has no issue or due date and nothing is
+  // owed on it yet. Reaching the clock check and coming back
+  // "invoice_dates_unusable" reads as broken data and sends someone looking for
+  // damage that is not there; a draft having no dates is simply what a draft
+  // is. Checked before the clock, which a draft can never have.
+  if (status === "draft") return { stage: null, reason: "draft_invoice_not_yet_issued" };
   if (!clock) return { stage: null, reason: "invoice_dates_unusable" };
   // A malformed window is treated as the widest safe boundary, never as "no
   // boundary": an unreadable setting must not silently pull in years of history.
