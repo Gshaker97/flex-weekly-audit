@@ -141,9 +141,22 @@ function isRecurringJob(j: JobberJobNode): boolean {
 }
 
 export async function runFullSync(
-  opts: { triggeredBy?: "manual" | "cron"; full?: boolean; entrypoint?: SyncEntrypoint } = {}
+  opts: {
+    triggeredBy?: "manual" | "cron"; full?: boolean; entrypoint?: SyncEntrypoint;
+    /**
+     * Called once, with the run's id, the moment it is admitted. The cron
+     * entrypoint uses it to arm a shutdown handler: without the id in hand
+     * before the work starts, a SIGTERM mid-run has nothing to tidy up, which
+     * is how a redeploy used to leave a row blocking every later sync. Any
+     * error it throws is swallowed - a reporting hook must never stop a sync.
+     */
+    onAdmitted?: (runId: string) => void;
+  } = {}
 ) {
   const { run, since } = await admitSyncRun({ ...opts, entrypoint: opts.entrypoint ?? "http" });
+  try { opts.onAdmitted?.(run.id); } catch (e: any) {
+    logError(`[sync] onAdmitted hook failed (ignored): ${e?.message ?? e}`);
+  }
   const writer = new SyncRunWriter(run.id);
   let heavyFeeds: Promise<{ ok: true } | { ok: false; err: unknown }> | undefined;
   let recurringDay10Issue: string | null = null;

@@ -175,7 +175,20 @@ test("actual sync has one awaited call after first normal token use and before a
   assert.ok(hook15 < source.indexOf("heavyFeeds = Promise.allSettled(["));
   assert.match(source.slice(hook15, hook15 + 110), /entrypoint: opts.entrypoint \?\? "http"/);
   const cron = readFileSync("scripts/sync-cron.ts", "utf8");
-  assert.match(cron, /await runFullSync\(\{ triggeredBy: "cron", entrypoint: "standalone_cron" \}\)/);
+  // Still exactly one awaited sync, still the cron entrypoint. The call is now
+  // multi-line because it also hands back its run id, so the shutdown handler
+  // has something to close if a deploy replaces the container mid-run.
+  assert.equal(cron.match(/await runFullSync\(/g)?.length, 1);
+  const call = cron.slice(cron.indexOf("await runFullSync("));
+  const args = call.slice(0, call.indexOf("});") + 3);
+  assert.match(args, /triggeredBy: "cron"/);
+  assert.match(args, /entrypoint: "standalone_cron"/);
+  assert.match(args, /onAdmitted: \(runId\) => \{ activeRunId = runId; \}/);
+  // The Jobber login is refreshed and the handlers armed BEFORE the sync, so a
+  // run refused at the admission gate still keeps the login alive and a signal
+  // arriving at any point has somewhere to report to.
+  assert.ok(cron.indexOf("armShutdownHandlers()") < cron.indexOf("await runFullSync("));
+  assert.ok(cron.indexOf("await keepJobberLoginAlive()") < cron.indexOf("await runFullSync("));
 });
 test("private deployment variable is bounded, immutable during run and needs no filesystem provisioning", () => {
   const source = readFileSync("lib/notification-recurring-cron-config.ts", "utf8");

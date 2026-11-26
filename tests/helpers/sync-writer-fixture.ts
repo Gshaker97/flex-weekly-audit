@@ -16,14 +16,20 @@ export function writerFixture(initial = true) {
     create: async ({ data }: any) => { const row = { id: `run-${++serial}`, status: "running", errorMessage: null, startedAt: new Date(), completedAt: null, ...data }; rows.push(row); return structuredClone(row); },
     updateMany: async ({ where, data }: any) => { beforeUpdate?.(); const selected = rows.filter(row => matches(row, where)); selected.forEach(row => Object.assign(row, data)); return { count: selected.length }; },
   };
+  // The progress signal admission reads to tell a slow run from a dead one.
+  // `undefined` means the model is absent entirely, which admission must treat
+  // as unreadable and therefore refuse on.
+  let lastSyncedAt: Date | null | undefined = null;
+  const invoiceRecord = { aggregate: async () => ({ _max: { lastSyncedAt } }) };
   let tail: Promise<unknown> = Promise.resolve();
   const db = {
     syncRun: model,
+    invoiceRecord,
     $transaction: async (fn: (tx: any) => unknown) => {
       const previous = tail; let unlock!: () => void; tail = new Promise<void>(resolve => { unlock = resolve; });
       await previous; const before = structuredClone(rows);
       try {
-        const result = await fn({ syncRun: model, $executeRaw: async () => { calls.push("synchronous-commit"); return 0; }, $queryRaw: async () => [{ locked: true }] });
+        const result = await fn({ syncRun: model, ...(lastSyncedAt === undefined ? {} : { invoiceRecord }), $executeRaw: async () => { calls.push("synchronous-commit"); return 0; }, $queryRaw: async () => [{ locked: true }] });
         calls.push("commit"); unlock(); afterCommit?.(); return result;
       } catch (error) {
         // A fault after commit intentionally cannot roll back committed rows.
@@ -33,6 +39,8 @@ export function writerFixture(initial = true) {
     },
   } as unknown as PrismaClient;
   return { db, rows, calls, writer: new SyncRunWriter("test-run", db),
+    /** The newest invoice write admission will see. `undefined` hides the model. */
+    setRowProgress: (at: Date | null | undefined) => { lastSyncedAt = at; },
     loseNextCommit: () => { afterCommit = () => { afterCommit = undefined; throw new Error("Synthetic lost commit reply"); }; },
     failNextUpdate: () => { beforeUpdate = () => { beforeUpdate = undefined; throw new Error("Synthetic DB unavailable"); }; },
   };

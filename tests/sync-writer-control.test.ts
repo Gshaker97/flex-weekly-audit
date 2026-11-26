@@ -20,15 +20,86 @@ const intent: GhlWriteIntent = {
 const prefix = "FLEX_GHL_WRITE_JOURNAL_V1:";
 const saved = (f: ReturnType<typeof writerFixture>) => JSON.parse(f.rows[0].errorMessage.slice(prefix.length));
 
-test("admission serializes check-create and has no stale-run expiry", async () => {
+test("admission serializes check-create, and recovers a dead run instead of refusing forever", async () => {
   delete process.env.SYNC_ADMISSION_MODE;
   const f = writerFixture(false);
   const results = await Promise.allSettled([admitSyncRun({ entrypoint: "http" }, f.db), admitSyncRun({ entrypoint: "standalone_cron" }, f.db)]);
   assert.equal(results.filter(r => r.status === "fulfilled").length, 1);
+
+  // A LIVE run still refuses. This is the ordinary case and must not change.
+  await assert.rejects(admitSyncRun({ entrypoint: "standalone_cron" }, f.db), /running or blocked/);
+
+  // THIS IS THE CHANGE. A run that is ancient, quiet and carries no pending
+  // write used to refuse every later sync for good; on 2026-11-25 that cost
+  // five consecutive hourly syncs. Now it is abandoned and the sync proceeds.
   f.rows[0].startedAt = new Date("2000-01-01");
+  f.setRowProgress(null);
+  const admitted = await admitSyncRun({ entrypoint: "standalone_cron" }, f.db);
+  assert.equal(f.rows[0].status, "abandoned", "the dead run is abandoned");
+  assert.ok(f.rows[0].completedAt instanceof Date);
+  assert.match(f.rows[0].errorMessage, /Presumed dead and abandoned automatically/);
+  assert.equal(admitted.run.status, "running", "and a new run starts behind it");
+
+  // A BLOCKED run is an operator hold and is never recovered, at any age.
+  f.rows[1].status = "blocked";
+  f.rows[1].startedAt = new Date("2000-01-01");
   await assert.rejects(admitSyncRun({ entrypoint: "standalone_cron" }, f.db), /running or blocked/);
-  f.rows[0].status = "blocked";
+  assert.equal(f.rows[1].status, "blocked", "and it is left exactly as it was");
+});
+
+test("a pending GHL write stops automatic recovery however dead the run looks", async () => {
+  delete process.env.SYNC_ADMISSION_MODE;
+  const f = writerFixture(false);
+  await admitSyncRun({ entrypoint: "standalone_cron" }, f.db);
+  const saved = "FLEX_GHL_WRITE_JOURNAL_V1:" + JSON.stringify({
+    version: 1, runId: f.rows[0].id, warnings: null,
+    writes: [{ id: "11111111-1111-4111-8111-111111111111", state: "pending",
+      preparedAt: "2026-11-26T02:00:00.000Z", fingerprint: "x", intent: {} }],
+  });
+  Object.assign(f.rows[0], { startedAt: new Date("2000-01-01"), errorMessage: saved });
+  f.setRowProgress(null);
   await assert.rejects(admitSyncRun({ entrypoint: "standalone_cron" }, f.db), /running or blocked/);
+  assert.equal(f.rows[0].status, "running", "the row is untouched");
+  assert.equal(f.rows[0].errorMessage, saved, "and its write journal is preserved exactly");
+});
+
+test("a write journal admission cannot even read refuses, and stays a plain busy", async () => {
+  // `journal()` throws SyncWriterBlockedError on anything malformed. Admission
+  // never used to parse the journal, so that must not escape and turn a busy
+  // refusal into a blocked-for-review one; an unreadable journal counts as a
+  // pending write instead.
+  delete process.env.SYNC_ADMISSION_MODE;
+  for (const bad of ["FLEX_GHL_WRITE_JOURNAL_V1:{not json", "FLEX_GHL_WRITE_JOURNAL_V1:{\"version\":2}",
+                     "FLEX_GHL_WRITE_JOURNAL_V1:{\"version\":1,\"runId\":\"someone-else\",\"warnings\":null,\"writes\":[]}"]) {
+    const f = writerFixture(false);
+    await admitSyncRun({ entrypoint: "standalone_cron" }, f.db);
+    Object.assign(f.rows[0], { startedAt: new Date("2000-01-01"), errorMessage: bad });
+    f.setRowProgress(null);
+    await assert.rejects(admitSyncRun({ entrypoint: "standalone_cron" }, f.db), /running or blocked/, bad.slice(26, 60));
+    assert.equal(f.rows[0].status, "running");
+    assert.equal(f.rows[0].errorMessage, bad, "the unreadable journal is preserved");
+  }
+});
+
+test("recovery refuses when it cannot tell whether anything is still writing", async () => {
+  // Fail-closed. Admission must still end in a clean refusal, not a raw error.
+  delete process.env.SYNC_ADMISSION_MODE;
+  const f = writerFixture(false);
+  await admitSyncRun({ entrypoint: "standalone_cron" }, f.db);
+  f.rows[0].startedAt = new Date("2000-01-01");
+  f.setRowProgress(undefined); // the progress signal cannot be read at all
+  await assert.rejects(admitSyncRun({ entrypoint: "standalone_cron" }, f.db), /running or blocked/);
+  assert.equal(f.rows[0].status, "running");
+});
+
+test("a run still writing rows is left alone however old it is", async () => {
+  delete process.env.SYNC_ADMISSION_MODE;
+  const f = writerFixture(false);
+  await admitSyncRun({ entrypoint: "standalone_cron" }, f.db);
+  f.rows[0].startedAt = new Date("2000-01-01");
+  f.setRowProgress(new Date()); // something wrote an invoice a moment ago
+  await assert.rejects(admitSyncRun({ entrypoint: "standalone_cron" }, f.db), /running or blocked/);
+  assert.equal(f.rows[0].status, "running");
 });
 test("both HTTP verbs reject cron-labeled admission before any DB or provider work", async () => {
   process.env.SYNC_ADMISSION_MODE = "cron_only"; process.env.CRON_SECRET = "synthetic";

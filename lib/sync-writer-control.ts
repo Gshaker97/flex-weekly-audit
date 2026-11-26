@@ -3,10 +3,46 @@ import { createHash, randomUUID } from "node:crypto";
 import type { Prisma, PrismaClient, SyncRun } from "@prisma/client";
 import { prisma } from "./prisma";
 import { invoiceCalendarDate } from "./invoice-reminder-clock";
+import { staleRunVerdict, STALE_RUN_MIN_AGE_MS } from "./sync-stale-recovery";
 
 export type SyncEntrypoint = "http" | "standalone_cron";
 const JOURNAL_PREFIX = "FLEX_GHL_WRITE_JOURNAL_V1:";
 const JOURNAL_LIMIT = 1024 * 1024;
+/**
+ * How old and how quiet a `running` row must be before it is presumed dead.
+ * Overridable with SYNC_STALE_RUN_MINUTES for an operator who needs it tighter
+ * or looser; a value that is not a positive number falls back to the default
+ * rather than disabling the guard.
+ */
+/**
+ * The newest `lastSyncedAt` the sync has stamped on an invoice: the progress
+ * signal that tells a slow run apart from a dead one.
+ *
+ * A failure here is reported as unknown rather than thrown. Admission must end
+ * in a clean refusal or a clean start, never in a raw database error - and an
+ * unreadable signal refuses, so the fallback is the safe one either way.
+ */
+async function readRowProgress(
+  tx: unknown,
+): Promise<{ lastRowProgressAt: Date | null; progressUnknown: boolean }> {
+  // Structural, not Prisma-typed: the same gate runs against the test fake,
+  // whose transaction client carries only the models those tests need.
+  const model = (tx as { invoiceRecord?: { aggregate?: (a: unknown) => Promise<unknown> } })?.invoiceRecord;
+  if (typeof model?.aggregate !== "function") return { lastRowProgressAt: null, progressUnknown: true };
+  try {
+    const r = (await model.aggregate({ _max: { lastSyncedAt: true } })) as
+      { _max?: { lastSyncedAt?: Date | null } } | null;
+    const at = r?._max?.lastSyncedAt;
+    return { lastRowProgressAt: at instanceof Date ? at : null, progressUnknown: false };
+  } catch {
+    return { lastRowProgressAt: null, progressUnknown: true };
+  }
+}
+
+export function staleRunThresholdMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = Number(env.SYNC_STALE_RUN_MINUTES);
+  return Number.isFinite(raw) && raw > 0 ? raw * 60_000 : STALE_RUN_MIN_AGE_MS;
+}
 const BLOCKED_MESSAGE = "Sync is blocked pending operator review. No later sync or GHL write may resume automatically.";
 
 export class SyncAdmissionError extends Error {
@@ -39,11 +75,78 @@ export async function admitSyncRun(opts: {
   assertSyncAdmission(opts.entrypoint);
   return durable(db, async tx => {
     // Serializes check-and-create across all NEW-VERSION processes. Old writers
-    // must be stopped at cutover. No age-based expiry or automatic recovery.
+    // must be stopped at cutover. A demonstrably dead `running` row IS now
+    // recovered automatically, under the guards below; nothing else is.
     const lock = await tx.$queryRaw<Array<{ locked: boolean }>>`SELECT pg_try_advisory_xact_lock(1927231041, 1) AS locked`;
     if (!lock[0]?.locked) throw new SyncAdmissionError("busy");
-    if (await tx.syncRun.findFirst({ where: { status: { in: ["running", "blocked"] } }, select: { id: true } })) {
-      throw new SyncAdmissionError("busy");
+
+    // A row left `running` or `blocked` still refuses a new sync. What is new
+    // is that a `running` row which is DEMONSTRABLY dead no longer refuses it
+    // forever: it is abandoned here, under the guards in sync-stale-recovery.ts,
+    // and only then does this run proceed. Everything else - above all a
+    // pending write journal, and any `blocked` row - refuses exactly as before,
+    // and now says out loud why.
+    //
+    // This runs inside the advisory lock, so two processes cannot both decide a
+    // row is dead, and the write is conditional on the status not having moved.
+    const blocker = await tx.syncRun.findFirst({
+      where: { status: { in: ["running", "blocked"] } },
+      orderBy: { startedAt: "desc" },
+    });
+    if (blocker) {
+      // `journal()` THROWS SyncWriterBlockedError on anything it cannot
+      // validate. Admission used not to parse the journal at all, so letting
+      // that escape here would change a plain "busy" into a blocked-for-review
+      // error for a row that is not blocked. Instead a journal we cannot read
+      // counts as one pending write: recovery refuses, loudly, and the error
+      // stays the one callers already handle.
+      let parsed: Journal | null = null;
+      let journalUnreadable = false;
+      const journalPresent = typeof blocker.errorMessage === "string"
+        && blocker.errorMessage.startsWith(JOURNAL_PREFIX);
+      if (journalPresent) {
+        try { parsed = journal(blocker.errorMessage, blocker.id); }
+        catch { journalUnreadable = true; }
+      }
+      const verdict = staleRunVerdict({
+        status: blocker.status,
+        startedAt: blocker.startedAt,
+        opportunitiesSynced: blocker.ghlOpportunitiesSynced,
+        journal: {
+          present: journalPresent,
+          // An unreadable journal counts as one pending write, not none: a
+          // journal we cannot read is not evidence that nothing is in flight.
+          pendingWrites: journalUnreadable
+            ? 1
+            : (parsed?.writes.filter(w => w.state === "pending").length ?? 0),
+        },
+        ...(await readRowProgress(tx)),
+        now: new Date(),
+        minAgeMs: staleRunThresholdMs(),
+      });
+
+      if (!verdict.recover) {
+        // Loudly, every time. A refusal that says nothing is how five hours of
+        // hourly syncs went missing without anyone noticing.
+        console.error(`[sync] REFUSING TO START. A ${blocker.status} run from`
+          + ` ${blocker.startedAt.toISOString()} (id ${blocker.id}) is in the way.`
+          + ` Reason: ${verdict.reason}. ${verdict.detail}.`);
+        throw new SyncAdmissionError("busy");
+      }
+
+      // A settled journal is write evidence and is left exactly as it is;
+      // `cycleHistory()` reads it back out of this column. Only a row with no
+      // journal has its errorMessage written to.
+      const cleared = await tx.syncRun.updateMany({
+        where: { id: blocker.id, status: "running" },
+        data: verdict.preserveJournal
+          ? { status: "abandoned", completedAt: new Date() }
+          : { status: "abandoned", completedAt: new Date(), errorMessage: verdict.note },
+      });
+      if (cleared.count !== 1) throw new SyncAdmissionError("busy");
+      console.warn(`[sync] abandoned a dead run to resume hourly syncing:`
+        + ` id ${blocker.id}, started ${blocker.startedAt.toISOString()}.`
+        + ` ${verdict.note}${verdict.preserveJournal ? " Its write journal was left untouched." : ""}`);
     }
     const lastComplete = await tx.syncRun.findFirst({ where: { status: "complete" }, orderBy: { completedAt: "desc" } });
     const lastFull = await tx.syncRun.findFirst({ where: { status: "complete", mode: "full" }, orderBy: { completedAt: "desc" } });
