@@ -247,6 +247,42 @@ test("contradictory, void, zero and unusable invoices support no stage", () => {
   assert.equal(s({}, null).stage, null, "no clock");
 });
 
+// Both of these were found on live invoices. Neither changes what happens to a
+// card - the invoice is held exactly as before - but a hold nobody can read is
+// a hold nobody can act on, so each contradiction now names itself.
+test("a paid label over an outstanding balance names the contradiction", () => {
+  const out = desiredStageForInvoice(
+    invoice({ status: "paid", totalDollars: 60, balanceDollars: 60 }), openClock);
+  assert.equal(out.stage, null, "still held: not chased, not zeroed");
+  assert.equal((out as { reason: string }).reason, "paid_label_contradicts_the_outstanding_balance");
+
+  // The settled case is untouched, and a part-paid invoice still reads as one.
+  assert.deepEqual(desiredStageForInvoice(
+    invoice({ status: "paid", totalDollars: 60, balanceDollars: 0 }), openClock),
+    { stage: STAGE_PAID, balance: 0 });
+  assert.equal(desiredStageForInvoice(
+    invoice({ status: "paid", totalDollars: 60, balanceDollars: 0.5 }), openClock).stage, null);
+});
+
+test("a draft is held as a draft, not as broken dates", () => {
+  // A real one: a draft carrying a balance with no issue or due date at all.
+  const out = desiredStageForInvoice(
+    invoice({ status: "draft", totalDollars: 85, balanceDollars: 85 }), null);
+  assert.equal(out.stage, null, "a draft owes nothing yet");
+  assert.equal((out as { reason: string }).reason, "draft_invoice_not_yet_issued");
+
+  // Named by its status even when it does have a clock, so the reason does not
+  // depend on which fields happen to be filled in.
+  assert.equal((desiredStageForInvoice(
+    invoice({ status: "draft" }), openClock) as { reason: string }).reason,
+    "draft_invoice_not_yet_issued");
+
+  // And a genuinely unreadable date on a non-draft still says so.
+  assert.equal((desiredStageForInvoice(
+    invoice({ status: "awaiting_payment" }), null) as { reason: string }).reason,
+    "invoice_dates_unusable");
+});
+
 // ------------------------------------------------- shape of the result
 
 test("the summary counts what the actions actually say", () => {
