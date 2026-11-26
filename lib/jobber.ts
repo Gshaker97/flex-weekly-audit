@@ -442,6 +442,12 @@ const VISITS_QUERY = `
   }
 `;
 
+// `receivedDate` is when the money actually arrived. Jobber has no
+// "paymentDate" on an invoice, and this is the one scalar that tracks full
+// settlement; lib/invoice-paid-date.ts records the measurement behind choosing
+// it over the nested payment-records connection, which would multiply the cost
+// of a feed that paginates to thousands of invoices. It feeds `paidAt`, so
+// removing it silently empties that column.
 const INVOICES_QUERY = `
   query GetInvoices($after: String) {
     invoices(first: 25, after: $after) {
@@ -454,6 +460,7 @@ const INVOICES_QUERY = `
         amounts { total invoiceBalance discountAmount subtotal }
         issuedDate
         dueDate
+        receivedDate
         createdAt
         client {
           id
@@ -528,6 +535,8 @@ export interface JobberInvoiceNode {
   } | null;
   issuedDate: string | null;
   dueDate: string | null;
+  /** Jobber's `Invoice.receivedDate`: when the invoice was settled. */
+  receivedDate: string | null;
   createdAt: string | null;
   client: { id: string; name?: string | null; companyName?: string | null } | null;
 }

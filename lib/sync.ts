@@ -30,6 +30,7 @@ import {
   jobberGraphQL,
 } from "./jobber";
 import { jobberBillingAddress } from "./jobber-billing-address";
+import { invoiceIsSettled, invoicePaidAt } from "./invoice-paid-date";
 import {
   getInvoicePipelineRefs,
   listContactsForPhoneMatching,
@@ -552,7 +553,6 @@ async function upsertInvoices(nodes: JobberInvoiceNode[]) {
     const total = inv.amounts?.total ?? 0;
     const balance = inv.amounts?.invoiceBalance ?? 0;
     const amountPaid = total - balance;
-    const isPaid = balance === 0 && total > 0;
 
     await prisma.invoiceRecord.upsert({
       where: { jobberInvoiceId: inv.id },
@@ -566,7 +566,7 @@ async function upsertInvoices(nodes: JobberInvoiceNode[]) {
         amountDue: balance,
         issuedAt: inv.issuedDate ? new Date(inv.issuedDate) : null,
         dueAt: inv.dueDate ? new Date(inv.dueDate) : null,
-        paidAt: isPaid && inv.issuedDate ? new Date(inv.issuedDate) : null,
+        paidAt: invoicePaidAt(inv),
         createdAtJobber: inv.createdAt ? new Date(inv.createdAt) : null,
         customerId,
         clientName: inv.client?.companyName || inv.client?.name || null,
@@ -580,7 +580,7 @@ async function upsertInvoices(nodes: JobberInvoiceNode[]) {
         amountDue: balance,
         issuedAt: inv.issuedDate ? new Date(inv.issuedDate) : null,
         dueAt: inv.dueDate ? new Date(inv.dueDate) : null,
-        paidAt: isPaid && inv.issuedDate ? new Date(inv.issuedDate) : null,
+        paidAt: invoicePaidAt(inv),
         createdAtJobber: inv.createdAt ? new Date(inv.createdAt) : null,
         customerId,
         clientName: inv.client?.companyName || inv.client?.name || null,
