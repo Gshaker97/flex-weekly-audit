@@ -55,6 +55,36 @@ export class SyncAdmissionError extends Error {
 export class SyncWriterBlockedError extends Error {
   constructor() { super(BLOCKED_MESSAGE); }
 }
+
+/**
+ * A write this writer REFUSED TO START. Nothing was journaled and nothing was
+ * sent to the provider, so there is no outcome to be uncertain about and no
+ * card that could be duplicated by a later run.
+ *
+ * This is deliberately a different class from `SyncWriterBlockedError`, and the
+ * difference is the whole point. A block means "a write may have left this
+ * process and I cannot prove what happened to it", which must stop every later
+ * sync until a person looks. A refusal means "this intent is not well-formed,
+ * so I did not attempt it" - one card held, the run carries on.
+ *
+ * Before this existed, `prepare()` funnelled both into a block. On 2026-11-27
+ * one malformed intent (invoice #6830: Jobber's `paid` label with $60 still
+ * owing, which the journal validator refuses) halted every remaining card write
+ * and blocked the hourly sync permanently. Nothing had been sent.
+ *
+ * ONLY pre-flight validation raises this. A duplicate-claim assertion, a
+ * pending write already in the journal, a lost update race and any provider
+ * call all still raise `SyncWriterBlockedError`, because any of those can mean
+ * a real write is in flight.
+ */
+export class SyncWriterRefusedError extends Error {
+  /** A short machine reason, safe to log. Never a customer detail. */
+  readonly reason: string;
+  constructor(reason: string) {
+    super(`GHL write intent refused before anything was sent: ${reason}`);
+    this.reason = reason;
+  }
+}
 export function assertSyncAdmission(entrypoint: SyncEntrypoint, env = process.env): void {
   const mode = env.SYNC_ADMISSION_MODE ?? "mixed";
   if (mode !== "mixed" && mode !== "cron_only") throw new SyncAdmissionError("invalid_mode");
@@ -256,7 +286,90 @@ export interface GhlWriteIntent {
  */
 export type WriteAbandonment = { version: 1; reason: string; evidence: string; observedAt: string };
 export interface JournalEntry { id: string; state: "pending" | "confirmed" | "abandoned"; preparedAt: string; confirmedAt?: string; abandonedAt?: string; abandonment?: WriteAbandonment; fingerprint: string; intent: GhlWriteIntent; paidDateReadback?: PaidDateReadback; removalAcknowledgment?: WorkflowRemovalAcknowledgment }
-interface Journal { version: 1; runId: string; warnings: string | null; writes: JournalEntry[] }
+/**
+ * ONE card the run decided not to write, in plain language, for a person to
+ * read on the dashboard. Deliberately NOT write evidence: a skip means nothing
+ * was attempted, so none of the journal's integrity rules apply to it, and it
+ * carries no opportunity, contact or location id.
+ */
+export type SyncRunSkip = Readonly<{
+  /** The human invoice number, e.g. "6830". */
+  invoiceNumber: string | null;
+  /** The customer as the dashboard already names them elsewhere. */
+  customer: string | null;
+  /** A whole sentence, written for Garrison, not a machine code. */
+  reason: string;
+}>;
+
+/** Why this run blocked, in plain language, so the row that stops the hourly
+ * sync explains itself without a log dig. */
+export type SyncRunBlockNote = Readonly<{
+  invoiceNumber: string | null;
+  customer: string | null;
+  /** Which part of the run it stopped in, e.g. "writing the invoice card". */
+  step: string;
+  reason: string;
+  /** True only when a write was already in flight, which keeps it human-only. */
+  pendingWrite: boolean;
+  at: string;
+}>;
+
+export const SKIP_LIMIT = 200;
+const SKIP_TEXT_LIMIT = 400;
+
+interface Journal {
+  version: 1; runId: string; warnings: string | null; writes: JournalEntry[];
+  /** Cards held this run. Additive and optional: an older journal has none. */
+  skips?: SyncRunSkip[];
+  /** Set once, when the run blocks. */
+  block?: SyncRunBlockNote;
+}
+
+function text(value: unknown, limit = SKIP_TEXT_LIMIT): string | null {
+  return typeof value === "string" && value.trim().length > 0 && value.length <= limit ? value.trim() : null;
+}
+
+/**
+ * Validates the plain-language parts of an envelope. Deliberately lenient in
+ * one direction only: anything it cannot read is DROPPED, never thrown on. A
+ * malformed skip note must not make a journal unparseable, because the journal
+ * is the write evidence and losing it is far worse than losing a sentence.
+ */
+function readNotes(value: Journal): { skips: SyncRunSkip[]; block: SyncRunBlockNote | null } {
+  const skips: SyncRunSkip[] = [];
+  if (Array.isArray(value.skips)) {
+    for (const s of value.skips.slice(0, SKIP_LIMIT)) {
+      const reason = text(s?.reason);
+      if (reason) skips.push(Object.freeze({
+        invoiceNumber: text(s?.invoiceNumber, 32), customer: text(s?.customer, 200), reason }));
+    }
+  }
+  const b = value.block;
+  const blockReason = text(b?.reason), step = text(b?.step, 120);
+  const block = blockReason && step ? Object.freeze({
+    invoiceNumber: text(b?.invoiceNumber, 32), customer: text(b?.customer, 200),
+    step, reason: blockReason, pendingWrite: b?.pendingWrite === true,
+    at: text(b?.at, 64) ?? new Date(0).toISOString(),
+  }) : null;
+  return { skips, block };
+}
+
+/**
+ * The plain-language diagnostics for one run: why each card was skipped and, if
+ * it blocked, what stopped it. Pure, and safe to render on an AUTHENTICATED
+ * page. It is not used by `publicSyncErrorMessage`, because that feeds an
+ * unauthenticated status endpoint and these notes name customers.
+ */
+export function syncRunDiagnostics(message: string | null, runId: string): {
+  skips: SyncRunSkip[]; block: SyncRunBlockNote | null;
+} {
+  if (!message?.startsWith(JOURNAL_PREFIX)) return { skips: [], block: null };
+  try {
+    const value = JSON.parse(message.slice(JOURNAL_PREFIX.length)) as Journal;
+    if (value.version !== 1 || value.runId !== runId) return { skips: [], block: null };
+    return readNotes(value);
+  } catch { return { skips: [], block: null }; }
+}
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 export const cardNameHash = (name: string | null | undefined) => hash(JSON.stringify(name ?? null));
 const identity = (v: unknown): v is string => typeof v === "string" && v.length > 0 && v.length <= 512;
@@ -283,13 +396,29 @@ function validateIntent(v: GhlWriteIntent): void {
       || !v.source || typeof v.source.observedAt !== "string" || !date(v.source.observedAt)
       || !Array.isArray(v.source.storedInvoiceIds) || !v.source.storedInvoiceIds.length || !v.source.storedInvoiceIds.every(identity)
       || !Array.isArray(v.source.invoices) || !v.source.invoices.length) throw new SyncWriterBlockedError();
+  // THE SOURCE INVOICES ARE A REFUSAL, NOT A BLOCK, and the distinction is
+  // narrow on purpose.
+  //
+  // Everything else in this function checks that the intent AGREES WITH ITS OWN
+  // CLAIM - that nobody has edited a stage, an amount, a name or a date into a
+  // write the journal never authorized. A failure there is tampering or a
+  // serious bug, and stopping every later sync is the right answer.
+  //
+  // This loop checks something different: whether the invoice data READ FROM
+  // JOBBER hangs together. Jobber can and does return an incoherent invoice -
+  // `paid` with money still owing is the everyday example - and that is not
+  // evidence of anything wrong with this system. It is one card we cannot act
+  // on, so it is refused before anything is journaled or sent, and the run
+  // carries on. Blocking on it cost every hourly sync on 2026-11-27.
   const ids = new Set<string>();
   for (const i of v.source.invoices) {
     if (!i || !identity(i.id) || ids.has(i.id) || i.jobberClientId !== v.jobberClientId
         || !["paid", "past_due", "awaiting_payment"].includes(i.invoiceStatus)
         || !minor(i.totalCents) || !minor(i.balanceCents) || i.balanceCents > i.totalCents
         || (i.invoiceStatus === "paid" ? i.balanceCents !== 0 : i.balanceCents <= 0)
-        || !date(i.issuedDate) || !date(i.createdAt) || !date(i.dueDate)) throw new SyncWriterBlockedError();
+        || !date(i.issuedDate) || !date(i.createdAt) || !date(i.dueDate)) {
+      throw new SyncWriterRefusedError("source_invoice_amounts_or_status_incoherent");
+    }
     ids.add(i.id);
   }
   if (new Set(v.source.storedInvoiceIds).size !== v.source.storedInvoiceIds.length || v.source.storedInvoiceIds.some(id => !ids.has(id))) throw new SyncWriterBlockedError();
@@ -568,7 +697,30 @@ function serialize(value: Journal): string {
 }
 export function publicSyncErrorMessage(message: string | null): string | null {
   // Never return partial or malformed journals, or their private source values.
-  if (message?.startsWith(JOURNAL_PREFIX)) return "Private GHL write evidence retained. A running or blocked sync requires operator review before another run.";
+  if (message?.startsWith(JOURNAL_PREFIX)) {
+    // This feeds an UNAUTHENTICATED status endpoint, so it reports what
+    // happened and how much, never who. Customer names and invoice numbers
+    // stay on the authenticated dashboard, via `syncRunDiagnostics`.
+    let notes: { skips: SyncRunSkip[]; block: SyncRunBlockNote | null } = { skips: [], block: null };
+    let pending = false;
+    try {
+      const value = JSON.parse(message.slice(JOURNAL_PREFIX.length)) as Journal;
+      if (value.version === 1) {
+        notes = readNotes(value);
+        pending = Array.isArray(value.writes) && value.writes.some(w => w?.state === "pending");
+      }
+    } catch { /* Fall through to the conservative sentence below. */ }
+    if (notes.block) {
+      return `Sync blocked while ${notes.block.step}. ${notes.block.pendingWrite
+        ? "A GHL write was already in flight, so a person must review it before another sync runs."
+        : "Nothing was sent to GoHighLevel. A person must clear it before another sync runs."}`;
+    }
+    if (!pending && notes.skips.length) {
+      return `${notes.skips.length} invoice card${notes.skips.length === 1 ? "" : "s"} held this run. `
+        + "See the dashboard for which, and why.";
+    }
+    return "Private GHL write evidence retained. A running or blocked sync requires operator review before another run.";
+  }
   return message;
 }
 export function publicSyncRun<T extends { errorMessage: string | null }>(run: T): T {
@@ -578,14 +730,83 @@ export function publicSyncRun<T extends { errorMessage: string | null }>(run: T)
 /** One admitted run owns all mutation attempts. No automatic unlock/recovery. */
 export class SyncRunWriter {
   private halted = false;
+  /** Cards held this run, in plain language, persisted when the run ends. */
+  private readonly skips: SyncRunSkip[] = [];
   constructor(readonly runId: string, private readonly db: PrismaClient = prisma) {}
+
+  /**
+   * Merge the plain-language notes into whatever is in `errorMessage` now,
+   * without disturbing the write evidence.
+   *
+   * BEST EFFORT, ALWAYS. Every failure path returns quietly: the caller has
+   * already recorded the outcome that matters (a blocked status, a finished
+   * run), and losing an explanatory sentence must never turn into losing a
+   * journal or failing a run. `writes` is copied through untouched, and the
+   * update is conditional on the exact previous value so a concurrent writer
+   * cannot be clobbered.
+   */
+  private async mergeNotes(block: SyncRunBlockNote | null): Promise<void> {
+    if (!this.skips.length && !block) return;
+    try {
+      await durable(this.db, async tx => {
+        const run = await tx.syncRun.findUniqueOrThrow({ where: { id: this.runId } });
+        let current: Journal;
+        try {
+          current = journal(run.errorMessage, this.runId)
+            ?? { version: 1 as const, runId: this.runId, warnings: run.errorMessage ?? null, writes: [] };
+        } catch { return; } // Unreadable journal: leave it exactly as found.
+        const existing = readNotes(current);
+        const next: Journal = { ...current,
+          // `warnings` must be string|null for `journal()` to parse this back.
+          warnings: current.warnings ?? null,
+          skips: [...existing.skips, ...this.skips].slice(0, SKIP_LIMIT),
+          ...(block ?? existing.block ? { block: block ?? existing.block! } : {}) };
+        let serialized: string;
+        try { serialized = serialize(next); } catch { return; } // Over the size limit.
+        await tx.syncRun.updateMany({
+          where: { id: this.runId, errorMessage: run.errorMessage }, data: { errorMessage: serialized } });
+      });
+    } catch { /* Explanations are never worth failing a run over. */ }
+  }
 
   async readCycleHistory(): Promise<CycleJournalEntry[]> { return cycleHistory(this.db); }
 
+  /**
+   * Note one card this run decided not to write. In memory only until the run
+   * ends, then persisted by `finish()` or `block()`. Never throws: a failure to
+   * record a sentence must not affect the run.
+   */
+  noteSkip(skip: SyncRunSkip): void {
+    if (this.skips.length >= SKIP_LIMIT) return;
+    const reason = text(skip?.reason);
+    if (!reason) return;
+    this.skips.push(Object.freeze({
+      invoiceNumber: text(skip?.invoiceNumber, 32), customer: text(skip?.customer, 200), reason }));
+  }
+
   async prepare(intent: GhlWriteIntent): Promise<string> {
+    // A writer that has already halted cannot be trusted to reason about
+    // anything, so this stays a block.
+    if (this.halted) { await this.block(); throw new SyncWriterBlockedError(); }
+    // PRE-FLIGHT, DELIBERATELY OUTSIDE THE BLOCKING CATCH BELOW.
+    //
+    // `validateIntent` is pure and runs before the transaction opens, so
+    // nothing has been journaled and nothing has been sent either way. But only
+    // ONE of its failures is a refusal: incoherent source invoice data, which
+    // it raises as `SyncWriterRefusedError`. Everything else it checks is
+    // whether the intent agrees with its own claim, and a failure there is a
+    // tamper tripwire that must still stop every later sync.
+    // No note is written here on purpose. A tampered intent must leave
+    // `errorMessage` exactly as it found it - the durable intent is never
+    // cleared or replaced - and the caller that knows which invoice and
+    // customer this was (the card writer) records the reason straight after.
+    try { validateIntent(intent); }
+    catch (err) {
+      if (err instanceof SyncWriterRefusedError) throw err;
+      await this.block();
+      throw new SyncWriterBlockedError();
+    }
     try {
-      if (this.halted) throw new SyncWriterBlockedError();
-      validateIntent(intent);
       const id = randomUUID();
       await durable(this.db, async tx => {
         const run = await tx.syncRun.findUniqueOrThrow({ where: { id: this.runId } });
@@ -669,13 +890,32 @@ export class SyncRunWriter {
       });
     } catch { await this.block(); throw new SyncWriterBlockedError(); }
   }
-  async block(): Promise<void> {
+  /**
+   * Hold this run for operator review.
+   *
+   * `note` is why, in plain language, for the dashboard. The STATUS IS WRITTEN
+   * FIRST and the explanation second, so a failure to record the sentence can
+   * never cost us the hold itself.
+   */
+  async block(note?: Omit<SyncRunBlockNote, "at" | "pendingWrite"> & { pendingWrite?: boolean }): Promise<void> {
     this.halted = true;
     // Best effort to make the hold obvious. Failure leaves the original running
     // row and pending journal in place, which is itself a non-expiring barrier.
     try {
       await durable(this.db, tx => tx.syncRun.updateMany({ where: { id: this.runId, status: "running" }, data: { status: "blocked" } }));
     } catch { /* Never clear or replace the durable intent. */ }
+    // A block with a write already in flight stays human-only to clear, and
+    // says so on the row itself.
+    let pendingWrite = note?.pendingWrite === true;
+    if (note && note.pendingWrite === undefined) {
+      try {
+        const run = await this.db.syncRun.findUniqueOrThrow({ where: { id: this.runId } });
+        pendingWrite = (journal(run.errorMessage, this.runId)?.writes ?? []).some(w => w.state === "pending");
+      } catch { pendingWrite = true; } // Cannot tell: assume the unsafe case.
+    }
+    await this.mergeNotes(note
+      ? { ...note, pendingWrite, at: new Date().toISOString() }
+      : null);
   }
   async finish(status: "complete" | "failed", failure?: string): Promise<SyncRun> {
     try {
@@ -693,6 +933,9 @@ export class SyncRunWriter {
         if (changed.count !== 1) throw new SyncWriterBlockedError();
         return tx.syncRun.findUniqueOrThrow({ where: { id: run.id } });
       });
+      // The run is closed; now record why any card was held. Deliberately after
+      // the status write, and never able to undo it.
+      await this.mergeNotes(null);
       return publicSyncRun(result);
     } catch { await this.block(); throw new SyncWriterBlockedError(); }
   }

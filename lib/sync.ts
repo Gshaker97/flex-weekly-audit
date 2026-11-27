@@ -43,6 +43,7 @@ import {
 } from "./ghl";
 import { phoneSourcePlan, readPhoneInvoiceEvidence, moneyCents } from "./ghl-phone-state";
 import { settledOrOwingStatus } from "./invoice-settlement";
+import { plainCardSkipReason } from "./card-skip-language";
 import { canonicalPhone, matchPhoneCustomer, phoneMayShareOwner } from "./ghl-phone-match";
 import { log, logError } from "./log";
 import { planCardCreation, describeCardCreation, CARD_CREATION_STAGE } from "./ghl-card-creation-plan";
@@ -721,7 +722,8 @@ export interface InvoiceCardPlanReport {
 export async function syncGhlInvoicePipeline(opts: {
   mode?: GhlInvoiceWriteMode;
   report?: (entry: GhlInvoiceReview) => void;
-  writer?: Pick<SyncRunWriter, "prepare" | "assertPending" | "confirm" | "abandon" | "block"> & Partial<Pick<SyncRunWriter, "readCycleHistory">>;
+  writer?: Pick<SyncRunWriter, "prepare" | "assertPending" | "confirm" | "abandon" | "block">
+    & Partial<Pick<SyncRunWriter, "readCycleHistory" | "noteSkip">>;
   /**
    * Ask for the ONE CARD PER INVOICE plan, chosen by the owner 2026-11-20.
    *
@@ -883,10 +885,14 @@ export async function syncGhlInvoicePipeline(opts: {
           stageName: stageNameById.get(card.pipelineStageId ?? "") ?? null,
           monetaryValue: card.monetaryValue ?? null,
         }));
+        // Named once: the plan uses it for the card name and the skip report uses
+        // it to tell Garrison whose card was held.
+        const cardCustomerLabel = ownInvoices[0]?.clientName ?? customer.companyName
+          ?? customer.name ?? customer.jobberClientId;
         const plan = planInvoiceCards({
             contactId, now, clocks, windowStart, legacySending: opts.legacySending ?? legacySendingFromEnv(process.env, now),
             legacyWorkflowId: process.env.GHL_LEGACY_INVOICE_WORKFLOW_ID ?? "",
-            label: ownInvoices[0]?.clientName ?? customer.companyName ?? customer.name ?? customer.jobberClientId,
+            label: cardCustomerLabel,
             invoices: mine.map(inv => ({
               invoiceId: inv.id, invoiceNumber: inv.invoiceNumber, status: inv.invoiceStatus,
               totalDollars: inv.amounts?.total ?? null, balanceDollars: inv.amounts?.invoiceBalance ?? null,
@@ -914,7 +920,7 @@ export async function syncGhlInvoicePipeline(opts: {
             stageIds: { sent: sentId, overdue: overdueId, paid: paidId },
             gate: cardGate, source: evidence, observedAt: sourceObservedAt,
             preflight: new Map(existingCards.map(card => [card.id, card])),
-            spend: cardSpend, claimedInvoiceIds: cardClaims,
+            spend: cardSpend, claimedInvoiceIds: cardClaims, customerLabel: cardCustomerLabel,
             writer: { prepare: opts.writer!.prepare.bind(opts.writer), assertPending: opts.writer!.assertPending.bind(opts.writer),
               confirm: opts.writer!.confirm.bind(opts.writer), abandon: opts.writer!.abandon.bind(opts.writer),
               block: opts.writer!.block.bind(opts.writer),
@@ -922,6 +928,12 @@ export async function syncGhlInvoicePipeline(opts: {
             report: entry => {
               log(`[ghl-card] ${JSON.stringify(entry)}`);
               opts.perInvoiceWriteReport?.(entry);
+              // EVERY SKIP REPORTS WHY, on the run itself, so the dashboard can
+              // show it without anyone opening a log.
+              if (entry.action === "hold") {
+                opts.writer?.noteSkip?.({ invoiceNumber: entry.invoiceNumber ?? null,
+                  customer: cardCustomerLabel, reason: plainCardSkipReason(entry.reason) });
+              }
             },
           });
           applied += result.applied;

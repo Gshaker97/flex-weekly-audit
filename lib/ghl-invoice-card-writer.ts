@@ -55,7 +55,8 @@ import { buildGhlWriteIntent, buildInvoiceSourceEvidence } from "./ghl-write-int
 import { isOwing, isSettled } from "./invoice-settlement";
 import { moneyCents, type PhoneInvoiceEvidence } from "./ghl-phone-state";
 import { cardNameHash, creationPlaceholderId, invoiceSourceFingerprint,
-  type CycleJournalEntry, type GhlWriteIntent, type SyncRunWriter } from "./sync-writer-control";
+  type CycleJournalEntry, type GhlWriteIntent, type SyncRunWriter,
+  SyncWriterRefusedError } from "./sync-writer-control";
 import { invoiceNumbersInCardName, legacySendingIsOff, STAGE_OVERDUE, STAGE_PAID, STAGE_SENT,
   type ExistingCard, type InvoiceCardAction, type InvoiceCardPlan,
   type LegacySendingEvidence } from "./ghl-invoice-card-plan";
@@ -370,6 +371,8 @@ export interface ApplyInvoiceCardPlanInput {
    */
   claimedInvoiceIds: Set<string>;
   writer: Writer;
+  /** How the dashboard already names this customer, for the skip/block notes. */
+  customerLabel?: string | null;
   report: (entry: InvoiceCardWriteReport) => void;
   io?: InvoiceCardWriteIo;
   /**
@@ -421,13 +424,23 @@ export async function applyInvoiceCardPlan(input: ApplyInvoiceCardPlanInput): Pr
       if (outcome.state === "applied") { applied += 1; input.spend.remaining -= 1; }
       say({ action: outcome.state, reason: outcome.reason, ...(outcome.to ? { to: outcome.to } : {}) },
         outcome.cardId ?? cardOf);
-      if (outcome.state === "failed") return { applied, halted: true };
+      if (outcome.state === "failed") {
+        // The writer has already blocked itself. Give the row the reason in
+        // plain words, so the thing that stops the next sync explains itself.
+        await input.writer.block({ invoiceNumber: base.invoiceNumber,
+          customer: input.customerLabel ?? null,
+          step: `writing this customer's invoice card`, reason: outcome.reason });
+        return { applied, halted: true };
+      }
     } catch (err: any) {
       // Everything a card write can be expected to get wrong is handled inside
       // the helpers and comes back as a hold. An exception reaching here is
       // therefore unexplained, and an unexplained failure in a writer whose
       // claim may already be durable is a halt, not a skipped card.
-      await input.writer.block();
+      await input.writer.block({ invoiceNumber: base.invoiceNumber,
+        customer: input.customerLabel ?? null,
+        step: `writing this customer's invoice card`,
+        reason: `an unexpected failure the writer could not explain, so it stopped rather than guess: ${err?.message ?? err}` });
       say({ action: "failed",
         reason: `Unexpected card write failure; remaining card writes halted. ${err?.message ?? err}` });
       return { applied, halted: true };
@@ -491,6 +504,12 @@ async function adoptCard(
   try {
     intentId = await input.writer.prepare(intent);
   } catch (err: any) {
+    // A REFUSAL IS NOT A HALT. `prepare` validates the intent before it
+    // journals or sends anything, so a refusal means this one card was never
+    // attempted: hold it, let the run carry on, and say why in plain words.
+    if (err instanceof SyncWriterRefusedError) {
+      return held(`this card's write could not be recorded safely, so it was left alone (${err.reason})`);
+    }
     return { state: "failed", cardId: decision.cardId, to, claimed: true,
       reason: `Durable write claim refused; remaining card writes halted. ${err?.message ?? err}` };
   }
@@ -636,6 +655,12 @@ async function combineCard(
   try {
     intentId = await input.writer.prepare(intent);
   } catch (err: any) {
+    // A REFUSAL IS NOT A HALT. `prepare` validates the intent before it
+    // journals or sends anything, so a refusal means this one card was never
+    // attempted: hold it, let the run carry on, and say why in plain words.
+    if (err instanceof SyncWriterRefusedError) {
+      return held(`this card's write could not be recorded safely, so it was left alone (${err.reason})`);
+    }
     return { state: "failed", cardId: decision.cardId, to, claimed: true,
       reason: `Durable write claim refused; remaining card writes halted. ${err?.message ?? err}` };
   }
@@ -736,6 +761,12 @@ async function createCard(
   try {
     intentId = await input.writer.prepare(intent);
   } catch (err: any) {
+    // A refused intent was never attempted, so this is one card held, not a
+    // halt. The claim added just above is left in place deliberately: it only
+    // ever prevents a second attempt at the same invoice.
+    if (err instanceof SyncWriterRefusedError) {
+      return held(`this card could not be created safely, so none was created (${err.reason})`);
+    }
     // Nothing was POSTed, but `prepare` has halted the writer; say so plainly
     // rather than letting the next card try and fail the same way.
     return { state: "failed", cardId: null, to, claimed: true,
