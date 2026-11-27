@@ -1,5 +1,6 @@
 import { prisma } from "@/lib/prisma";
 import { SyncSkipReport } from "./SyncSkipReport";
+import { latestReconcileRun, RECONCILE_PANEL_LOOKBACK_RUNS } from "@/lib/invoice-reconcile";
 import { computeDashboardKPIs } from "@/lib/kpis";
 import { COLLECTIONS_SINCE } from "@/lib/lateInvoices";
 import { overdueInvoicesWhere, legacyOverdueWhere, legacyOverdueAnyRangeWhere,
@@ -55,11 +56,16 @@ export default async function DashboardPage({
   if (!lastSync) return <FirstSyncPrompt />;
 
   // The newest run whatever its status: a blocked or failed run is exactly the
-  // one whose skips and stop reason need to be visible.
-  const newestRun = await prisma.syncRun.findFirst({
-    orderBy: { startedAt: "desc" },
+  // one whose skips and stop reason need to be visible. The newest run whose
+  // journal carries a RECONCILE stamp comes out of the same page of rows, so
+  // the daily reconcile stays on the dashboard for the whole day rather than
+  // only for the hour it ran in.
+  const recentRuns = await prisma.syncRun.findMany({
+    orderBy: { startedAt: "desc" }, take: RECONCILE_PANEL_LOOKBACK_RUNS,
     select: { id: true, status: true, startedAt: true, errorMessage: true },
   });
+  const newestRun = recentRuns[0] ?? null;
+  const reconcileRun = latestReconcileRun(recentRuns);
 
   const now = new Date();
   const range = resolveDateRange(searchParams);
@@ -134,7 +140,7 @@ export default async function DashboardPage({
         rangeLabel={kpis.range.label}
       />
 
-      <SyncSkipReport run={newestRun} />
+      <SyncSkipReport run={newestRun} reconcileRun={reconcileRun} />
 
       <section className="space-y-3">
         <SectionTitle title="Revenue" />

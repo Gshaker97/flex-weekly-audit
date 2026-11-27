@@ -4,7 +4,9 @@ import { readPrePaidDateWitness, readPaidDateReadback } from "./ghl-paid-date-wi
 import { readConfiguredStandingIdentityPolicy, readStandingIdentityInventory } from "./ghl-standing-identity";
 import { inspectReviewedIdentityInventory, reviewedIdentityOwnerEvidence } from "./ghl-identity-coverage";
 import { prisma } from "./prisma";
-import { latestCycleOwner, admitSyncRun, SyncEntrypoint, SyncRunWriter, SyncWriterBlockedError } from "./sync-writer-control";
+import { latestCycleOwner, admitSyncRun, SyncEntrypoint, SyncRunWriter, SyncWriterBlockedError,
+  type SyncRunReconcile } from "./sync-writer-control";
+import { reconcileInvoiceLabels, reconcileDue, lastReconcileAt, groupReasons } from "./invoice-reconcile";
 import { buildGhlWriteIntent, approvedGhlCards } from "./ghl-write-intent";
 import { verifyFreshGhlIdentity, readFreshJobberIdentities, strictGhlIdentityHold, validGhlContactIdentity } from "./ghl-write-identity";
 import { refreshOpenInvoiceStatuses } from "./open-invoice-status-refresh";
@@ -306,8 +308,15 @@ export async function runFullSync(
     // Reconcile existing ordinary GHL cards. Defaults to verified email Paid
     // exits only; other changes require explicit mode/gates. Best-effort: a GHL
     // outage must not prevent refreshing the Jobber dashboard cache.
+    // Is today's FULL RECONCILE due? Decided per run, not on a clock of its
+    // own, so a late, slow or skipped run does not cost a day's reconcile: the
+    // next hourly run picks it up. Unreadable history makes one due, which is
+    // the safe direction - a reconcile that runs twice costs reads, one that
+    // never runs is the bug it exists to fix.
+    const reconcile = reconcileDue(await lastReconcileAt(), new Date());
+    if (reconcile) log("[sync] full reconcile is due; it runs before this run's card pass");
     try {
-      const ghlSynced = await syncGhlInvoicePipeline({ writer });
+      const ghlSynced = await syncGhlInvoicePipeline({ writer, reconcile });
       await prisma.syncRun.update({
         where: { id: run.id },
         data: { ghlOpportunitiesSynced: ghlSynced },
@@ -723,7 +732,15 @@ export async function syncGhlInvoicePipeline(opts: {
   mode?: GhlInvoiceWriteMode;
   report?: (entry: GhlInvoiceReview) => void;
   writer?: Pick<SyncRunWriter, "prepare" | "assertPending" | "confirm" | "abandon" | "block">
-    & Partial<Pick<SyncRunWriter, "readCycleHistory" | "noteSkip">>;
+    & Partial<Pick<SyncRunWriter, "readCycleHistory" | "noteSkip" | "noteReconcile">>;
+  /**
+   * Run the daily FULL RECONCILE of stored labels before judging any card.
+   *
+   * Reads and label corrections only. It never writes a card and never sends
+   * anything; the card pass below keeps sole ownership of card writes, so a
+   * reconcile cannot become a second path that duplicates one.
+   */
+  reconcile?: boolean;
   /**
    * Ask for the ONE CARD PER INVOICE plan, chosen by the owner 2026-11-20.
    *
@@ -752,9 +769,16 @@ export async function syncGhlInvoicePipeline(opts: {
   if (!["review", "paid_only", "sync"].includes(mode)) throw new Error("Invalid GHL_INVOICE_WRITE_MODE");
   const phoneWrites = process.env.GHL_PHONE_WRITES_ENABLED === "true";
   const approvedCards = approvedGhlCards();
+  // Card-level holds, collected only during a reconcile so it can report what
+  // on the board it could not act on. Grouped, not listed: a board with
+  // hundreds of untouchable cards must read as a few lines, not a wall.
+  const cardHoldReasons: string[] = [];
   const report = (entry: GhlInvoiceReview) => {
     log(`[ghl-plan] ${JSON.stringify(entry)}`);
     opts.report?.(entry);
+    if (opts.reconcile && entry.action === "hold" && entry.opportunityId) {
+      cardHoldReasons.push(entry.reason.slice(0, 200));
+    }
   };
   const refs = await getInvoicePipelineRefs();
   const sentId = refs.stageIdByName[GHL_STAGE_SENT.toLowerCase()];
@@ -769,7 +793,7 @@ export async function syncGhlInvoicePipeline(opts: {
       [id, canonicalStages.find(name => name.toLowerCase() === lower) ?? lower]));
   const now = new Date();
   const customers = await prisma.customer.findMany();
-  const invoices = await prisma.invoiceRecord.findMany({ include: { customer: true } });
+  let invoices = await prisma.invoiceRecord.findMany({ include: { customer: true } });
   // Complete, status=all snapshots are required BEFORE the first write.
   let contacts: GhlContact[];
   let cards: GhlOpportunity[];
@@ -780,6 +804,36 @@ export async function syncGhlInvoicePipeline(opts: {
   } catch (err: any) {
     report({ action: "hold", reason: `Incomplete GHL preflight; no writes: ${err?.message ?? err}` });
     return 0;
+  }
+
+  // --- THE FULL RECONCILE --------------------------------------------------
+  //
+  // Before any card is judged: read Jobber's live balance and status for every
+  // invoice that could be wrong - open, paid-with-a-balance, recently paid, or
+  // named by a card on the board above - and correct the stored label to match.
+  // Reads and label corrections only; it writes no card and sends nothing.
+  //
+  // It runs against THIS run's card snapshot, not a fresh one, so the labels and
+  // the board being reconciled are the same pair the card pass below will judge.
+  //
+  // A failure here is reported and the run continues. A reconcile is a reading:
+  // failing to take one must never stop this run or the next hour's.
+  let reconcileStamp: SyncRunReconcile | null = null;
+  if (opts.reconcile) {
+    try {
+      const result = await reconcileInvoiceLabels({ cards, now });
+      reconcileStamp = result.stamp;
+      log(`[reconcile] checked=${result.stamp.checkedInvoices} cards=${result.stamp.checkedCards}`
+        + ` corrected=${result.stamp.corrected} held=${result.stamp.held}`);
+      // Re-read the stored invoices so everything below judges the corrected
+      // labels rather than the snapshot taken moments before them.
+      if (result.plan.updates.length) {
+        invoices = await prisma.invoiceRecord.findMany({ include: { customer: true } });
+      }
+    } catch (err: any) {
+      report({ action: "hold",
+        reason: `Full reconcile unavailable; stored labels were not corrected this run: ${err?.message ?? err}` });
+    }
   }
   const phoneCustomers = customers.filter(c => !c.email?.trim() && c.phone?.trim() &&
     invoices.some(inv => inv.customerId === c.id && !isOldOrZeroInvoice(inv)));
@@ -1286,6 +1340,12 @@ export async function syncGhlInvoicePipeline(opts: {
   }
   if (process.env.CLEANUP_INVALID_OPPS === "true") {
     log("[ghl] Invalid-card deletion disabled; old, zero, duplicate, closed and special-stage cards require individual review");
+  }
+  // The reconcile's record, written once the card pass has had its say so the
+  // card reasons are part of it. Stored on the run itself, which is what makes
+  // it visible on the dashboard and what `reconcileDue` reads next time.
+  if (reconcileStamp) {
+    opts.writer?.noteReconcile?.({ ...reconcileStamp, cardReasons: groupReasons(cardHoldReasons) });
   }
   log(`[ghl] invoice sync mode=${mode} applied=${applied}; existing queued reminders are not canceled by holds`);
   return applied;

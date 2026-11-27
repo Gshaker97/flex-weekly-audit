@@ -314,8 +314,54 @@ export type SyncRunBlockNote = Readonly<{
   at: string;
 }>;
 
+/**
+ * ONE stored label this run corrected, in plain language.
+ *
+ * `from` and `to` are the labels, not the money: a correction never invents a
+ * balance, and showing the two labels side by side is what makes "paid with
+ * $60 still owing" legible to a person.
+ */
+export type SyncRunCorrection = Readonly<{
+  invoiceNumber: string | null;
+  customer: string | null;
+  from: string | null;
+  to: string;
+}>;
+
+/**
+ * What the daily FULL RECONCILE established, for the dashboard.
+ *
+ * Not write evidence, like `SyncRunSkip`: a reconcile reads Jobber and may
+ * correct stored labels, but it sends nothing and writes no GHL card itself -
+ * the card pass that follows it owns every card write, under its own gates and
+ * the journal's duplicate guards.
+ */
+export type SyncRunReconcile = Readonly<{
+  at: string;
+  /** Invoices read live from Jobber by id, whether or not Jobber said they changed. */
+  checkedInvoices: number;
+  /** Cards on the invoice pipeline this run looked at. */
+  checkedCards: number;
+  /** Stored labels corrected, and which. Bounded; `corrected` is the true total. */
+  corrected: number;
+  corrections: SyncRunCorrection[];
+  /** Invoices the reconcile would not act on. `held` is the true total. */
+  held: number;
+  /** Which ones, named. Bounded; the grouped reasons below cover the rest. */
+  holds: SyncRunSkip[];
+  /** Plain sentences, grouped and counted, so 200 holds read as a few lines. */
+  holdReasons: ReadonlyArray<Readonly<{ reason: string; count: number }>>;
+  /** Cards it could not act on, grouped the same way. */
+  cardReasons: ReadonlyArray<Readonly<{ reason: string; count: number }>>;
+  /** One sentence naming what was in scope, for a person reading the panel. */
+  scope: string;
+}>;
+
 export const SKIP_LIMIT = 200;
 const SKIP_TEXT_LIMIT = 400;
+/** How many individual corrections and grouped reasons a stamp may carry. */
+export const RECONCILE_LIST_LIMIT = 100;
+const RECONCILE_REASON_LIMIT = 40;
 
 interface Journal {
   version: 1; runId: string; warnings: string | null; writes: JournalEntry[];
@@ -323,6 +369,8 @@ interface Journal {
   skips?: SyncRunSkip[];
   /** Set once, when the run blocks. */
   block?: SyncRunBlockNote;
+  /** Set once, by a run that performed the full reconcile. */
+  reconcile?: SyncRunReconcile;
 }
 
 function text(value: unknown, limit = SKIP_TEXT_LIMIT): string | null {
@@ -335,6 +383,60 @@ function text(value: unknown, limit = SKIP_TEXT_LIMIT): string | null {
  * malformed skip note must not make a journal unparseable, because the journal
  * is the write evidence and losing it is far worse than losing a sentence.
  */
+function count(value: unknown): number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
+/**
+ * Grouped hold reasons, dropped individually if unreadable. Same one-directional
+ * leniency as the rest of `readNotes`.
+ */
+function readReasons(value: unknown): ReadonlyArray<Readonly<{ reason: string; count: number }>> {
+  if (!Array.isArray(value)) return Object.freeze([]);
+  const out: Array<Readonly<{ reason: string; count: number }>> = [];
+  for (const row of value.slice(0, RECONCILE_REASON_LIMIT)) {
+    const reason = text((row as { reason?: unknown })?.reason);
+    if (reason) out.push(Object.freeze({ reason, count: count((row as { count?: unknown })?.count) }));
+  }
+  return Object.freeze(out);
+}
+
+function readReconcile(value: unknown): SyncRunReconcile | null {
+  if (value === null || typeof value !== "object") return null;
+  const r = value as Record<string, unknown>;
+  const at = text(r.at, 64);
+  // Without a timestamp this is not a reconcile record: `reconcileDue` reads
+  // exactly this field to decide whether today's reconcile has already run, and
+  // a stamp it cannot date would silently suppress the next one.
+  if (!at) return null;
+  const corrections: SyncRunCorrection[] = [];
+  if (Array.isArray(r.corrections)) {
+    for (const c of r.corrections.slice(0, RECONCILE_LIST_LIMIT)) {
+      const row = c as Record<string, unknown>;
+      const to = text(row?.to, 32);
+      if (to) corrections.push(Object.freeze({
+        invoiceNumber: text(row?.invoiceNumber, 32), customer: text(row?.customer, 200),
+        from: text(row?.from, 32), to }));
+    }
+  }
+  const holds: SyncRunSkip[] = [];
+  if (Array.isArray(r.holds)) {
+    for (const h of r.holds.slice(0, RECONCILE_LIST_LIMIT)) {
+      const row = h as Record<string, unknown>;
+      const reason = text(row?.reason);
+      if (reason) holds.push(Object.freeze({
+        invoiceNumber: text(row?.invoiceNumber, 32), customer: text(row?.customer, 200), reason }));
+    }
+  }
+  return Object.freeze({
+    at,
+    checkedInvoices: count(r.checkedInvoices), checkedCards: count(r.checkedCards),
+    corrected: count(r.corrected), corrections,
+    held: count(r.held), holds, holdReasons: readReasons(r.holdReasons), cardReasons: readReasons(r.cardReasons),
+    scope: text(r.scope) ?? "",
+  });
+}
+
 function readNotes(value: Journal): { skips: SyncRunSkip[]; block: SyncRunBlockNote | null } {
   const skips: SyncRunSkip[] = [];
   if (Array.isArray(value.skips)) {
@@ -361,14 +463,15 @@ function readNotes(value: Journal): { skips: SyncRunSkip[]; block: SyncRunBlockN
  * unauthenticated status endpoint and these notes name customers.
  */
 export function syncRunDiagnostics(message: string | null, runId: string): {
-  skips: SyncRunSkip[]; block: SyncRunBlockNote | null;
+  skips: SyncRunSkip[]; block: SyncRunBlockNote | null; reconcile: SyncRunReconcile | null;
 } {
-  if (!message?.startsWith(JOURNAL_PREFIX)) return { skips: [], block: null };
+  const none = { skips: [], block: null, reconcile: null };
+  if (!message?.startsWith(JOURNAL_PREFIX)) return none;
   try {
     const value = JSON.parse(message.slice(JOURNAL_PREFIX.length)) as Journal;
-    if (value.version !== 1 || value.runId !== runId) return { skips: [], block: null };
-    return readNotes(value);
-  } catch { return { skips: [], block: null }; }
+    if (value.version !== 1 || value.runId !== runId) return none;
+    return { ...readNotes(value), reconcile: readReconcile(value.reconcile) };
+  } catch { return none; }
 }
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 export const cardNameHash = (name: string | null | undefined) => hash(JSON.stringify(name ?? null));
@@ -702,11 +805,13 @@ export function publicSyncErrorMessage(message: string | null): string | null {
     // happened and how much, never who. Customer names and invoice numbers
     // stay on the authenticated dashboard, via `syncRunDiagnostics`.
     let notes: { skips: SyncRunSkip[]; block: SyncRunBlockNote | null } = { skips: [], block: null };
+    let reconcile: SyncRunReconcile | null = null;
     let pending = false;
     try {
       const value = JSON.parse(message.slice(JOURNAL_PREFIX.length)) as Journal;
       if (value.version === 1) {
         notes = readNotes(value);
+        reconcile = readReconcile(value.reconcile);
         pending = Array.isArray(value.writes) && value.writes.some(w => w?.state === "pending");
       }
     } catch { /* Fall through to the conservative sentence below. */ }
@@ -717,6 +822,15 @@ export function publicSyncErrorMessage(message: string | null): string | null {
     }
     if (!pending && notes.skips.length) {
       return `${notes.skips.length} invoice card${notes.skips.length === 1 ? "" : "s"} held this run. `
+        + "See the dashboard for which, and why.";
+    }
+    // Counts only. The reconcile's own notes name customers and invoices, so
+    // they stay on the authenticated dashboard like every other note here.
+    if (!pending && reconcile) {
+      return `Full reconcile checked ${reconcile.checkedInvoices} invoice`
+        + `${reconcile.checkedInvoices === 1 ? "" : "s"} and ${reconcile.checkedCards} card`
+        + `${reconcile.checkedCards === 1 ? "" : "s"} against Jobber: ${reconcile.corrected} label`
+        + `${reconcile.corrected === 1 ? "" : "s"} corrected, ${reconcile.held} held. `
         + "See the dashboard for which, and why.";
     }
     return "Private GHL write evidence retained. A running or blocked sync requires operator review before another run.";
@@ -732,6 +846,8 @@ export class SyncRunWriter {
   private halted = false;
   /** Cards held this run, in plain language, persisted when the run ends. */
   private readonly skips: SyncRunSkip[] = [];
+  /** What the full reconcile established, if this run ran one. */
+  private reconcile: SyncRunReconcile | null = null;
   constructor(readonly runId: string, private readonly db: PrismaClient = prisma) {}
 
   /**
@@ -746,7 +862,7 @@ export class SyncRunWriter {
    * cannot be clobbered.
    */
   private async mergeNotes(block: SyncRunBlockNote | null): Promise<void> {
-    if (!this.skips.length && !block) return;
+    if (!this.skips.length && !block && !this.reconcile) return;
     try {
       await durable(this.db, async tx => {
         const run = await tx.syncRun.findUniqueOrThrow({ where: { id: this.runId } });
@@ -756,11 +872,16 @@ export class SyncRunWriter {
             ?? { version: 1 as const, runId: this.runId, warnings: run.errorMessage ?? null, writes: [] };
         } catch { return; } // Unreadable journal: leave it exactly as found.
         const existing = readNotes(current);
+        const existingReconcile = readReconcile(current.reconcile);
         const next: Journal = { ...current,
           // `warnings` must be string|null for `journal()` to parse this back.
           warnings: current.warnings ?? null,
           skips: [...existing.skips, ...this.skips].slice(0, SKIP_LIMIT),
-          ...(block ?? existing.block ? { block: block ?? existing.block! } : {}) };
+          ...(block ?? existing.block ? { block: block ?? existing.block! } : {}),
+          // This run's own reconcile wins; an existing one is kept otherwise, so
+          // a later merge (a block after the reconcile) cannot erase it.
+          ...(this.reconcile ?? existingReconcile
+            ? { reconcile: this.reconcile ?? existingReconcile! } : {}) };
         let serialized: string;
         try { serialized = serialize(next); } catch { return; } // Over the size limit.
         await tx.syncRun.updateMany({
@@ -782,6 +903,19 @@ export class SyncRunWriter {
     if (!reason) return;
     this.skips.push(Object.freeze({
       invoiceNumber: text(skip?.invoiceNumber, 32), customer: text(skip?.customer, 200), reason }));
+  }
+
+  /**
+   * Record what the full reconcile checked, corrected and held. In memory until
+   * the run ends, then persisted by `finish()` or `block()` alongside the skips.
+   *
+   * Validated through the same reader the dashboard uses, so a stamp that would
+   * not survive a round trip is never stored. Never throws, and never touches
+   * `writes`: a reconcile is a reading of Jobber, not write evidence.
+   */
+  noteReconcile(reconcile: SyncRunReconcile): void {
+    const parsed = readReconcile(reconcile);
+    if (parsed) this.reconcile = parsed;
   }
 
   async prepare(intent: GhlWriteIntent): Promise<string> {

@@ -45,7 +45,7 @@ test("the block note says which invoice, which step and whether a write was in f
 
 test("a journal for a DIFFERENT run tells us nothing", () => {
   const msg = envelope("run1", { skips: [{ invoiceNumber: "1", customer: "x", reason: "y." }] });
-  assert.deepEqual(syncRunDiagnostics(msg, "run2"), { skips: [], block: null });
+  assert.deepEqual(syncRunDiagnostics(msg, "run2"), { skips: [], block: null, reconcile: null });
 });
 
 test("A MALFORMED NOTE IS DROPPED, NEVER THROWN ON", () => {
@@ -59,10 +59,10 @@ test("A MALFORMED NOTE IS DROPPED, NEVER THROWN ON", () => {
   assert.equal(syncRunDiagnostics(envelope("r", { block: { reason: "x." } }), "r").block, null);
   assert.equal(syncRunDiagnostics(envelope("r", { block: { step: "x" } }), "r").block, null);
   // Not JSON at all.
-  assert.deepEqual(syncRunDiagnostics(PREFIX + "{{{", "r"), { skips: [], block: null });
+  assert.deepEqual(syncRunDiagnostics(PREFIX + "{{{", "r"), { skips: [], block: null, reconcile: null });
   // Not a journal at all.
-  assert.deepEqual(syncRunDiagnostics("Jobber GraphQL error: Throttled", "r"), { skips: [], block: null });
-  assert.deepEqual(syncRunDiagnostics(null, "r"), { skips: [], block: null });
+  assert.deepEqual(syncRunDiagnostics("Jobber GraphQL error: Throttled", "r"), { skips: [], block: null, reconcile: null });
+  assert.deepEqual(syncRunDiagnostics(null, "r"), { skips: [], block: null, reconcile: null });
 });
 
 test("the skip list is bounded", () => {

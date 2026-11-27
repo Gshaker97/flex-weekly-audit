@@ -2,6 +2,7 @@ import Link from "next/link";
 import { prisma } from "@/lib/prisma";
 import { publicSyncErrorMessage } from "@/lib/sync-writer-control";
 import { SyncSkipReport } from "@/app/SyncSkipReport";
+import { latestReconcileRun, RECONCILE_PANEL_LOOKBACK_RUNS } from "@/lib/invoice-reconcile";
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/Card";
 import { Badge } from "@/components/ui/Badge";
 import { StatCard } from "@/components/ui/StatCard";
@@ -76,6 +77,13 @@ export default async function OverdueRevenuePage({
   const lastSync = await prisma.syncRun.findFirst({
     orderBy: { startedAt: "desc" },
   });
+  // The daily reconcile is almost never the newest run, so its record is looked
+  // up separately. Ids and journals only: everything else on this page comes
+  // from `lastSync`.
+  const reconcileRun = latestReconcileRun(await prisma.syncRun.findMany({
+    orderBy: { startedAt: "desc" }, take: RECONCILE_PANEL_LOOKBACK_RUNS,
+    select: { id: true, startedAt: true, errorMessage: true },
+  }));
   // A visit far older than the newest one wasn't refreshed by the last pull —
   // the signature of a feed that stopped short before reaching it.
   const newestVisitSync = visits.reduce<Date | null>(
@@ -128,7 +136,7 @@ export default async function OverdueRevenuePage({
         />
       </div>
 
-      <SyncSkipReport run={lastSync} />
+      <SyncSkipReport run={lastSync} reconcileRun={reconcileRun} />
 
       {lastSync && (
         <Card>
