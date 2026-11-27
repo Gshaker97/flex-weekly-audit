@@ -600,7 +600,7 @@ async function combineCard(
   // Re-check the whole set against the verified source. The amount on a
   // combined card is only meaningful as the sum of what it covers, so a stale
   // sum is refused outright rather than written and corrected later.
-  const invoices = buildInvoiceSourceEvidence(input.source, input.jobberClientId);
+  const invoices = buildInvoiceSourceEvidence(input.source, input.jobberClientId, input.observedAt);
   const target = moneyCents(decision.monetaryValue);
   if (!invoices || target === null) return held("source_evidence_unavailable");
   let owed = 0;
@@ -707,7 +707,7 @@ async function createCard(
     return held("a_card_for_this_invoice_already_exists");
   }
 
-  const invoices = buildInvoiceSourceEvidence(input.source, input.jobberClientId);
+  const invoices = buildInvoiceSourceEvidence(input.source, input.jobberClientId, input.observedAt);
   const row = invoices?.find(i => i.id === decision.invoiceId);
   const amountCents = moneyCents(decision.monetaryValue);
   if (!invoices || !row || amountCents === null) return held("source_evidence_unavailable");
