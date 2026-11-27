@@ -236,9 +236,9 @@ test("each invoice's own facts pick its stage", () => {
 test("contradictory, void, zero and unusable invoices support no stage", () => {
   const s = (over: Partial<InvoiceFact>, clock: typeof openClock | null = openClock) =>
     desiredStageForInvoice(invoice(over), clock);
-  assert.equal(s({ status: "past_due" }).stage, null, "past_due before its own due date");
-  assert.match((s({ status: "past_due" }) as { reason: string }).reason, /contradicts/);
   assert.equal(s({ status: "void" }).stage, null);
+  assert.equal(s({ status: "bad_debt" }).stage, null);
+  assert.equal(s({ status: "draft" }).stage, null);
   assert.equal(s({ status: null }).stage, null);
   assert.equal(s({ totalDollars: 0, balanceDollars: 0 }).stage, null);
   assert.equal(s({ balanceDollars: 500 }).stage, null, "balance over total");
@@ -247,21 +247,53 @@ test("contradictory, void, zero and unusable invoices support no stage", () => {
   assert.equal(s({}, null).stage, null, "no clock");
 });
 
-// Both of these were found on live invoices. Neither changes what happens to a
-// card - the invoice is held exactly as before - but a hold nobody can read is
-// a hold nobody can act on, so each contradiction now names itself.
-test("a paid label over an outstanding balance names the contradiction", () => {
-  const out = desiredStageForInvoice(
-    invoice({ status: "paid", totalDollars: 60, balanceDollars: 60 }), openClock);
-  assert.equal(out.stage, null, "still held: not chased, not zeroed");
-  assert.equal((out as { reason: string }).reason, "paid_label_contradicts_the_outstanding_balance");
+// Found on live invoices, and the reason this whole rule exists.
+test("A PAID LABEL OVER AN OUTSTANDING BALANCE IS STAGED BY THE DUE DATE", () => {
+  // Jobber #6830: $60 charged and refunded four minutes later, label stuck on
+  // paid, $60 genuinely still owed. It belongs on the board like any other
+  // unpaid invoice - in Sent before its due date, Overdue after it - and the
+  // DUE DATE decides which, never the label.
+  assert.deepEqual(desiredStageForInvoice(
+    invoice({ status: "paid", totalDollars: 60, balanceDollars: 60 }), openClock),
+    { stage: STAGE_SENT, balance: 60 });
+  assert.deepEqual(desiredStageForInvoice(
+    invoice({ status: "paid", totalDollars: 60, balanceDollars: 60 }), overdueClock),
+    { stage: STAGE_OVERDUE, balance: 60 });
 
-  // The settled case is untouched, and a part-paid invoice still reads as one.
+  // A deposit-only part payment is the same case with a smaller balance.
+  assert.deepEqual(desiredStageForInvoice(
+    invoice({ status: "paid", totalDollars: 60, balanceDollars: 0.5 }), overdueClock),
+    { stage: STAGE_OVERDUE, balance: 0.5 });
+
+  // And the settled case is untouched: nothing outstanding still retires it.
   assert.deepEqual(desiredStageForInvoice(
     invoice({ status: "paid", totalDollars: 60, balanceDollars: 0 }), openClock),
     { stage: STAGE_PAID, balance: 0 });
-  assert.equal(desiredStageForInvoice(
-    invoice({ status: "paid", totalDollars: 60, balanceDollars: 0.5 }), openClock).stage, null);
+});
+
+test("a past_due label arriving early no longer holds the card", () => {
+  // It used to be refused as a contradiction. The due date is the authority, so
+  // the invoice simply waits in Sent until it is really overdue.
+  assert.deepEqual(desiredStageForInvoice(invoice({ status: "past_due" }), openClock),
+    { stage: STAGE_SENT, balance: 137 });
+  assert.deepEqual(desiredStageForInvoice(invoice({ status: "past_due" }), overdueClock),
+    { stage: STAGE_OVERDUE, balance: 137 });
+});
+
+test("an open label with nothing outstanding retires the card", () => {
+  // The mirror image: the balance decides in both directions.
+  assert.deepEqual(desiredStageForInvoice(
+    invoice({ status: "awaiting_payment", totalDollars: 60, balanceDollars: 0 }), openClock),
+    { stage: STAGE_PAID, balance: 0 });
+});
+
+test("void and bad debt support no stage however large the balance", () => {
+  // The protection a balance-only rule would have thrown away.
+  for (const status of ["void", "bad_debt"]) {
+    const out = desiredStageForInvoice(invoice({ status, totalDollars: 60, balanceDollars: 60 }), overdueClock);
+    assert.equal(out.stage, null, status);
+    assert.match((out as { reason: string }).reason, /not_a_receivable/, status);
+  }
 });
 
 test("a draft is held as a draft, not as broken dates", () => {

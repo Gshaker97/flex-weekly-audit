@@ -89,7 +89,7 @@ test("the root dashboard counts unconfirmed rows in the total and labels them se
 function cached(id: string, patch: Partial<OpenInvoiceSnapshot> = {}): OpenInvoiceSnapshot {
   return { id: `local-${id}`, jobberInvoiceId: id, invoiceStatus: "awaiting_payment", total: 100,
     amountPaid: 0, amountDue: 100, customerId: "local-owner", customer: { jobberClientId: "owner" },
-    lastSyncedAt: daysAgo(159), ...patch };
+    dueAt: daysAgo(170), lastSyncedAt: daysAgo(159), ...patch };
 }
 const reader = (rows: Record<string, unknown>) => async (_q: string, vars: Record<string, string>) =>
   Object.fromEntries(Object.entries(vars).map(([k, id]) => [k.replace("id", "i"), rows[id]]));

@@ -41,7 +41,8 @@ import {
   GhlContact,
   GhlOpportunity,
 } from "./ghl";
-import { phoneSourcePlan, readPhoneInvoiceEvidence } from "./ghl-phone-state";
+import { phoneSourcePlan, readPhoneInvoiceEvidence, moneyCents } from "./ghl-phone-state";
+import { settledOrOwingStatus } from "./invoice-settlement";
 import { canonicalPhone, matchPhoneCustomer, phoneMayShareOwner } from "./ghl-phone-match";
 import { log, logError } from "./log";
 import { planCardCreation, describeCardCreation, CARD_CREATION_STAGE } from "./ghl-card-creation-plan";
@@ -554,12 +555,26 @@ async function upsertInvoices(nodes: JobberInvoiceNode[]) {
     const balance = inv.amounts?.invoiceBalance ?? 0;
     const amountPaid = total - balance;
 
+    // THE STORED LABEL FOLLOWS THE MONEY, NOT JOBBER'S WORD FOR IT.
+    //
+    // Jobber leaves `paid` on an invoice whose card payment was later refunded
+    // in full, and on one that only ever received a deposit - 12 such invoices
+    // on this account, $25,983.82 outstanding behind a paid label. Storing that
+    // label verbatim is what kept them out of collections, off the Overdue
+    // stage and out of the reminder ladder, because every consumer downstream
+    // reasonably believed it. The correction happens HERE, once, on the way in,
+    // so it survives every later sync instead of being re-applied by each
+    // reader. See lib/invoice-settlement.ts.
+    const dueClock = invoiceReminderClock(inv.issuedDate ?? null, inv.dueDate ?? null, new Date());
+    const invoiceStatus = settledOrOwingStatus(
+      inv.invoiceStatus ?? null, moneyCents(total), moneyCents(balance), dueClock?.isOverdue === true);
+
     await prisma.invoiceRecord.upsert({
       where: { jobberInvoiceId: inv.id },
       create: {
         jobberInvoiceId: inv.id,
         invoiceNumber: inv.invoiceNumber ?? null,
-        invoiceStatus: inv.invoiceStatus ?? null,
+        invoiceStatus,
         subtotal: inv.subtotal ?? inv.amounts?.subtotal ?? 0,
         total,
         amountPaid,
@@ -573,7 +588,7 @@ async function upsertInvoices(nodes: JobberInvoiceNode[]) {
       },
       update: {
         invoiceNumber: inv.invoiceNumber ?? null,
-        invoiceStatus: inv.invoiceStatus ?? null,
+        invoiceStatus,
         subtotal: inv.subtotal ?? inv.amounts?.subtotal ?? 0,
         total,
         amountPaid,

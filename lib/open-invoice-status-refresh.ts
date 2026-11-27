@@ -2,6 +2,7 @@ import { prisma } from "./prisma";
 import { jobberGraphQL } from "./jobber";
 import { log, logError } from "./log";
 import { INVOICE_VERIFY_CONFIRMED } from "./invoiceMetrics";
+import { invoiceSettlement, settledOrOwingStatus } from "./invoice-settlement";
 
 const OPEN_STATUSES = ["awaiting_payment", "past_due"];
 const KNOWN_STATUSES = new Set([...OPEN_STATUSES, "draft", "paid", "void", "bad_debt"]);
@@ -27,6 +28,12 @@ export interface OpenInvoiceSnapshot {
   amountDue: number;
   customerId: string | null;
   customer: { jobberClientId: string } | null;
+  /**
+   * Needed only for the paid-while-owing correction: when Jobber's own label is
+   * not an owing one, past_due versus awaiting_payment has to come from the due
+   * date rather than be guessed. Null is treated as not yet overdue.
+   */
+  dueAt: Date | null;
   lastSyncedAt: Date;
 }
 /**
@@ -57,6 +64,16 @@ export interface StatusRefreshPlan {
   updates: InvoiceStatusCorrection[];
   holds: Array<{ jobberInvoiceId: string; reason: string }>;
   verifications: InvoiceVerification[];
+}
+
+/**
+ * The calendar day in Phoenix, which never observes DST, so UTC-7 is a constant
+ * and no library or shared clock module is needed. Used only to choose between
+ * the two owing labels when one has to be invented.
+ */
+function phoenixDay(value: Date | null): string | null {
+  if (!(value instanceof Date) || !Number.isFinite(value.getTime())) return null;
+  return new Date(value.getTime() - 7 * 60 * 60 * 1000).toISOString().slice(0, 10);
 }
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -138,8 +155,18 @@ export async function planOpenInvoiceStatusRefresh(
       const total = record(source.amounts) ? cents(source.amounts.total) : null;
       const balance = record(source.amounts) ? cents(source.amounts.invoiceBalance) : null;
       if (total === null || balance === null) { hold("Unknown source amounts", "source_unreadable"); continue; }
-      if (total < 0 || balance < 0 || balance > total ||
-          (source.invoiceStatus === "paid" && balance !== 0) ||
+      // `paid` with a balance still on it stops being a conflict to hold, but
+      // ONLY behind the same release gate as the rest of this module's
+      // corrections - with the gate off this behaves exactly as the previous
+      // release did, hold reasons included, which is the gate's whole promise.
+      //
+      // With it on: that pair is what Jobber leaves behind after a refund
+      // reverses the payment, or when only a deposit was ever paid, and the
+      // balance is the true figure. Genuinely unreadable figures still hold.
+      const paidWhileOwing = correctBalance
+        ? invoiceSettlement(source.invoiceStatus, total, balance) === "unreadable"
+        : source.invoiceStatus === "paid" && balance !== 0;
+      if (total < 0 || balance < 0 || balance > total || paidWhileOwing ||
           (OPEN_STATUSES.includes(source.invoiceStatus) && balance <= 0)) {
         hold("Conflicting or credit balance requires review", "source_conflicting"); continue;
       }
@@ -160,7 +187,23 @@ export async function planOpenInvoiceStatusRefresh(
       const cachedPaid = cents(invoice.amountPaid);
       if (cachedBalance === null || cachedPaid === null) { hold("Unknown cached amounts", "cached_unreadable"); continue; }
 
-      const statusChanged = invoice.invoiceStatus !== source.invoiceStatus;
+      // THE LABEL THIS ROW SHOULD CARRY, not the one Jobber printed.
+      //
+      // Writing source.invoiceStatus verbatim would undo the sync's own fix:
+      // Jobber says `paid` on a refunded or deposit-only invoice, so the next
+      // pass would push a row that correctly reads past_due back to paid and
+      // pull it straight out of collections again.
+      //
+      // Only that contradiction is overridden. When Jobber already calls the
+      // invoice owing, its label is taken as given, so an ordinary
+      // past_due/awaiting_payment correction still goes through exactly as
+      // before.
+      const dueDay = phoenixDay(invoice.dueAt), today = phoenixDay(new Date());
+      const correctedStatus = correctBalance
+        ? settledOrOwingStatus(source.invoiceStatus, total, balance,
+            dueDay !== null && today !== null && dueDay < today) ?? source.invoiceStatus
+        : source.invoiceStatus;
+      const statusChanged = invoice.invoiceStatus !== correctedStatus;
       const balanceChanged = balance !== cachedBalance;
       // THE FIX for the dashboard. This read confirmed the invoice and the stored
       // row already agrees with it. Previously that fact was discarded, which is
@@ -168,7 +211,7 @@ export async function planOpenInvoiceStatusRefresh(
       if (!statusChanged && !balanceChanged) { confirm(); continue; }
       if (!correctBalance) {
         // The balance is already known unchanged here, so this is status-only.
-        plan.updates.push({ cached: invoice, invoiceStatus: source.invoiceStatus });
+        plan.updates.push({ cached: invoice, invoiceStatus: correctedStatus });
         confirm();
         continue;
       }
@@ -178,7 +221,7 @@ export async function planOpenInvoiceStatusRefresh(
         hold("Balance changed without a status change; requires full invoice sync", "stored_value_differs"); continue;
       }
       if (!balanceChanged) {
-        plan.updates.push({ cached: invoice, invoiceStatus: source.invoiceStatus });
+        plan.updates.push({ cached: invoice, invoiceStatus: correctedStatus });
         confirm();
         continue;
       }
@@ -192,7 +235,7 @@ export async function planOpenInvoiceStatusRefresh(
       }
       plan.updates.push({
         cached: invoice,
-        invoiceStatus: source.invoiceStatus,
+        invoiceStatus: correctedStatus,
         amountDue: 0,
         amountPaid: total / 100,
       });
@@ -213,7 +256,7 @@ export async function refreshOpenInvoiceStatuses(): Promise<StatusRefreshPlan | 
     select: {
       id: true, jobberInvoiceId: true, invoiceStatus: true,
       total: true, amountPaid: true, amountDue: true, customerId: true,
-      customer: { select: { jobberClientId: true } }, lastSyncedAt: true,
+      customer: { select: { jobberClientId: true } }, dueAt: true, lastSyncedAt: true,
     },
   });
   // Read once per run, before any correction is planned.

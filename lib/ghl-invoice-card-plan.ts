@@ -57,6 +57,8 @@
  */
 
 export const STAGE_SENT = "Invoice Sent" as const;
+import { invoiceSettlement } from "./invoice-settlement";
+
 export const STAGE_OVERDUE = "Invoice Overdue" as const;
 export const STAGE_PAID = "Invoice Paid" as const;
 
@@ -275,36 +277,38 @@ export function desiredStageForInvoice(
   if (total === null || balance === null) return { stage: null, reason: "invoice_amounts_unusable" };
   if (balance > total) return { stage: null, reason: "balance_exceeds_total" };
   const status = invoice.status?.toLowerCase() ?? null;
-  if (status === "paid" && balance === 0) return { stage: STAGE_PAID, balance: 0 };
-  // Jobber sometimes labels an invoice paid while still showing a balance on
-  // it. Holding is the right answer either way - this code will not chase money
-  // Jobber calls settled, nor zero a card that still shows one owing - but the
-  // fact is a CONTRADICTION IN THE SOURCE, not an unreadable status, and saying
-  // so is the difference between someone checking Jobber and someone hunting
-  // for a bug here. Observed live on an invoice reading paid with its full
-  // balance outstanding.
-  if (status === "paid" && balance > 0) {
-    return { stage: null, reason: "paid_label_contradicts_the_outstanding_balance" };
-  }
+  // THE BALANCE DECIDES, THE STATUS ONLY EXCLUDES. See lib/invoice-settlement.ts
+  // for why Jobber's label cannot be asked this question: it stays on `paid`
+  // after a refund reverses the payment, and after a deposit-only part payment.
+  const settlement = invoiceSettlement(status, total, balance);
+  // A zero-total invoice is neither owing nor meaningfully settled, and it is
+  // already out of scope for the sync entirely. Checked ahead of the settled
+  // branch so it cannot retire a card on the strength of owing nothing.
+  if (total === 0) return { stage: null, reason: "zero_total_invoice" };
+  // Then settled, before the clock or the window, exactly as the old
+  // paid-and-zero test was: an invoice with nothing outstanding needs no dates.
+  if (settlement === "settled") return { stage: STAGE_PAID, balance: 0 };
   // A draft has not been issued, so it has no issue or due date and nothing is
   // owed on it yet. Reaching the clock check and coming back
   // "invoice_dates_unusable" reads as broken data and sends someone looking for
   // damage that is not there; a draft having no dates is simply what a draft
   // is. Checked before the clock, which a draft can never have.
   if (status === "draft") return { stage: null, reason: "draft_invoice_not_yet_issued" };
+  // Void and bad debt are off the books, so no stage, whatever the balance
+  // reads. Named for what is true rather than as a contradiction, because there
+  // is nothing here for anyone to go and check in Jobber.
+  if (settlement === "excluded") return { stage: null, reason: `invoice_status_is_not_a_receivable_${status}` };
+  if (settlement === "unreadable") return { stage: null, reason: `unusable_invoice_status_${status ?? "missing"}` };
   if (!clock) return { stage: null, reason: "invoice_dates_unusable" };
   // A malformed window is treated as the widest safe boundary, never as "no
   // boundary": an unreadable setting must not silently pull in years of history.
   const start = DAY.test(windowStart) && windowStart >= COLLECTIONS_CUTOFF ? windowStart : COLLECTIONS_CUTOFF;
   if (clock.sentOn < start) return { stage: null, reason: "outside_the_lookback_window" };
-  if (total === 0) return { stage: null, reason: "zero_total_invoice" };
-  if (balance > 0 && (status === "awaiting_payment" || status === "past_due")) {
-    // Jobber occasionally labels an invoice past_due before its own due date.
-    // That contradiction is held rather than used to promote a card early.
-    if (status === "past_due" && !clock.isOverdue) return { stage: null, reason: "past_due_label_contradicts_the_due_date" };
-    return { stage: clock.isOverdue ? STAGE_OVERDUE : STAGE_SENT, balance: invoice.balanceDollars as number };
-  }
-  return { stage: null, reason: `unusable_invoice_status_${status ?? "missing"}` };
+  // Owing. The DUE DATE picks the stage, never Jobber's `past_due` label, so an
+  // invoice sits in Sent until the day it is really due and then moves to
+  // Overdue. That also retires the old hold for a past_due label arriving early:
+  // such an invoice now simply stays in Sent instead of holding the whole card.
+  return { stage: clock.isOverdue ? STAGE_OVERDUE : STAGE_SENT, balance: invoice.balanceDollars as number };
 }
 
 export type InvoiceCardInput = Readonly<{
