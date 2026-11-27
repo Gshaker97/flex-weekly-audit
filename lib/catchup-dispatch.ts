@@ -42,6 +42,7 @@
  * decide what the words say - all of that arrives as evidence and is only ever
  * checked here, never produced.
  */
+import { isOwing } from "./invoice-settlement";
 import type { CatchupAction, CatchupChannel, CatchupSend } from "./catchup-plan";
 import { CATCHUP_SMS_SUFFIX, catchupSmsReceiptBody } from "./catchup-copy";
 import {
@@ -66,6 +67,12 @@ export const SENDABLE_INVOICE_STATUSES = Object.freeze(["awaiting_payment", "pas
 export type CatchupDueConfirmation = Readonly<{
   stillOpen: boolean;
   balanceMinor: number | null;
+  /**
+   * The invoice total at send time, needed because owing is decided from the
+   * balance against the total, not from the status. Null when unreadable, which
+   * refuses the send.
+   */
+  totalMinor: number | null;
   dayPastDue: number | null;
   /**
    * The status the SOURCE gives this invoice, at send time. Required, and null
@@ -228,19 +235,28 @@ export async function dispatchCatchupSend(
       return refuse("live_invoice_read_failed");
     }
     if (!live || live.stillOpen !== true) return refuse("invoice_no_longer_open");
-    // THE STATUS IS CHECKED HERE, not just the balance.
+    // THE STATUS IS STILL CHECKED HERE, not just the balance - but it is checked
+    // for what it can actually settle.
     //
-    // A balance is not a status. Jobber will report an invoice as `paid` while
-    // a balance is still sitting on it - the status refresh treats exactly that
-    // combination as a conflict needing review - and it reports `void`, `draft`
-    // and `bad_debt` invoices that may carry a balance too. Any of those would
-    // pass a balance-only look and go out as a past-due notice.
+    // `void`, `draft` and `bad_debt` invoices can carry a balance, and a
+    // balance-only look would send a past-due notice about every one of them.
+    // Those are refused by status, as before.
+    //
+    // What changed: Jobber ALSO reports `paid` while a balance is still sitting
+    // on the invoice, after a refund reverses the payment or when only a deposit
+    // was ever paid. That was previously refused here as well, which is why 12
+    // invoices carrying $25,983.82 were never chased. A positive balance on a
+    // collectable invoice is money owed, whatever the label says, so it now
+    // sends. See lib/invoice-settlement.ts for the single definition.
     const status = typeof live.invoiceStatus === "string" ? live.invoiceStatus.trim().toLowerCase() : null;
-    if (status === "paid") return refuse("invoice_is_paid_at_send_time");
-    if (!status || !SENDABLE_INVOICE_STATUSES.some(s => s === status)) {
+    // The balance first, so "nothing is owed" and "the figure is unreadable"
+    // keep saying so rather than being reported as a status problem.
+    if (typeof live.balanceMinor !== "number" || live.balanceMinor <= 0) return refuse("invoice_no_longer_owes");
+    // Then the status, for what it can actually settle: void, draft, bad debt,
+    // an unknown label, or amounts that do not make sense together.
+    if (!isOwing(status, live.totalMinor, live.balanceMinor)) {
       return refuse("invoice_status_is_not_sendable_at_send_time");
     }
-    if (typeof live.balanceMinor !== "number" || live.balanceMinor <= 0) return refuse("invoice_no_longer_owes");
     if (live.dayPastDue !== row.dayPastDue) return refuse("day_past_due_changed_since_planning");
     // The message states a dollar figure. "Still owes something" is not the same
     // promise as "still owes THIS", and a part payment between planning and

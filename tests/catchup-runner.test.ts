@@ -80,7 +80,8 @@ function ledger() {
   };
 }
 
-type DueOverride = { stillOpen: boolean; balanceMinor: number; dayPastDue: number; invoiceStatus?: string | null };
+type DueOverride = { stillOpen: boolean; balanceMinor: number; totalMinor?: number | null;
+  dayPastDue: number; invoiceStatus?: string | null };
 
 const deps = (over: Partial<CatchupRunnerDependencies>
   & { attempts?: unknown[]; due?: DueOverride } = {}): CatchupRunnerDependencies => {
@@ -89,8 +90,9 @@ const deps = (over: Partial<CatchupRunnerDependencies>
   // it does not - that is the point of looking again. So a test whose invoice is
   // not $90.00 at day 7 has to say so here.
   const due: DueOverride = over.due ?? { stillOpen: true, balanceMinor: 9000, dayPastDue: 7 };
-  // Unless a case says otherwise, the source still calls the invoice past due.
-  const confirmation = { invoiceStatus: "past_due", ...due };
+  // Unless a case says otherwise, the source still calls the invoice past due,
+  // and the total is at least the balance so the invoice genuinely owes money.
+  const confirmation = { invoiceStatus: "past_due", totalMinor: due.balanceMinor || 9000, ...due };
   return {
     io: {
       ledger: led.api as never,

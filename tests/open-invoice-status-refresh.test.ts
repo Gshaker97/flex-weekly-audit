@@ -8,7 +8,9 @@ function cached(id = "synthetic-invoice", amount = 100): OpenInvoiceSnapshot {
   return {
     id: `local-${id}`, jobberInvoiceId: id, invoiceStatus: "awaiting_payment",
     total: amount, amountPaid: 0, amountDue: amount, customerId: "local-owner",
-    customer: { jobberClientId: "synthetic-owner" }, lastSyncedAt: new Date("2026-11-07T02:12:00Z"),
+    customer: { jobberClientId: "synthetic-owner" },
+    // Well in the past, so an invoice that owes money is genuinely overdue.
+    dueAt: new Date("2026-11-01T00:00:00Z"), lastSyncedAt: new Date("2026-11-07T02:12:00Z"),
   };
 }
 function source(invoice = cached(), patch: Record<string, unknown> = {}) {
@@ -313,7 +315,6 @@ test("the write guard pins every amount, so a newer payment blocks a stale corre
 // --- Incomplete or conflicting reads leave the last verified values intact ---
 
 for (const [name, patch] of Object.entries({
-  "paid claimed with a balance still owed": { invoiceStatus: "paid", amounts: { total: 90, invoiceBalance: 90 } },
   "paid claimed with a partial balance": { invoiceStatus: "paid", amounts: { total: 90, invoiceBalance: 45 } },
   "paid claimed with a credit balance": { invoiceStatus: "paid", amounts: { total: 90, invoiceBalance: -1 } },
   "paid claimed with a balance over total": { invoiceStatus: "paid", amounts: { total: 90, invoiceBalance: 91 } },
@@ -356,12 +357,43 @@ for (const [name, data] of Object.entries({
   });
 }
 
+test("PAID WITH THE BALANCE STILL ON IT IS CONFIRMED, NOT HELD, AND NOT REWRITTEN", async () => {
+  // The case this whole change exists for. Jobber says paid; $90 is still
+  // outstanding; the cached row already says past_due with $90 owing. That row
+  // is CORRECT, so there is nothing to write - and nothing to hold for review
+  // either, which is where 12 invoices sat.
+  const invoice = settled();
+  const plan = await planCorrecting([invoice], reader({
+    [invoice.jobberInvoiceId]: source(invoice, { invoiceStatus: "paid", amounts: { total: 90, invoiceBalance: 90 } }),
+  }));
+  assert.deepEqual(plan.updates, [], "nothing to correct");
+  assert.deepEqual(plan.holds, [], "and nothing to hold");
+  assert.equal(plan.verifications.length, 1);
+  assert.equal(plan.verifications[0].outcome, "confirmed", "the read confirmed the row");
+});
+
+test("THE CORRECTION NEVER WRITES JOBBER'S PAID LABEL OVER AN OWING ROW", async () => {
+  // The regression this guards: writing source.invoiceStatus verbatim would
+  // push a correctly-past_due row back to paid on the next pass and pull it
+  // straight back out of collections. A part payment moves the balance, so it
+  // reaches the correction path rather than the confirm path.
+  const invoice = settled();
+  const plan = await planCorrecting([invoice], reader({
+    [invoice.jobberInvoiceId]: source(invoice, { invoiceStatus: "paid", amounts: { total: 90, invoiceBalance: 45 } }),
+  }));
+  for (const update of plan.updates) {
+    assert.notEqual(update.invoiceStatus, "paid", "an owing invoice is never relabelled paid");
+  }
+});
+
 test("one conflicting row never suppresses a valid correction, and vice versa", async () => {
   const good = settled("synthetic-good");
   const bad = settled("synthetic-bad");
   const plan = await planCorrecting([good, bad], reader({
     [good.jobberInvoiceId]: source(good, { invoiceStatus: "paid", amounts: { total: 90, invoiceBalance: 0 } }),
-    [bad.jobberInvoiceId]: source(bad, { invoiceStatus: "paid", amounts: { total: 90, invoiceBalance: 90 } }),
+    // Genuinely unreadable - a balance above the total - because paid-with-a-
+    // balance is no longer a conflict, it is an ordinary unpaid invoice.
+    [bad.jobberInvoiceId]: source(bad, { invoiceStatus: "paid", amounts: { total: 90, invoiceBalance: 91 } }),
   }));
   assert.equal(plan.updates.length, 1);
   assert.equal(plan.updates[0].cached.jobberInvoiceId, good.jobberInvoiceId);

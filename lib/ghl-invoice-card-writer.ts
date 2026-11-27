@@ -52,6 +52,7 @@
 import { createOpportunity, listContactOpportunities, moveOpportunityToStage, readOpportunity,
   type GhlOpportunity } from "./ghl";
 import { buildGhlWriteIntent, buildInvoiceSourceEvidence } from "./ghl-write-intent";
+import { isOwing, isSettled } from "./invoice-settlement";
 import { moneyCents, type PhoneInvoiceEvidence } from "./ghl-phone-state";
 import { cardNameHash, creationPlaceholderId, invoiceSourceFingerprint,
   type CycleJournalEntry, type GhlWriteIntent, type SyncRunWriter } from "./sync-writer-control";
@@ -609,10 +610,16 @@ async function combineCard(
     if (decision.role === "paid") {
       // Retiring the card asserts every one of these is settled, so the source
       // has to say so about every one of them, by status AND by balance.
-      if (row.invoiceStatus !== "paid" || row.balanceCents !== 0) return held("one_of_these_invoices_is_not_settled");
+      // Settled means NOTHING IS OUTSTANDING, judged by the balance. A void or
+      // draft invoice is excluded rather than settled, so this still refuses to
+      // retire a card on the strength of a status that was never a receivable.
+      if (!isSettled(row.invoiceStatus, row.totalCents, row.balanceCents)) return held("one_of_these_invoices_is_not_settled");
       continue;
     }
-    if (row.invoiceStatus === "paid" || row.balanceCents <= 0) return held("one_of_these_invoices_is_no_longer_unpaid");
+    // Owing is a positive balance on a collectable invoice - NOT "the label is
+    // not paid". Jobber keeps `paid` on refunded and deposit-only invoices, and
+    // reading the label here is what kept them off the board.
+    if (!isOwing(row.invoiceStatus, row.totalCents, row.balanceCents)) return held("one_of_these_invoices_is_no_longer_unpaid");
     owed += row.balanceCents;
   }
   if (owed !== target) return held("these_invoices_no_longer_add_up_to_the_amount_planned");
@@ -704,7 +711,8 @@ async function createCard(
   const row = invoices?.find(i => i.id === decision.invoiceId);
   const amountCents = moneyCents(decision.monetaryValue);
   if (!invoices || !row || amountCents === null) return held("source_evidence_unavailable");
-  if (row.invoiceStatus === "paid" || row.balanceCents <= 0) return held("invoice_is_no_longer_unpaid");
+  // Same rule as the update path: the balance decides, the status only excludes.
+  if (!isOwing(row.invoiceStatus, row.totalCents, row.balanceCents)) return held("invoice_is_no_longer_unpaid");
   if (row.balanceCents !== amountCents) return held("invoice_balance_changed_since_the_plan_was_made");
 
   const intent: GhlWriteIntent = {

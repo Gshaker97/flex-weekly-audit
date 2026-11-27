@@ -71,13 +71,33 @@ test("real issuer/account/owner reader composition has no fabricated source meta
   assert.ok(Object.isFrozen(s)); assert.ok(Object.isFrozen(s.unsupportedInputs));
 }));
 
-for (const [status, balance, expected] of [["paid", 0, "paid"], ["paid", 137, "unknown"], ["void", 137, "void"],
-  ["refunded", 0, "unknown"], ["refunded", 137, "unknown"], ["past_due", 0, "unknown"], ["awaiting_payment", 0, "unknown"], ["unrecognized", 137, "unknown"]] as const)
+// Settled, excluded or unreadable - none of them may be messaged. `paid` with
+// nothing outstanding and an open label with nothing outstanding both read as
+// paid, because the BALANCE decides that, not the label.
+for (const [status, balance, expected] of [["paid", 0, "paid"], ["void", 137, "void"],
+  ["refunded", 0, "unknown"], ["refunded", 137, "unknown"], ["past_due", 0, "paid"],
+  ["awaiting_payment", 0, "paid"], ["unrecognized", 137, "unknown"]] as const)
   test(`source ${status}/${balance} never becomes open/eligible`, () => withClock(async () => {
     const f = fixture(); f.data.invoices[0].invoiceStatus = status; f.data.invoices[0].amounts.invoiceBalance = balance;
     const h = await f.read(), s = inspectNotificationSource(h), e = eventFor(s);
     assert.equal(s.status, expected); assert.throws(() => composeNotificationEvidence(h, e, externalFor(e)), /not open/);
   }));
+
+test("SOURCE paid WITH A BALANCE STILL ON IT IS OPEN, AND REACHABLE", () => withClock(async () => {
+  // Jobber #6830: paid label, $60 refunded back out, $60 still owed. This used
+  // to read as "unknown" and be held for review for good, which is precisely
+  // how 12 invoices carrying $25,983.82 were never chased. The balance is the
+  // fact; the label is not.
+  const f = fixture();
+  f.data.invoices[0].invoiceStatus = "paid";
+  f.data.invoices[0].amounts.invoiceBalance = 137;
+  const h = await f.read(), s = inspectNotificationSource(h);
+  assert.equal(s.status, "open");
+  assert.equal(s.balanceMinor, 13700);
+  // And it composes, rather than throwing "not open" like every case above.
+  const e = eventFor(s);
+  assert.doesNotThrow(() => composeNotificationEvidence(h, e, externalFor(e)));
+}));
 
 for (const kind of ["negative", "zero total", "subcent", "NaN", "balance above total", "missing total", "missing balance", "missing status",
   "missing invoice", "second unpaid invoice", "second paid invoice", "duplicate invoice", "wrong invoice owner", "missing cached invoice", "extra cached invoice",

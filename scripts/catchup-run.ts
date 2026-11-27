@@ -43,7 +43,8 @@ import { catchupRunnerReadiness, planCatchupRun, runCatchup } from "../lib/catch
 import { CATCHUP_EMAIL_SENDER, CATCHUP_SMS_SENDER } from "../lib/catchup-sender-policy";
 import type { CatchupRecipientInput } from "../lib/catchup-plan";
 import { readFileSync, writeFileSync } from "node:fs";
-import { constructCatchupRequest, SENDABLE_INVOICE_STATUSES } from "../lib/catchup-dispatch";
+import { constructCatchupRequest } from "../lib/catchup-dispatch";
+import { isOwing } from "../lib/invoice-settlement";
 import { assembleCatchupSenders, catchupPreparationSenders } from "../lib/catchup-senders";
 import {
   approveCatchupManifest, buildCatchupManifest, catchupRequestSha256, parseCatchupManifest,
@@ -314,10 +315,43 @@ async function main(): Promise<void> {
     }
     const transport = createCatchupTransport(transportOptions);
 
+    // ONCE PER CONTACT, FOR GOOD. The catch-up is a one-off sweep, not a
+    // recurring sender, and after it has reached somebody they belong to the
+    // normal ladder from then on.
+    //
+    // The ledger's own unique indexes do not settle this on their own. The
+    // per-day index is keyed on the send date, so a second run on a LATER day
+    // does not collide with it, and the per-milestone index is keyed on
+    // dayPastDue, which has moved on by then too. So a re-run days later could
+    // legitimately take fresh rows and message the same people a second time.
+    // This closes that: any contact with ANY catch-up row already in the
+    // ledger - whatever its day, milestone, channel or outcome - is dropped
+    // here, before a plan is made or a row is taken.
+    //
+    // `state` is deliberately not filtered. A row left `reserved`, `pending` or
+    // `unknown` means a message may well have gone out and the outcome was
+    // never confirmed, and "we are not sure" must not read as "safe to send
+    // again".
+    const { prisma: guardDb } = await import("../lib/prisma");
+    const alreadyReached = new Set<string>(
+      (await guardDb.notificationLedger.findMany({
+        where: { accountId: ACCOUNT_ID }, select: { contactId: true }, distinct: ["contactId"],
+      })).map(row => row.contactId));
+    const repeats = recipients.filter(r => r.contactId && alreadyReached.has(r.contactId));
+    if (repeats.length) {
+      console.log(`${TAG} ${repeats.length} contact(s) already reached by an earlier catch-up:`);
+      for (const r of repeats) console.log(`${TAG}   skipping ${r.clientName} - on the normal ladder now`);
+    }
+    const firstTime = recipients.filter(r => !r.contactId || !alreadyReached.has(r.contactId));
+    if (!firstTime.length) {
+      console.log(`${TAG} every planned recipient has already had a catch-up. NOTHING SENT.`);
+      return;
+    }
+
     // PRE-FLIGHT, BEFORE ANY LEDGER ROW IS TAKEN. The ledger has no release, so
     // a row reserved for a message the transport would then refuse is stuck for
     // good. Every planned message must already be covered, or nothing runs.
-    const plan = planCatchupRun(recipients, sendDate);
+    const plan = planCatchupRun(firstTime, sendDate);
     const uncovered: string[] = [];
     for (const action of plan.actions) {
       if (action.state !== "send") continue;
@@ -342,29 +376,34 @@ async function main(): Promise<void> {
 
     const { prisma: db } = await import("../lib/prisma");
     const sent = await runCatchup({
-      recipients, sendDate, mode: "send",
+      recipients: firstTime, sendDate, mode: "send",
       dependencies: {
         io: {
           ledger: createPrismaNotificationLedger(db as never),
           confirmStillDue: async (invoiceId: string) => {
+            // The total is fetched alongside the balance because owing is
+            // decided from the two together, not from the status.
             const data = await jobberQuery<{ invoice?: { invoiceStatus?: string;
-              amounts?: { invoiceBalance?: number }; dueDate?: string } }>(
-              "query($id:EncodedId!){ invoice(id:$id){ invoiceStatus dueDate amounts { invoiceBalance } } }",
+              amounts?: { total?: number; invoiceBalance?: number }; dueDate?: string } }>(
+              "query($id:EncodedId!){ invoice(id:$id){ invoiceStatus dueDate amounts { total invoiceBalance } } }",
               { id: invoiceId });
             const invoice = data?.invoice;
-            const balanceMinor = typeof invoice?.amounts?.invoiceBalance === "number"
-              ? Math.round(invoice.amounts.invoiceBalance * 100) : null;
+            const minor = (v: unknown) => typeof v === "number" && Number.isFinite(v) ? Math.round(v * 100) : null;
+            const balanceMinor = minor(invoice?.amounts?.invoiceBalance);
+            const totalMinor = minor(invoice?.amounts?.total);
             const dueOn = invoice?.dueDate ? invoiceCalendarDate(new Date(invoice.dueDate)) : null;
-            // The status this query has always fetched is now carried through
-            // and acted on. A positive balance on its own does not mean an
-            // invoice is still chaseable: Jobber reports `paid` invoices that
-            // still carry one, and `void`, `draft` and `bad_debt` ones too.
+            // A positive balance on its own does not mean an invoice is
+            // chaseable - `void`, `draft` and `bad_debt` invoices carry one too,
+            // and those are excluded by status. But `paid` no longer excludes
+            // it: Jobber leaves that label on refunded and deposit-only
+            // invoices that genuinely still owe money, and treating the label as
+            // the answer is what hid them. lib/invoice-settlement.ts holds the
+            // single definition, shared with the dispatcher's own re-check.
             const invoiceStatus = typeof invoice?.invoiceStatus === "string" ? invoice.invoiceStatus : null;
-            const sendable = !!invoiceStatus
-              && SENDABLE_INVOICE_STATUSES.some(s => s === invoiceStatus.trim().toLowerCase());
             return {
-              stillOpen: Boolean(invoice) && sendable && (balanceMinor ?? 0) > 0,
+              stillOpen: Boolean(invoice) && isOwing(invoiceStatus, totalMinor, balanceMinor),
               balanceMinor,
+              totalMinor,
               dayPastDue: dueOn ? dayNumber(sendDate) - dayNumber(dueOn) : null,
               invoiceStatus,
             };

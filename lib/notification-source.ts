@@ -1,4 +1,5 @@
 /** Disabled, read-only source composition. No sender, migration, scheduler or sync hook. */
+import { invoiceSettlement } from "./invoice-settlement";
 import { createHash } from "node:crypto";
 import type { Prisma } from "@prisma/client";
 import { permitsUnknownCurrency } from "./notification-copy-policy";
@@ -227,9 +228,14 @@ async function readAndIssueSource(data: Baseline, continuity: Continuity): Promi
   const clock = invoiceReminderClock(invoice.issuedDate, invoice.dueDate, new Date(Date.now()));
   if (!clock) throw new Error("Notification source invoice dates unverified");
   const rawStatus = invoice.invoiceStatus.toLowerCase();
-  const status = ["awaiting_payment", "past_due"].includes(rawStatus) && balanceMinor > 0 &&
-      (rawStatus !== "past_due" || clock.isOverdue) ? "open"
-    : rawStatus === "paid" && balanceMinor === 0 ? "paid"
+  // The balance says whether money is owed; the status only excludes. A
+  // refunded or deposit-only invoice still labelled `paid` is OPEN here, which
+  // is what lets the ladder reach it at all - previously it fell through to
+  // "unknown" and was held for review forever. void/draft/bad_debt are still
+  // excluded by status. See lib/invoice-settlement.ts.
+  const settlement = invoiceSettlement(rawStatus, totalMinor, balanceMinor);
+  const status = settlement === "owing" && (rawStatus !== "past_due" || clock.isOverdue) ? "open"
+    : settlement === "settled" ? "paid"
     : rawStatus === "void" ? "void" : "unknown";
   // Labels and createdAt are not identity or reminder-clock inputs. Keep number for display
   // without making a changed/missing display label another logical invoice or send event.
