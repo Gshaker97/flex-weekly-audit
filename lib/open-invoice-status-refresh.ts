@@ -8,6 +8,31 @@ const OPEN_STATUSES = ["awaiting_payment", "past_due"];
 const KNOWN_STATUSES = new Set([...OPEN_STATUSES, "draft", "paid", "void", "bad_debt"]);
 const BATCH_SIZE = 25;
 
+/**
+ * THE ROWS THIS RE-CHECK READS.
+ *
+ * It used to be the two owing labels alone, and that was the bug. A row
+ * labelled `paid` while money is still outstanding was invisible to BOTH the
+ * things that could have fixed it:
+ *
+ *   - the hourly sync fetches invoices by Jobber's own updatedAt, so an invoice
+ *     Jobber has not touched in months is never re-upserted and the labelling
+ *     fix in `upsertInvoices` never runs on it;
+ *   - this re-check only selected rows that already said they were owing, so a
+ *     row that wrongly said `paid` was never looked at either.
+ *
+ * Measured 2026-11-27: 12 invoices sat `paid` with $25,983.82 outstanding
+ * between those two scopes, indefinitely. Adding the paid-with-a-balance rows
+ * here is what lets the correction reach them. It is a small, bounded addition
+ * - those 12 rows against 77 open ones - not a widening to all 6,027 invoices.
+ */
+export const RECHECK_SCOPE_WHERE = Object.freeze({
+  OR: [
+    { invoiceStatus: { in: [...OPEN_STATUSES] } },
+    { invoiceStatus: "paid", amountDue: { gt: 0 } },
+  ],
+});
+
 type ReadQuery = (query: string, variables: Record<string, string>) => Promise<unknown>;
 
 /**
@@ -180,7 +205,31 @@ export async function planOpenInvoiceStatusRefresh(
         // is more than this read covers, so it stays the full invoice sync's job.
         hold("Invoice total changed; requires full invoice sync, not a status correction", "stored_value_differs"); continue;
       }
-      if (!OPEN_STATUSES.includes(invoice.invoiceStatus ?? "")) {
+      // WHAT THIS READ IS ALLOWED TO CORRECT.
+      //
+      // Until 2026-11-27 this was the open labels alone, which held every
+      // paid-labelled row as "no longer open" - the exact row the paid-while-
+      // owing correction exists to fix, so the correction could never reach it.
+      //
+      // One case is added, and only behind the same release gate as every other
+      // correction here: a row this system stored as `paid` WHILE ITS OWN
+      // STORED BALANCE STILL SHOWS MONEY, and this live read agrees that money
+      // is outstanding. Jobber's label is irrelevant to that test; the balance
+      // decides, which is `invoiceSettlement`'s whole job.
+      //
+      // The stored balance is part of the test on purpose, and it is what keeps
+      // the old protection intact. A row that reads paid with NOTHING
+      // outstanding is a verified payment, and a stale read claiming the
+      // invoice is still open must never reopen it. Requiring the stored
+      // balance to be non-zero holds that row here, for the original reason,
+      // instead of leaning on a later guard to catch it. It also makes this
+      // test agree exactly with `RECHECK_SCOPE_WHERE`, so the rows selected and
+      // the rows acted on are the same set.
+      const liveSettlement = invoiceSettlement(source.invoiceStatus, total, balance);
+      const locallyOwing = OPEN_STATUSES.includes(invoice.invoiceStatus ?? "");
+      const locallyPaidWhileOwing = correctBalance && invoice.invoiceStatus === "paid"
+        && (cents(invoice.amountDue) ?? 0) > 0 && liveSettlement === "owing";
+      if (!locallyOwing && !locallyPaidWhileOwing) {
         hold("Cached invoice is no longer open", "not_open_locally"); continue;
       }
       const cachedBalance = cents(invoice.amountDue);
@@ -245,6 +294,75 @@ export async function planOpenInvoiceStatusRefresh(
   return plan;
 }
 
+/** The columns one snapshot needs. Shared so every caller reads the same shape. */
+export const INVOICE_SNAPSHOT_SELECT = Object.freeze({
+  id: true, jobberInvoiceId: true, invoiceStatus: true,
+  total: true, amountPaid: true, amountDue: true, customerId: true,
+  customer: { select: { jobberClientId: true } }, dueAt: true, lastSyncedAt: true,
+} as const);
+
+/**
+ * Commit a batch of status corrections, all or nothing.
+ *
+ * The whole pre-image is the guard. A newer verified payment already written by
+ * another pass changes these values, so a stale in-flight correction matches no
+ * row and rolls the entire batch back.
+ */
+export async function applyInvoiceStatusCorrections(updates: InvoiceStatusCorrection[]): Promise<void> {
+  if (!updates.length) return;
+  await prisma.$transaction(async (tx) => {
+    for (const correction of updates) {
+      const { cached: invoice, invoiceStatus } = correction;
+      const result = await tx.invoiceRecord.updateMany({
+        where: {
+          id: invoice.id, jobberInvoiceId: invoice.jobberInvoiceId,
+          invoiceStatus: invoice.invoiceStatus, total: invoice.total,
+          amountPaid: invoice.amountPaid, amountDue: invoice.amountDue,
+          customerId: invoice.customerId,
+          customer: { is: { jobberClientId: invoice.customer!.jobberClientId } },
+          lastSyncedAt: invoice.lastSyncedAt,
+        },
+        // Status alone, unless this is the settled-to-zero payment case, where
+        // the balance from the same read goes with it. paidAt is deliberately
+        // left alone: this read carries no payment timestamp, and a guessed one
+        // would misdate collections reporting. lastSyncedAt is not advanced
+        // either, because the row was not fully refreshed.
+        data: correction.amountDue === undefined
+          ? { invoiceStatus }
+          : { invoiceStatus, amountDue: correction.amountDue, amountPaid: correction.amountPaid },
+      });
+      if (result.count !== 1) throw new Error("Invoice changed during status refresh; rolled back all status corrections");
+    }
+  }, { isolationLevel: "Serializable", timeout: 30000 });
+}
+
+/**
+ * Plan, apply and record one re-check over an explicit set of snapshots.
+ *
+ * Extracted from `refreshOpenInvoiceStatuses` unchanged, so the hourly re-check
+ * and the daily full reconcile share ONE code path: the same by-id Jobber read,
+ * the same hold reasons, the same pre-image-guarded write and the same
+ * verification recording. The only thing a caller chooses is which rows to pass.
+ */
+export async function runInvoiceStatusRecheck(
+  cached: OpenInvoiceSnapshot[], label: string
+): Promise<StatusRefreshPlan> {
+  // Read once per run, before any correction is planned.
+  const correctBalance = paidBalanceCorrectionEnabled();
+  const plan = await planOpenInvoiceStatusRefresh(cached, jobberGraphQL, { paidBalanceCorrection: correctBalance });
+  await applyInvoiceStatusCorrections(plan.updates);
+  // Record what this run actually established, per invoice. Written AFTER the
+  // corrections above, and never inside their transaction: these two columns are
+  // not part of the pre-image guard, so they cannot cause a correction to roll
+  // back. A confirmed read advances lastVerifiedAt; every other outcome records
+  // the code only, leaving lastVerifiedAt where it was.
+  await recordInvoiceVerifications(plan.verifications);
+  log(`[sync] ${label}: checked=${plan.checked} changed=${plan.updates.length} held=${plan.holds.length} paidBalanceCorrection=${correctBalance}`);
+  // IDs/reasons only; no customer contact details or financial values in logs.
+  for (const hold of plan.holds) log(`[sync] ${label} held ${hold.jobberInvoiceId}: ${hold.reason}`);
+  return plan;
+}
+
 /**
  * Separate, default-off release gate. Enabling this can change downstream GHL
  * enrollment even though this module never calls GHL or sends a message.
@@ -252,55 +370,8 @@ export async function planOpenInvoiceStatusRefresh(
 export async function refreshOpenInvoiceStatuses(): Promise<StatusRefreshPlan | null> {
   if (process.env.JOBBER_OPEN_STATUS_REFRESH_ENABLED !== "true") return null;
   const cached = await prisma.invoiceRecord.findMany({
-    where: { invoiceStatus: { in: OPEN_STATUSES } },
-    select: {
-      id: true, jobberInvoiceId: true, invoiceStatus: true,
-      total: true, amountPaid: true, amountDue: true, customerId: true,
-      customer: { select: { jobberClientId: true } }, dueAt: true, lastSyncedAt: true,
-    },
-  });
-  // Read once per run, before any correction is planned.
-  const correctBalance = paidBalanceCorrectionEnabled();
-  const plan = await planOpenInvoiceStatusRefresh(cached, jobberGraphQL, { paidBalanceCorrection: correctBalance });
-  if (plan.updates.length) {
-    await prisma.$transaction(async (tx) => {
-      for (const correction of plan.updates) {
-        const { cached: invoice, invoiceStatus } = correction;
-        // The whole pre-image is the guard. A newer verified payment already
-        // written by another pass changes these values, so a stale in-flight
-        // correction matches no row and rolls the entire batch back.
-        const result = await tx.invoiceRecord.updateMany({
-          where: {
-            id: invoice.id, jobberInvoiceId: invoice.jobberInvoiceId,
-            invoiceStatus: invoice.invoiceStatus, total: invoice.total,
-            amountPaid: invoice.amountPaid, amountDue: invoice.amountDue,
-            customerId: invoice.customerId,
-            customer: { is: { jobberClientId: invoice.customer!.jobberClientId } },
-            lastSyncedAt: invoice.lastSyncedAt,
-          },
-          // Status alone, unless this is the settled-to-zero payment case, where
-          // the balance from the same read goes with it. paidAt is deliberately
-          // left alone: this read carries no payment timestamp, and a guessed one
-          // would misdate collections reporting. lastSyncedAt is not advanced
-          // either, because the row was not fully refreshed.
-          data: correction.amountDue === undefined
-            ? { invoiceStatus }
-            : { invoiceStatus, amountDue: correction.amountDue, amountPaid: correction.amountPaid },
-        });
-        if (result.count !== 1) throw new Error("Invoice changed during status refresh; rolled back all status corrections");
-      }
-    }, { isolationLevel: "Serializable", timeout: 30000 });
-  }
-  // Record what this run actually established, per invoice. Written AFTER the
-  // corrections above, and never inside their transaction: these two columns are
-  // not part of the pre-image guard, so they cannot cause a correction to roll
-  // back. A confirmed read advances lastVerifiedAt; every other outcome records
-  // the code only, leaving lastVerifiedAt where it was.
-  await recordInvoiceVerifications(plan.verifications);
-  log(`[sync] open invoice status refresh: checked=${plan.checked} changed=${plan.updates.length} held=${plan.holds.length} paidBalanceCorrection=${correctBalance}`);
-  // IDs/reasons only; no customer contact details or financial values in logs.
-  for (const hold of plan.holds) log(`[sync] status refresh held ${hold.jobberInvoiceId}: ${hold.reason}`);
-  return plan;
+    where: RECHECK_SCOPE_WHERE, select: INVOICE_SNAPSHOT_SELECT });
+  return runInvoiceStatusRecheck(cached, "open invoice status refresh");
 }
 
 /**

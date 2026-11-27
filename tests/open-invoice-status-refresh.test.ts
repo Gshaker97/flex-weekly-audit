@@ -34,7 +34,21 @@ beforeEach(() => {
   writes = []; transactions = 0; fetches = 0; cacheReads = 0; response = undefined; failedUpdate = undefined;
   (prisma.invoiceRecord as any).findMany = async (query: any) => {
     cacheReads++;
-    assert.deepEqual(query.where, { invoiceStatus: { in: ["awaiting_payment", "past_due"] } }, "no issue-date cutoff or balance filter");
+    // THE EXACT SCOPE OF THE HOURLY RE-CHECK, pinned.
+    //
+    // It gained one clause on 2026-11-27: a row stored as `paid` that still
+    // shows a balance. That row was invisible to this re-check AND to the
+    // incremental sync, which is how 12 invoices sat wrong indefinitely.
+    //
+    // Still pinned exactly, and for the original reason: this must stay a small,
+    // named set. No issue-date cutoff (which would hide invoices), and no clause
+    // that could drag in every invoice ever issued.
+    assert.deepEqual(query.where, {
+      OR: [
+        { invoiceStatus: { in: ["awaiting_payment", "past_due"] } },
+        { invoiceStatus: "paid", amountDue: { gt: 0 } },
+      ],
+    }, "no issue-date cutoff, and no clause beyond open plus paid-with-a-balance");
     return records;
   };
   (prisma.jobberAuth as any).findFirst = async () => ({ accessToken: "synthetic-only", expiresAt: new Date(Date.now() + 3600000) });
@@ -217,7 +231,12 @@ test("sync integration refreshes before aggregates and GHL without swallowing er
   const invocation = sync.indexOf('await step("refreshOpenInvoiceStatuses", () => refreshOpenInvoiceStatuses());');
   assert.ok(invocation > 0);
   assert.ok(invocation < sync.indexOf('await step("recomputeCustomerAggregates"'));
-  assert.ok(invocation < sync.indexOf("await syncGhlInvoicePipeline({ writer })"));
+  // Matched on the prefix, not the whole call: the card pass has gained the
+  // `reconcile` option since this was written, and what this test is for is the
+  // ORDER - the hourly re-check runs before any card is judged.
+  const cardPass = sync.indexOf("await syncGhlInvoicePipeline({ writer");
+  assert.ok(cardPass > 0, "the card pass is still called with the durable writer");
+  assert.ok(invocation < cardPass);
   assert.equal(sync.slice(sync.lastIndexOf("if (!heavy.ok)", invocation), invocation).includes("catch"), false);
 });
 
